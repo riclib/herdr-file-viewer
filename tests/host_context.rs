@@ -42,3 +42,23 @@ fn from_env_without_context_is_cwd_only() {
     assert_eq!(ctx.cwd, std::env::current_dir().unwrap());
     assert_eq!(ctx.base_branch, None);
 }
+
+#[test]
+fn focused_pane_cwd_is_used_as_the_root() {
+    // herdr 0.7.0's real context shape names the invoking pane's directory `focused_pane_cwd`
+    // (not `cwd`). The viewer must root there — not at its own process cwd (the fallback),
+    // which is the plugin's install dir. Regression test for the "tree shows the plugin's own
+    // files" bug.
+    let json = r#"{"workspace_cwd":"/ws","focused_pane_cwd":"/work/project","tab_id":"wE:tD"}"#;
+    let ctx = parse_context(Some(json), PathBuf::from("/plugin-dir"));
+    assert_eq!(ctx.cwd, PathBuf::from("/work/project"));
+}
+
+#[test]
+fn workspace_cwd_is_the_fallback_when_no_focused_pane_cwd() {
+    let ctx = parse_context(
+        Some(r#"{"workspace_cwd":"/ws"}"#),
+        PathBuf::from("/plugin-dir"),
+    );
+    assert_eq!(ctx.cwd, PathBuf::from("/ws"));
+}
