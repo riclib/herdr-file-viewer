@@ -82,6 +82,68 @@ viewer and its open actions ship **inside** the plugin and register automaticall
 you only add the keybinding. Everything below is detail: pinning a release, the renderer fallback,
 the launcher's open/focus/toggle behavior, the full key map, and the `--remote` caveat.
 
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `↑` / `k`, `↓` / `j` | Move the tree cursor — or **scroll the content pane** vertically when it is focused |
+| `→` / `l` | Expand the selected directory — or **scroll the content pane right** when it is focused |
+| `←` / `h` | Collapse the selected directory — or **scroll the content pane left** when it is focused |
+| `Enter` | Activate the selection — expand/collapse a directory, or open a file in **zoom mode** (content full-screen) |
+| `i` | Toggle gitignored files |
+| `c` | Toggle changed-files-only |
+| `b` | Toggle the diff baseline (base branch ⇄ `HEAD`) |
+| `v` | Cycle the content view mode |
+| `e` | Open the selected file in `$EDITOR` |
+| `Tab` | Move focus between the tree and content columns |
+| `<` / `>` | Narrow / widen the tree column (move the divider) |
+| `w` | Toggle line wrapping for the content pane |
+| `z` | Zoom — hide the tree so the content pane fills the frame; press again (or `q`/`Esc`) to restore the two-column layout |
+| `r` | Refresh git state — pick up changes made outside the viewer (a merge / pull / commit elsewhere) |
+| `q` / `Esc` | Back out of zoom if zoomed; otherwise close the viewer and return to the prior pane |
+
+`Tab` to the content pane, then the arrow keys (or `h`/`j`/`k`/`l`) scroll it in all four
+directions; `Tab` back to the tree to move between files. Long lines wrap in prose (markdown /
+plain text); diffs and code keep their original lines so columns stay aligned — scroll
+sideways with `←`/`→`, or press `w` to wrap them instead. The layout reflows automatically
+when the pane is resized.
+
+**Git state stays current.** The viewer re-reads git status when the pane **regains focus**, so
+changes you make outside it (a merge, pull, or commit in another pane) show up automatically; `r`
+forces a full refresh on demand. (Focus-refresh updates the tree's status without disturbing your
+content scroll.)
+
+Character keys act only when no control chord is held (so terminal chords like `Ctrl+C` are
+never intercepted); `Shift` is permitted, for keys such as `<` and `>`.
+
+### Mouse
+
+The viewer is keyboard-first; the mouse is additive and on by default:
+
+| Gesture | Action |
+| --- | --- |
+| **Click** a tree row | Select it (focus the tree) |
+| **Double-click** a folder | Expand / collapse it (same as `Enter`) |
+| **Double-click** a file | Open it in **zoom mode** — content full-screen (same as `Enter`); the editor is the `e` key |
+| **Wheel** over the content pane | Scroll it vertically; over the tree, move the selection |
+| **Horizontal wheel / swipe** over the content | Scroll it sideways (terminal-dependent — see below) |
+| **Drag** the divider | Resize the tree / content split |
+
+**`Shift`+drag is left to your terminal**, so its native select-and-copy still works while the
+viewer owns ordinary clicks — herdr reserves `Shift`+mouse for exactly this. (herdr forwards
+mouse events to the pane because the viewer requests capture.)
+
+**Horizontal mouse scroll is terminal-dependent** — it works only where your terminal emits
+horizontal-scroll events (`ScrollLeft` / `ScrollRight`); many terminals send nothing for a
+sideways trackpad swipe. The `←` / `→` keys always scroll the content sideways regardless.
+
+### Opening in an editor
+
+`e` hands the selected file to the editor named by the `$EDITOR` environment variable
+(e.g. `export EDITOR="vim"` or `EDITOR="code --wait"`). The viewer suspends, runs the editor,
+and resumes when it exits. If `$EDITOR` is unset, a notice is shown — the viewer never edits a
+file itself.
+
 ## Install
 
 Requirements: **Rust 1.96+** (edition 2024) and Cargo; **herdr 0.7.0+**, on **Linux** or
@@ -211,68 +273,6 @@ doesn't persist). To drive the viewer on the remote, attach with
 
 This is a herdr keybinding/remote limitation, not the plugin's — the action and launcher work
 the same locally and remotely; it's only *which* keymap fires them across `--remote` that differs.
-
-## Keys
-
-| Key | Action |
-| --- | --- |
-| `↑` / `k`, `↓` / `j` | Move the tree cursor — or **scroll the content pane** vertically when it is focused |
-| `→` / `l` | Expand the selected directory — or **scroll the content pane right** when it is focused |
-| `←` / `h` | Collapse the selected directory — or **scroll the content pane left** when it is focused |
-| `Enter` | Activate the selection — expand/collapse a directory, or open a file in **zoom mode** (content full-screen) |
-| `i` | Toggle gitignored files |
-| `c` | Toggle changed-files-only |
-| `b` | Toggle the diff baseline (base branch ⇄ `HEAD`) |
-| `v` | Cycle the content view mode |
-| `e` | Open the selected file in `$EDITOR` |
-| `Tab` | Move focus between the tree and content columns |
-| `<` / `>` | Narrow / widen the tree column (move the divider) |
-| `w` | Toggle line wrapping for the content pane |
-| `z` | Zoom — hide the tree so the content pane fills the frame; press again (or `q`/`Esc`) to restore the two-column layout |
-| `r` | Refresh git state — pick up changes made outside the viewer (a merge / pull / commit elsewhere) |
-| `q` / `Esc` | Back out of zoom if zoomed; otherwise close the viewer and return to the prior pane |
-
-`Tab` to the content pane, then the arrow keys (or `h`/`j`/`k`/`l`) scroll it in all four
-directions; `Tab` back to the tree to move between files. Long lines wrap in prose (markdown /
-plain text); diffs and code keep their original lines so columns stay aligned — scroll
-sideways with `←`/`→`, or press `w` to wrap them instead. The layout reflows automatically
-when the pane is resized.
-
-**Git state stays current.** The viewer re-reads git status when the pane **regains focus**, so
-changes you make outside it (a merge, pull, or commit in another pane) show up automatically; `r`
-forces a full refresh on demand. (Focus-refresh updates the tree's status without disturbing your
-content scroll.)
-
-Character keys act only when no control chord is held (so terminal chords like `Ctrl+C` are
-never intercepted); `Shift` is permitted, for keys such as `<` and `>`.
-
-### Mouse
-
-The viewer is keyboard-first; the mouse is additive and on by default:
-
-| Gesture | Action |
-| --- | --- |
-| **Click** a tree row | Select it (focus the tree) |
-| **Double-click** a folder | Expand / collapse it (same as `Enter`) |
-| **Double-click** a file | Open it in **zoom mode** — content full-screen (same as `Enter`); the editor is the `e` key |
-| **Wheel** over the content pane | Scroll it vertically; over the tree, move the selection |
-| **Horizontal wheel / swipe** over the content | Scroll it sideways (terminal-dependent — see below) |
-| **Drag** the divider | Resize the tree / content split |
-
-**`Shift`+drag is left to your terminal**, so its native select-and-copy still works while the
-viewer owns ordinary clicks — herdr reserves `Shift`+mouse for exactly this. (herdr forwards
-mouse events to the pane because the viewer requests capture.)
-
-**Horizontal mouse scroll is terminal-dependent** — it works only where your terminal emits
-horizontal-scroll events (`ScrollLeft` / `ScrollRight`); many terminals send nothing for a
-sideways trackpad swipe. The `←` / `→` keys always scroll the content sideways regardless.
-
-### Opening in an editor
-
-`e` hands the selected file to the editor named by the `$EDITOR` environment variable
-(e.g. `export EDITOR="vim"` or `EDITOR="code --wait"`). The viewer suspends, runs the editor,
-and resumes when it exits. If `$EDITOR` is unset, a notice is shown — the viewer never edits a
-file itself.
 
 ## Architecture & security
 
