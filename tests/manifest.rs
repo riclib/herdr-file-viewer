@@ -92,7 +92,7 @@ fn declares_a_release_build_command() {
         "manifest must declare a [[build]] step"
     );
     assert!(
-        m.contains(r#"command = ["cargo", "build", "--release"]"#),
+        m.contains("cargo build --release"),
         "the build step must run `cargo build --release`"
     );
 }

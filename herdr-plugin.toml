@@ -11,9 +11,12 @@ description = "A git-aware, read-only file viewer: a keyboard-driven TUI in a he
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
 
-# Build step herdr runs at install time to produce the binary the pane launches.
+# Build step herdr runs at install time to produce the binary the pane launches. It is wrapped
+# in a shell that sources ~/.cargo/env first, so the build finds `cargo` even when herdr was
+# launched from a context that doesn't have ~/.cargo/bin on PATH (e.g. a GUI / login-less
+# launch) — otherwise `cargo build` fails to start with "No such file or directory".
 [[build]]
-command = ["cargo", "build", "--release"]
+command = ["/bin/sh", "-c", ". \"$HOME/.cargo/env\" 2>/dev/null; cargo build --release"]
 
 # The viewer pane. herdr performs the split placement on launch (AC-17); no runtime
 # command is issued to open the viewer — declaring placement = "split" is what opens
