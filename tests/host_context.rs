@@ -42,3 +42,43 @@ fn from_env_without_context_is_cwd_only() {
     assert_eq!(ctx.cwd, std::env::current_dir().unwrap());
     assert_eq!(ctx.base_branch, None);
 }
+
+#[test]
+fn focused_pane_cwd_is_used_as_the_root() {
+    // herdr 0.7.0's real context shape names the invoking pane's directory `focused_pane_cwd`
+    // (not `cwd`). The viewer must root there — not at its own process cwd (the fallback),
+    // which is the plugin's install dir. Regression test for the "tree shows the plugin's own
+    // files" bug.
+    let json = r#"{"workspace_cwd":"/ws","focused_pane_cwd":"/work/project","tab_id":"wE:tD"}"#;
+    let ctx = parse_context(Some(json), PathBuf::from("/plugin-dir"));
+    assert_eq!(ctx.cwd, PathBuf::from("/work/project"));
+}
+
+#[test]
+fn workspace_cwd_is_the_fallback_when_no_focused_pane_cwd() {
+    let ctx = parse_context(
+        Some(r#"{"workspace_cwd":"/ws"}"#),
+        PathBuf::from("/plugin-dir"),
+    );
+    assert_eq!(ctx.cwd, PathBuf::from("/ws"));
+}
+
+#[test]
+fn focused_pane_cwd_wins_over_a_co_present_legacy_cwd() {
+    // Precedence is the whole point of the change: the invoking pane's dir beats a bare `cwd`.
+    let ctx = parse_context(
+        Some(r#"{"focused_pane_cwd":"/a","cwd":"/b"}"#),
+        PathBuf::from("/fallback"),
+    );
+    assert_eq!(ctx.cwd, PathBuf::from("/a"));
+}
+
+#[test]
+fn an_empty_cwd_field_is_ignored_in_favor_of_the_fallback() {
+    // A malformed host value (empty string) must not root at an empty path.
+    let ctx = parse_context(
+        Some(r#"{"focused_pane_cwd":""}"#),
+        PathBuf::from("/fallback"),
+    );
+    assert_eq!(ctx.cwd, PathBuf::from("/fallback"));
+}
