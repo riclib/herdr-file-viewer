@@ -145,10 +145,47 @@ sideways trackpad swipe. The `←` / `→` keys always scroll the content sidewa
 
 ### Opening in an editor
 
-`e` hands the selected file to the editor named by the `$EDITOR` environment variable
-(e.g. `export EDITOR="vim"` or `EDITOR="code --wait"`). The viewer suspends, runs the editor,
+`e` hands the selected file to the editor named by the **`$EDITOR`** environment variable
+(e.g. `vim`, or `"code --wait"` for editors that fork). The viewer suspends, runs the editor,
 and resumes when it exits. If `$EDITOR` is unset, a notice is shown — the viewer never edits a
 file itself.
+
+**`e` does nothing, or says "no editor configured"?** The viewer reads `$EDITOR` from the
+**herdr server's** environment — the server spawns every pane — *not* from the shell you happen to
+be attached from. So if `$EDITOR` is set in your interactive shell but the server was started
+without it (common with `mosh`, `systemd`, or any login manager that doesn't source your shell
+startup files), the viewer won't see it. To fix it:
+
+1. **Export `$EDITOR` in the startup file your server's launch actually reads.** Pick the line(s)
+   that match how herdr starts on your machine:
+
+   ```bash
+   # zsh — interactive shells read ~/.zshrc; ~/.zshenv is read by *every* zsh invocation
+   echo 'export EDITOR=vim' >> ~/.zshrc
+
+   # bash — add to both, so interactive and login shells agree
+   echo 'export EDITOR=vim' >> ~/.bashrc
+   echo 'export EDITOR=vim' >> ~/.profile
+
+   # mosh / `sh -lc` / any POSIX login-shell launch (e.g. herdr started over SSH+mosh)
+   echo 'export EDITOR=vim' >> ~/.profile
+   ```
+
+   If you're unsure which applies, adding it to **`~/.profile`** covers the login-shell launch
+   paths; keep it in your shell's rc too for interactive use.
+
+2. **Restart the herdr server** so it re-reads the environment — `reload-config` and `prefix+q`
+   are **not** enough (the first doesn't re-read env; the second only quits the client and leaves
+   the detached server running with its old environment):
+
+   ```bash
+   herdr server stop   # stops the background daemon — ends all panes, so finish in-flight work first
+   herdr               # relaunch from a shell where `echo $EDITOR` already prints your editor
+   ```
+
+3. **Verify:** open any shell pane *inside* herdr and run `echo $EDITOR`. Once that prints your
+   editor (it was empty before), `e` will open it. (A future settings file will also let you set
+   the editor command directly — see [Roadmap](#roadmap).)
 
 ## Documentation
 
