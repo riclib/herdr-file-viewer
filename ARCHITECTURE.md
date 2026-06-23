@@ -43,7 +43,7 @@ herdr → env (HERDR_PLUGIN_CONTEXT_JSON)
           │
    host::from_env → root::resolve → git::default_baseline
           │
-   Controller::new  ── wires live GitService / ContentProvider / EditorHandoff behind traits
+   Controller::new  ── wires live GitService / ContentProvider / EditorHandoff / Clipboard behind traits
           │
    event loop (app::run):  draw → poll input → handle(intent) → drain finished renders → repeat
 ```
@@ -57,7 +57,8 @@ A renderer panic is contained (`catch_unwind`) so the worker survives. No `tokio
 ## Load-bearing decisions
 
 - **Read-only.** The viewer never mutates a file or the git repository. The editor path is a
-  hand-off to an external process. Every `git` invocation uses read-only subcommands.
+  hand-off to an external process; the path-copy keys (`y`/`Y`) only copy a path string to the
+  clipboard (via an OSC 52 escape). Every `git` invocation uses read-only subcommands.
 - **Delegate rendering.** Markdown, diffs, and syntax highlighting are produced by best-in-class
   external CLIs (`glow`, `delta`, `bat`) — the viewer builds only the shell and ingests their
   ANSI output. Each renderer is optional; a missing one degrades to plain text + a notice.

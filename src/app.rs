@@ -7,7 +7,7 @@
 //! via the hook `ratatui::try_init` installs.
 
 use crate::controller::{
-    Components, ContentProvider, Controller, EditorHandoff, GitService, RenderResult,
+    Clipboard, Components, ContentProvider, Controller, EditorHandoff, GitService, RenderResult,
 };
 use crate::editor::{EditorLauncher, Spawner};
 use crate::git::{self, Baseline, Status};
@@ -27,6 +27,7 @@ use ratatui::DefaultTerminal;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -61,6 +62,7 @@ pub fn run() -> io::Result<()> {
     let editor: Box<dyn EditorHandoff> = Box::new(LiveEditor {
         editor: std::env::var_os("EDITOR"),
     });
+    let clipboard: Box<dyn Clipboard> = Box::new(Osc52Clipboard);
 
     let mut controller = Controller::new(
         resolved.root.clone(),
@@ -70,6 +72,7 @@ pub fn run() -> io::Result<()> {
             git,
             content,
             editor,
+            clipboard,
         },
     );
     // Kick off the once-a-day update check (off the UI thread; disabled by
@@ -256,6 +259,54 @@ impl EditorHandoff for LiveEditor {
         resumed?;
         Ok(true) // the editor drew over the screen → the run loop forces a full repaint
     }
+}
+
+/// The live Clipboard: copy via the OSC 52 terminal escape sequence. This is the portable,
+/// dependency-free way for a TUI in a pane to set the *host* terminal's clipboard — it travels
+/// through terminal multiplexers (herdr, tmux with passthrough) and SSH, unlike a native
+/// clipboard API bound to the local display. The sequence produces no visible output, so
+/// writing it mid-loop never disturbs the ratatui screen.
+struct Osc52Clipboard;
+
+impl Clipboard for Osc52Clipboard {
+    fn copy(&mut self, text: &str) -> io::Result<()> {
+        // OSC 52: ESC ] 52 ; c ; <base64 payload> BEL — `c` selects the clipboard. The payload is
+        // a path, which can include an untrusted, attacker-chosen file name (trust boundary #1).
+        // base64-encoding it confines the bytes to `[A-Za-z0-9+/=]`, so a name containing ESC/BEL
+        // or another OSC sequence cannot break out of this one and drive the terminal — the same
+        // defense-in-depth the renderer path applies to file content.
+        let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        let mut out = io::stdout();
+        out.write_all(seq.as_bytes())?;
+        out.flush()
+    }
+}
+
+/// Standard base64 (RFC 4648) — a few lines so OSC 52 needs no extra dependency, matching the
+/// project's minimal-deps style. OSC 52 payloads are base64; the terminal decodes them.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        // Pad the final partial group with '=' (one byte → "xx==", two bytes → "xxx=").
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Runs the editor command and waits for it (the hand-off is synchronous, as for a terminal
@@ -450,6 +501,36 @@ mod tests {
             r.syntax.iter().any(|a| a == "--style=numbers"),
             "bat line numbers: {:?}",
             r.syntax
+        );
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_including_padding() {
+        // Padding is what OSC 52 consumers expect; the partial-group cases are the easy ones to
+        // get wrong. Vectors from RFC 4648 §10.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // A path with a slash exercises the '+/' tail of the alphabet via high bytes.
+        assert_eq!(base64_encode(b"src/app.rs"), "c3JjL2FwcC5ycw==");
+    }
+
+    #[test]
+    fn base64_confines_control_bytes_to_the_safe_alphabet() {
+        // Security: the OSC 52 payload may carry an attacker-chosen file name (trust boundary
+        // #1). Encoding must leave no ESC/BEL or other raw control byte that could break out of
+        // the escape sequence — the output is strictly `[A-Za-z0-9+/=]`.
+        let hostile = b"\x1b]52;c;evil\x07\x1b\\name\nwith\x07bel";
+        let encoded = base64_encode(hostile);
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')),
+            "encoded output stays within the base64 alphabet: {encoded}"
         );
     }
 

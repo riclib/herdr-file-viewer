@@ -123,6 +123,7 @@ fn a_select_intent_does_not_block_on_a_slow_render_and_content_arrives_later() {
         git: Arc::new(NoGit),
         content: Box::new(SlowContent { delay }),
         editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), false, Baseline::Head, components);
 
@@ -186,6 +187,7 @@ fn full_diff_mode_asks_git_for_whole_file_context() {
             delay: Duration::from_millis(0),
         }),
         editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), true, Baseline::Head, components);
 
@@ -226,6 +228,7 @@ fn a_superseded_render_does_not_overwrite_a_newer_selection() {
             delay: Duration::from_millis(80),
         }),
         editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), false, Baseline::Head, components);
 
@@ -263,6 +266,7 @@ fn a_panicking_renderer_is_contained_and_the_worker_survives() {
         git: Arc::new(NoGit),
         content: Box::new(PanicOnContent { panic_file: "b.rs" }),
         editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), false, Baseline::Head, components);
 

@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Copy a file's path to the clipboard.** `y` copies the selected file's repo-relative path
+  (e.g. `src/app.rs`); `Y` copies its absolute path. The copy uses the terminal's OSC 52
+  clipboard escape, so it travels through herdr and SSH to your real clipboard with no extra
+  tooling, and a confirmation shows in the notices strip. Read-only — like every other key, it
+  never touches the file's contents.
+
 ## [1.2.2] - 2026-06-23
 
 ### Docs

@@ -83,6 +83,14 @@ pub trait EditorHandoff {
     fn open(&mut self, file: &Path) -> io::Result<bool>;
 }
 
+/// Copy a string to the system clipboard (the `y` / `Y` path-copy keys). Behind a trait so
+/// the controller never touches the terminal directly — the live implementation emits an
+/// OSC 52 sequence — and tests record the copied text instead of writing a real clipboard.
+/// Read-only with respect to files: it only ever copies a path string (AC-N3).
+pub trait Clipboard {
+    fn copy(&mut self, text: &str) -> io::Result<()>;
+}
+
 /// The injected components the controller orchestrates.
 pub struct Components {
     /// Shared (`Arc`) because both the controller (status / changed-set) and the render
@@ -90,6 +98,7 @@ pub struct Components {
     pub git: Arc<dyn GitService>,
     pub content: Box<dyn ContentProvider>,
     pub editor: Box<dyn EditorHandoff>,
+    pub clipboard: Box<dyn Clipboard>,
 }
 
 /// What the run loop should do after an intent is handled.
@@ -173,6 +182,7 @@ pub struct Controller {
     action_notice: Option<String>,
     git: Arc<dyn GitService>,
     editor: Box<dyn EditorHandoff>,
+    clipboard: Box<dyn Clipboard>,
     /// Render dispatch to the worker thread (AC-23). `latest_seq` is the most recently
     /// dispatched job; a `poll`ed result with a smaller seq is stale and dropped.
     job_tx: mpsc::Sender<RenderJob>,
@@ -211,6 +221,7 @@ impl Controller {
             git,
             content,
             editor,
+            clipboard,
         } = components;
         // The Content Renderer (and the diff query it needs) live on a worker thread; the
         // controller talks to it over a job channel and reads finished renders off a result
@@ -277,6 +288,7 @@ impl Controller {
             action_notice: None,
             git,
             editor,
+            clipboard,
             job_tx,
             result_rx,
             latest_seq: 0,
@@ -436,6 +448,8 @@ impl Controller {
             Intent::ToggleBaseline => self.toggle_baseline(),
             Intent::CycleView => self.cycle_view(),
             Intent::OpenInEditor => self.open_in_editor(),
+            Intent::CopyRepoPath => self.copy_path(PathKind::Repo),
+            Intent::CopyAbsPath => self.copy_path(PathKind::Absolute),
             Intent::ToggleFocus => self.toggle_focus(),
             Intent::ShrinkTree => self.resize_split(-(SPLIT_STEP as i16)),
             Intent::GrowTree => self.resize_split(SPLIT_STEP as i16),
@@ -807,6 +821,31 @@ impl Controller {
         }
     }
 
+    /// Copy the selected node's path to the clipboard (`y` repo-relative, `Y` absolute). Works
+    /// for files and directories alike — copying a path mutates nothing (AC-N3). The outcome is
+    /// surfaced as a transient notice ("Copied …" / a clipboard-failure message). Inert when
+    /// nothing is selected. The repo-relative form falls back to the absolute path for a node
+    /// outside the tree root (there is no relative form to give), which in practice cannot
+    /// happen since every node is under the root.
+    fn copy_path(&mut self, kind: PathKind) -> Effects {
+        let Some(node) = self.tree.selected() else {
+            return Effects::noop();
+        };
+        let text = match kind {
+            PathKind::Absolute => node.path.to_string_lossy().into_owned(),
+            PathKind::Repo => self
+                .rel(&node.path)
+                .unwrap_or(node.path.clone())
+                .to_string_lossy()
+                .into_owned(),
+        };
+        self.action_notice = Some(match self.clipboard.copy(&text) {
+            Ok(()) => format!("Copied {text}"),
+            Err(e) => format!("Could not copy path: {e}"),
+        });
+        Effects::redraw()
+    }
+
     fn toggle_focus(&mut self) -> Effects {
         // While zoomed the tree is hidden, so there is nothing to switch focus to: keep focus
         // pinned to the content pane (entering zoom set it there). Without this guard, Tab would
@@ -1037,6 +1076,15 @@ impl Controller {
     fn rel(&self, path: &Path) -> Option<PathBuf> {
         path.strip_prefix(&self.root).ok().map(Path::to_path_buf)
     }
+}
+
+/// Which form of the selected node's path the copy keys put on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    /// Relative to the tree/repo root (`y`), e.g. `src/app.rs`.
+    Repo,
+    /// The full absolute path (`Y`).
+    Absolute,
 }
 
 /// Where a mouse cell falls in the drawn layout.

@@ -60,6 +60,7 @@ fn controller_in(dir: &Path) -> Controller {
             git: Arc::new(Git),
             content: Box::new(Content),
             editor: Box::new(Editor),
+            clipboard: Box::new(common::RecordingClipboard::default()),
         },
     )
 }

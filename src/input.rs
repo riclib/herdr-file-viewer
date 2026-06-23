@@ -28,6 +28,8 @@ pub fn map_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Char('b') => Some(Intent::ToggleBaseline),
         KeyCode::Char('v') => Some(Intent::CycleView),
         KeyCode::Char('e') => Some(Intent::OpenInEditor),
+        KeyCode::Char('y') => Some(Intent::CopyRepoPath),
+        KeyCode::Char('Y') => Some(Intent::CopyAbsPath),
         KeyCode::Tab => Some(Intent::ToggleFocus),
         KeyCode::Char('<') => Some(Intent::ShrinkTree),
         KeyCode::Char('>') => Some(Intent::GrowTree),
@@ -65,6 +67,8 @@ mod tests {
         (KeyCode::Char('b'), Intent::ToggleBaseline),
         (KeyCode::Char('v'), Intent::CycleView),
         (KeyCode::Char('e'), Intent::OpenInEditor),
+        (KeyCode::Char('y'), Intent::CopyRepoPath),
+        (KeyCode::Char('Y'), Intent::CopyAbsPath),
         (KeyCode::Tab, Intent::ToggleFocus),
         (KeyCode::Char('<'), Intent::ShrinkTree),
         (KeyCode::Char('>'), Intent::GrowTree),
@@ -142,6 +146,21 @@ mod tests {
         );
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_path_keys_are_distinct_and_shift_capital_y_is_the_absolute_path() {
+        // `y` copies the repo-relative path; `Y` (Shift+y, reported as `Char('Y')` with the
+        // Shift bit set) copies the absolute path. A Ctrl chord on the same key fires neither.
+        assert_eq!(map_key(k(KeyCode::Char('y'))), Some(Intent::CopyRepoPath));
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)),
+            Some(Intent::CopyAbsPath)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
             None
         );
     }

@@ -99,6 +99,7 @@ fn controller(
             fail: editor_fails,
             opened: opened.clone(),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let ctrl = Controller::new(root.to_path_buf(), is_git_repo, Baseline::Head, components);
     (ctrl, changed_calls, opened)
@@ -533,6 +534,7 @@ fn controller_with_lines(root: &Path, n: usize) -> Controller {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     Controller::new(root.to_path_buf(), false, Baseline::Head, components)
 }
@@ -678,6 +680,7 @@ fn left_right_scroll_the_content_horizontally_when_focused_and_unwrapped() {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), false, Baseline::Head, components);
     await_marker(&mut ctrl, "WIDE");
@@ -742,6 +745,7 @@ fn wrapped_content_scrolls_vertically_to_the_bottom_and_not_horizontally() {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), false, Baseline::Head, components);
     await_marker(&mut ctrl, "WIDE");
@@ -1229,6 +1233,7 @@ fn horizontal_wheel_scrolls_the_content_sideways() {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), false, Baseline::Head, components);
     await_marker(&mut ctrl, "WIDE");
@@ -1299,6 +1304,7 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), true, Baseline::Head, components);
     await_marker(&mut ctrl, "L0");
@@ -1398,6 +1404,7 @@ fn focus_gained_keeps_tree_and_content_in_sync_after_a_changed_only_refilter() {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
     };
     let mut ctrl = Controller::new(dir.path().to_path_buf(), true, Baseline::Head, components);
     ctrl.handle(Intent::ToggleChangedOnly); // changed-only: only a.rs visible → it's selected
@@ -1419,5 +1426,64 @@ fn focus_gained_keeps_tree_and_content_in_sync_after_a_changed_only_refilter() {
     assert!(
         flatten(ctrl.content()).contains("b.rs"),
         "content pane shows the selected file — in sync"
+    );
+}
+
+/// Build a controller over `root` whose clipboard records what it was asked to copy, so the
+/// path-copy keys (`y` / `Y`) can be asserted without a real clipboard.
+fn controller_with_clipboard(root: &Path, is_git_repo: bool) -> (Controller, Recorder<String>) {
+    let clipboard = common::RecordingClipboard::default();
+    let copied = clipboard.copied.clone();
+    let components = Components {
+        git: Arc::new(StubGit::default()),
+        content: Box::new(StubContent),
+        editor: Box::new(StubEditor {
+            fail: false,
+            opened: Arc::new(Mutex::new(Vec::new())),
+        }),
+        clipboard: Box::new(clipboard),
+    };
+    let ctrl = Controller::new(root.to_path_buf(), is_git_repo, Baseline::Head, components);
+    (ctrl, copied)
+}
+
+#[test]
+fn copy_repo_path_copies_the_repo_relative_path_and_confirms() {
+    // `y`: the selected node's path relative to the tree root goes to the clipboard, and the
+    // action is confirmed in a notice. Copying a path touches no file (AC-N3).
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    let (mut ctrl, copied) = controller_with_clipboard(dir.path(), false);
+
+    let fx = ctrl.handle(Intent::CopyRepoPath);
+    assert!(fx.redraw, "copying redraws to show the confirmation notice");
+    assert_eq!(
+        copied.lock().unwrap().as_slice(),
+        ["a.rs"],
+        "the repo-relative path was copied"
+    );
+    assert!(
+        ctrl.notices().iter().any(|n| n.contains("Copied a.rs")),
+        "the copy is confirmed: {:?}",
+        ctrl.notices()
+    );
+}
+
+#[test]
+fn copy_abs_path_copies_the_absolute_path() {
+    // `Y`: the full absolute path goes to the clipboard.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    let (mut ctrl, copied) = controller_with_clipboard(dir.path(), false);
+
+    ctrl.handle(Intent::CopyAbsPath);
+    let log = copied.lock().unwrap();
+    assert_eq!(log.len(), 1, "exactly one copy");
+    let want = dir.path().join("a.rs").to_string_lossy().into_owned();
+    assert_eq!(log[0], want, "the absolute path was copied");
+    assert!(
+        Path::new(&log[0]).is_absolute(),
+        "the copied path is absolute: {}",
+        log[0]
     );
 }
