@@ -64,7 +64,14 @@ impl Outcome {
 /// Run the script with stubbed uname/curl/cargo.
 /// - `serve_binary == false` → fake curl fails the binary fetch (simulates a 404 / missing asset).
 /// - `corrupt_sums == true`  → the published SHA256SUMS holds a wrong hash (checksum mismatch).
-fn run(os: &str, arch: &str, version: &str, serve_binary: bool, corrupt_sums: bool) -> Outcome {
+fn run_impl(
+    os: &str,
+    arch: &str,
+    version: &str,
+    serve_binary: bool,
+    corrupt_sums: bool,
+    repo_root: Option<&Path>,
+) -> Outcome {
     let root = tmp("root");
     let stub = root.join("bin");
     let server = root.join("server");
@@ -129,11 +136,16 @@ fn run(os: &str, arch: &str, version: &str, serve_binary: bool, corrupt_sums: bo
         "#!/bin/sh\necho FAKE_CARGO_BUILD \"$@\"\nexit 0\n",
     );
 
+    // The release-tag gate inspects FV_REPO_ROOT as a git work tree. By default point it at the
+    // (non-git) temp root so the gate is skipped and the platform/download/verify logic is what's
+    // under test; the gate's own tests pass a real git repo here.
+    let fv_repo_root: &Path = repo_root.unwrap_or(root.as_path());
     let path = format!("{}:{}", stub.display(), std::env::var("PATH").unwrap());
     let output = Command::new("sh")
         .arg(script_path())
         .env("PATH", path)
         .env("HOME", &root) // no ~/.cargo/env here, so the fallback uses the stubbed cargo
+        .env("FV_REPO_ROOT", fv_repo_root)
         .env("FV_CARGO_TOML", &cargo_toml)
         .env("FV_OUT", &out)
         .env("FV_BASE_URL", "https://example.invalid/releases/download")
@@ -154,6 +166,47 @@ fn run(os: &str, arch: &str, version: &str, serve_binary: bool, corrupt_sums: bo
     };
     let _ = fs::remove_dir_all(&root);
     o
+}
+
+/// Default runner: no git work tree at FV_REPO_ROOT, so the release-tag gate is skipped and the
+/// platform/download/verify path is exercised directly.
+fn run(os: &str, arch: &str, version: &str, serve_binary: bool, corrupt_sums: bool) -> Outcome {
+    run_impl(os, arch, version, serve_binary, corrupt_sums, None)
+}
+
+/// Throwaway git repo at `dir`: one commit tagged `v<version>`, plus (if `head_ahead`) a second
+/// commit so HEAD is past the tag. Drives the release-tag gate.
+fn make_git_repo(dir: &Path, version: &str, head_ahead: bool) {
+    fs::create_dir_all(dir).unwrap();
+    let g = |args: &[&str]| {
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    g(&["init", "-q"]);
+    fs::write(dir.join("f.txt"), "1").unwrap();
+    g(&["add", "-A"]);
+    g(&["commit", "-q", "-m", "release"]);
+    g(&["tag", &format!("v{version}")]);
+    if head_ahead {
+        fs::write(dir.join("f.txt"), "2").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "post-release"]);
+    }
 }
 
 #[test]
@@ -260,4 +313,45 @@ fn script_preserves_the_cargo_source_build_fallback() {
         s.contains(".cargo/env"),
         "fallback must source ~/.cargo/env like the original build step"
     );
+}
+
+#[test]
+fn gate_uses_prebuilt_when_checkout_is_exactly_the_release_tag() {
+    let gitdir = tmp("gitrepo-attag");
+    make_git_repo(&gitdir, "1.2.0", false); // HEAD == v1.2.0 tag
+    let o = run_impl("Linux", "x86_64", "1.2.0", true, false, Some(&gitdir));
+    assert!(
+        o.installed_prebuilt(),
+        "at the release tag the prebuilt should be used\nstdout:{}\nstderr:{}",
+        o.stdout,
+        o.stderr
+    );
+    assert!(
+        !o.fell_back(),
+        "must not build from source at the exact release commit"
+    );
+    let _ = fs::remove_dir_all(&gitdir);
+}
+
+#[test]
+fn gate_falls_back_when_checkout_is_ahead_of_the_release_tag() {
+    let gitdir = tmp("gitrepo-ahead");
+    make_git_repo(&gitdir, "1.2.0", true); // HEAD one commit past v1.2.0
+    let o = run_impl("Linux", "x86_64", "1.2.0", true, false, Some(&gitdir));
+    assert!(
+        o.fell_back(),
+        "source ahead of the tag must build from source\nstdout:{}\nstderr:{}",
+        o.stdout,
+        o.stderr
+    );
+    assert!(
+        o.placed.is_none(),
+        "must not install the stale tagged binary"
+    );
+    assert!(
+        o.urls.is_empty(),
+        "the gate must fire before any download; urls: {:?}",
+        o.urls
+    );
+    let _ = fs::remove_dir_all(&gitdir);
 }

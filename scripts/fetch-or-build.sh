@@ -15,7 +15,7 @@ set -u
 repo="smarzban/herdr-file-viewer"
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_root="$script_dir/.."
+repo_root="${FV_REPO_ROOT:-$script_dir/..}"
 cargo_toml="${FV_CARGO_TOML:-$repo_root/Cargo.toml}"
 out="${FV_OUT:-$repo_root/target/release/herdr-file-viewer}"
 base_url="${FV_BASE_URL:-https://github.com/$repo/releases/download}"
@@ -62,6 +62,16 @@ esac
 # --- read the version this source declares ------------------------------------------------
 version=$(grep -E '^version *= *"' "$cargo_toml" 2>/dev/null | head -n 1 | sed -E 's/^version *= *"([^"]+)".*/\1/')
 [ -n "$version" ] || fallback "could not read version from $cargo_toml"
+
+# Trust the prebuilt only when this checkout is EXACTLY the v$version release commit. Between
+# releases main carries the last released version in Cargo.toml while its HEAD has moved past the
+# tag; without this check we'd install the older tagged binary for newer source. When the checkout
+# is not a git work tree (e.g. an unpacked tarball) we can't verify, so we proceed on the version.
+if have git && git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  head_rev=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo nohead)
+  tag_rev=$(git -C "$repo_root" rev-parse -q --verify "refs/tags/v$version^{commit}" 2>/dev/null || echo notag)
+  [ "$head_rev" = "$tag_rev" ] || fallback "checkout is not the v$version release tag (source may be ahead) — building from source"
+fi
 
 asset="herdr-file-viewer-$triple"
 bin_url="$base_url/v$version/$asset"
