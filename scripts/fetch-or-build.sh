@@ -96,7 +96,7 @@ download "$bin_url" "$tmpbin"   || fallback "prebuilt binary not available for v
 download "$sums_url" "$tmpsums" || fallback "checksums not available for v$version"
 
 # Expected hash = the SHA256SUMS line for our asset filename.
-expected=$(grep " $asset\$" "$tmpsums" 2>/dev/null | awk '{print $1}' | head -n 1)
+expected=$(grep -E "^[0-9a-f]{64}  $asset\$" "$tmpsums" 2>/dev/null | awk '{print $1}' | head -n 1)
 [ -n "$expected" ] || fallback "no checksum listed for $asset"
 
 actual=$(sha256_of "$tmpbin") || fallback "no sha-256 tool (sha256sum/shasum) available"
