@@ -156,7 +156,7 @@ file itself.
 
 ## Roadmap
 
-Active project — a few things on the way:
+A few things on the way:
 
 - **In-app help overlay** — a `?` key to show every keybinding (and setup tips) without leaving the viewer.
 - **Settings & customization** — a config file for keymaps, the default split, themes, and your own renderer/editor commands.
