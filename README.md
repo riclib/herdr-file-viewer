@@ -100,6 +100,8 @@ you only add the keybinding. The [keys](#keys) are below; deeper detail lives in
 | `b` | Toggle the diff baseline (base branch ⇄ `HEAD`) |
 | `v` | Cycle the content view mode |
 | `e` | Open the selected file in `$EDITOR` |
+| `y` | Copy the selected file's **repo-relative** path to the clipboard (e.g. `src/app.rs`) |
+| `Y` | Copy the selected file's **absolute** path to the clipboard |
 | `Tab` | Move focus between the tree and content columns |
 | `<` / `>` | Narrow / widen the tree column (move the divider) |
 | `w` | Toggle line wrapping for the content pane |
@@ -120,7 +122,14 @@ forces a full refresh on demand. (Focus-refresh updates the tree's status withou
 content scroll.)
 
 Character keys act only when no control chord is held (so terminal chords like `Ctrl+C` are
-never intercepted); `Shift` is permitted, for keys such as `<` and `>`.
+never intercepted); `Shift` is permitted, for keys such as `<` and `>` (and `y`/`Y`).
+
+**Copy a path (`y` / `Y`).** `y` copies the selected file's repo-relative path; `Y` copies its
+absolute path — handy for pasting into a prompt, a command, or an agent. The copy uses the
+terminal's **OSC 52** clipboard escape, so it travels through herdr (and SSH) to your real
+clipboard with no extra tooling. A confirmation appears in the notices strip. If nothing lands
+on your clipboard, your terminal likely needs OSC 52 / clipboard-write enabled (e.g. in tmux,
+`set -g set-clipboard on`).
 
 ### Mouse
 

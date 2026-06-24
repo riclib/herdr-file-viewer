@@ -30,6 +30,12 @@ pub enum Intent {
     CycleView,
     /// Hand the selected file off to an external editor (AC-19).
     OpenInEditor,
+    /// Copy the selected node's **repo-relative** path to the clipboard (e.g. `src/app.rs`).
+    /// Read-only — it copies a path string, never reads or writes the file's contents (AC-N3).
+    CopyRepoPath,
+    /// Copy the selected node's **absolute** path to the clipboard. Read-only, like
+    /// [`Intent::CopyRepoPath`] — no file contents are touched.
+    CopyAbsPath,
     /// Move focus between the tree and content columns (AC-21).
     ToggleFocus,
     /// Narrow the tree column (move the tree/content divider left).
@@ -55,7 +61,7 @@ pub enum Intent {
 impl Intent {
     /// Every intent variant — lets the dispatcher and tests enumerate the closed set so
     /// keyboard-completeness (AC-18) and the no-edit invariant (AC-N3) stay checkable.
-    pub const ALL: [Intent; 18] = [
+    pub const ALL: [Intent; 20] = [
         Intent::NavUp,
         Intent::NavDown,
         Intent::Expand,
@@ -66,6 +72,8 @@ impl Intent {
         Intent::ToggleBaseline,
         Intent::CycleView,
         Intent::OpenInEditor,
+        Intent::CopyRepoPath,
+        Intent::CopyAbsPath,
         Intent::ToggleFocus,
         Intent::ShrinkTree,
         Intent::GrowTree,
@@ -100,6 +108,8 @@ mod tests {
                 | Intent::ToggleBaseline
                 | Intent::CycleView
                 | Intent::OpenInEditor
+                | Intent::CopyRepoPath
+                | Intent::CopyAbsPath
                 | Intent::ToggleFocus
                 | Intent::ShrinkTree
                 | Intent::GrowTree

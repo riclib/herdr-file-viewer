@@ -4,9 +4,11 @@
 
 #![allow(dead_code)] // not every integration test uses every helper
 
+use herdr_file_viewer::controller::Clipboard;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -40,6 +42,22 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A Clipboard stub that records every copied string instead of touching a real clipboard,
+/// so a test can assert what the `y`/`Y` keys would have copied. The `copied` log is shared
+/// (`Arc<Mutex<_>>`) so the test keeps a handle to read back after handing the stub to the
+/// controller.
+#[derive(Default, Clone)]
+pub struct RecordingClipboard {
+    pub copied: Arc<Mutex<Vec<String>>>,
+}
+
+impl Clipboard for RecordingClipboard {
+    fn copy(&mut self, text: &str) -> std::io::Result<()> {
+        self.copied.lock().unwrap().push(text.to_string());
+        Ok(())
     }
 }
 
