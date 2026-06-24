@@ -273,3 +273,221 @@ fn list_returns_empty_vec_for_non_repo() {
         "expected empty Vec for non-repo, got: {result:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-5 — agent_active: tiered pre-selection resolution (AC-3, AC-4, AC-15)
+// ---------------------------------------------------------------------------
+
+use herdr_file_viewer::worktree::agent_active;
+use std::path::PathBuf;
+
+/// Canned `herdr worktree list --json` output with three worktrees.
+///
+/// wt-a → ws-1, wt-b → ws-2, wt-c → ws-3 (no agent).
+fn worktree_json_three() -> &'static str {
+    r#"[
+        {"path": "/repo/wt-a", "open_workspace_id": "ws-1", "branch": "main",     "is_bare": false, "is_detached": false},
+        {"path": "/repo/wt-b", "open_workspace_id": "ws-2", "branch": "feat",     "is_bare": false, "is_detached": false},
+        {"path": "/repo/wt-c", "open_workspace_id": "ws-3", "branch": "other",    "is_bare": false, "is_detached": false}
+    ]"#
+}
+
+/// Canned `herdr agent list` output — agents in ws-1 and ws-2 (both active).
+fn agent_json_two_workspaces() -> &'static str {
+    r#"[
+        {"id": "agent-abc", "workspace_id": "ws-1"},
+        {"id": "agent-xyz", "workspace_id": "ws-2"}
+    ]"#
+}
+
+/// Canned agent list — only ws-2 has an agent.
+fn agent_json_one_workspace() -> &'static str {
+    r#"[{"id": "agent-only", "workspace_id": "ws-2"}]"#
+}
+
+/// Canned agent list — no agents at all.
+fn agent_json_empty() -> &'static str {
+    r#"[]"#
+}
+
+/// Build a `&[Worktree]` slice from `parse_porcelain` canned bytes + direct `Worktree`
+/// construction so the path-normalization step is exercised. Paths must be absolute and
+/// exist on this machine for canonicalize to succeed; we use a non-existent-but-absolute
+/// path and rely on the canonicalize-fallback in `agent_active`.
+fn make_worktrees() -> Vec<herdr_file_viewer::worktree::Worktree> {
+    // Construct directly using parse_porcelain with a fabricated current_root.
+    // The worktrees don't need to exist on disk — `agent_active` compares path strings
+    // when canonicalize fails (the paths are fake).
+    parse_porcelain(
+        &{
+            let mut b = Vec::new();
+            b.extend_from_slice(b"worktree /repo/wt-a\0branch refs/heads/main\0");
+            b.push(b'\0');
+            b.extend_from_slice(b"worktree /repo/wt-b\0branch refs/heads/feat\0");
+            b.push(b'\0');
+            b.extend_from_slice(b"worktree /repo/wt-c\0branch refs/heads/other\0");
+            b
+        },
+        std::path::Path::new("/repo/wt-a"),
+    )
+}
+
+/// **Tier 1** — our workspace wins even when multiple agent-hosting worktrees exist.
+///
+/// Setup: agents in ws-1 (wt-a) and ws-2 (wt-b), our_workspace_id = "ws-2".
+/// Expected: `Some("/repo/wt-b")` — Tier-1 match on our own workspace.
+#[test]
+fn agent_active_tier1_prefers_own_workspace() {
+    let worktrees = make_worktrees();
+    let result = agent_active(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_two_workspaces(),
+        Some("ws-2"),
+    );
+    assert_eq!(result, Some(PathBuf::from("/repo/wt-b")));
+}
+
+/// **Tier 2** — no own-workspace hint; exactly one agent-hosting worktree → return it.
+///
+/// Setup: only ws-2 has an agent (wt-b). our_workspace_id = None.
+/// Expected: `Some("/repo/wt-b")`.
+#[test]
+fn agent_active_tier2_unique_agent_worktree() {
+    let worktrees = make_worktrees();
+    let result = agent_active(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_one_workspace(),
+        None,
+    );
+    assert_eq!(result, Some(PathBuf::from("/repo/wt-b")));
+}
+
+/// **Tier 3 — zero** — no agents running at all → `None`.
+#[test]
+fn agent_active_tier3_no_agents_returns_none() {
+    let worktrees = make_worktrees();
+    let result = agent_active(&worktrees, worktree_json_three(), agent_json_empty(), None);
+    assert_eq!(result, None);
+}
+
+/// **Tier 3 — two (ambiguous)** — two agent-hosting worktrees, no own-workspace hint → `None`.
+#[test]
+fn agent_active_tier3_ambiguous_returns_none() {
+    let worktrees = make_worktrees();
+    let result = agent_active(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_two_workspaces(),
+        None,
+    );
+    assert_eq!(result, None);
+}
+
+/// **Tier 1 fallback to Tier 2** — our workspace id is set but has NO running agent, exactly
+/// one other worktree does → Tier 2 fires.
+#[test]
+fn agent_active_tier1_miss_falls_to_tier2() {
+    let worktrees = make_worktrees();
+    // our_workspace_id = "ws-3" has no agent; only ws-2 does
+    let result = agent_active(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_one_workspace(),
+        Some("ws-3"),
+    );
+    assert_eq!(result, Some(PathBuf::from("/repo/wt-b")));
+}
+
+/// **Malformed worktree_json** → `None`, no panic.
+#[test]
+fn agent_active_malformed_worktree_json_returns_none() {
+    let worktrees = make_worktrees();
+    let result = agent_active(
+        &worktrees,
+        "this is not json {{{{",
+        agent_json_one_workspace(),
+        None,
+    );
+    assert_eq!(result, None);
+}
+
+/// **Malformed agent_json** → `None`, no panic.
+#[test]
+fn agent_active_malformed_agent_json_returns_none() {
+    let worktrees = make_worktrees();
+    let result = agent_active(&worktrees, worktree_json_three(), "{ broken", None);
+    assert_eq!(result, None);
+}
+
+/// **Both JSON args malformed** → `None`, no panic.
+#[test]
+fn agent_active_both_malformed_returns_none() {
+    let worktrees = make_worktrees();
+    let result = agent_active(&worktrees, "bad", "also bad", Some("ws-1"));
+    assert_eq!(result, None);
+}
+
+/// **Tier 1 — empty `our_workspace_id` must NOT match** — `Some("")` is not a valid workspace
+/// id and must not spuriously trigger Tier 1. With two qualifying worktrees and an empty
+/// own-workspace hint the function must fall through to Tier 2/3 logic, which here returns
+/// `None` (ambiguous: two qualifying entries).
+#[test]
+fn agent_active_empty_our_workspace_id_does_not_trigger_tier1() {
+    let worktrees = make_worktrees();
+    // Two agents active (ws-1 → wt-a, ws-2 → wt-b); empty own workspace.
+    let result = agent_active(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_two_workspaces(),
+        Some(""),
+    );
+    // Empty string is never in the agent_workspaces set, so Tier 1 is skipped.
+    // Tier 2 sees two qualifying entries → ambiguous → None.
+    assert_eq!(result, None);
+}
+
+/// **Two worktrees share the same `open_workspace_id`** — when two distinct worktree entries
+/// both open the same agent-hosting workspace the qualifying count is 2, which is >1, so the
+/// result is `None` (ambiguous). Confirms the "exactly one" check operates on worktree
+/// entries, not on distinct workspace ids.
+#[test]
+fn agent_active_two_worktrees_same_workspace_is_ambiguous() {
+    // Build a JSON where wt-a and wt-b both point to ws-1.
+    let wt_json = r#"[
+        {"path": "/repo/wt-a", "open_workspace_id": "ws-1"},
+        {"path": "/repo/wt-b", "open_workspace_id": "ws-1"},
+        {"path": "/repo/wt-c", "open_workspace_id": "ws-3"}
+    ]"#;
+    // Agent list — only ws-1 has an agent.
+    let ag_json = r#"[{"id": "agent-only", "workspace_id": "ws-1"}]"#;
+
+    let worktrees = make_worktrees();
+    // No own-workspace hint: Tier 2 must count two qualifying entries → None.
+    let result = agent_active(&worktrees, wt_json, ag_json, None);
+    assert_eq!(
+        result, None,
+        "two worktrees in the same workspace must be ambiguous"
+    );
+}
+
+/// **Path not in worktrees slice** — agent points to a path not in the slice → `None`.
+///
+/// The worktrees slice only contains wt-a; the agent targets wt-b (ws-2) which is absent.
+#[test]
+fn agent_active_path_not_in_slice_returns_none() {
+    // Slice only contains wt-a
+    let worktrees = parse_porcelain(
+        b"worktree /repo/wt-a\0branch refs/heads/main\0",
+        std::path::Path::new("/repo/wt-a"),
+    );
+    // JSON includes wt-b → ws-2, but wt-b is not in the slice
+    let result = agent_active(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_one_workspace(), // ws-2 → wt-b
+        None,
+    );
+    assert_eq!(result, None);
+}
