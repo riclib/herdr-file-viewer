@@ -215,7 +215,10 @@ fn list_returns_main_and_linked_worktrees_with_current_flag() {
         .iter()
         .find(|w| common::canon(&w.path) == canon_linked)
         .expect("linked worktree should appear in list output");
-    assert!(!linked_row.is_current, "linked worktree must not be current");
+    assert!(
+        !linked_row.is_current,
+        "linked worktree must not be current"
+    );
     assert_eq!(
         linked_row.branch,
         Some("linked-branch".to_string()),
@@ -253,10 +256,7 @@ fn list_does_not_mutate_worktree_set() {
     let after = git(repo.path(), &["worktree", "list", "--porcelain"]);
     let head_after = git(repo.path(), &["rev-parse", "HEAD"]);
 
-    assert_eq!(
-        before, after,
-        "AC-N1: worktree list unchanged after list()"
-    );
+    assert_eq!(before, after, "AC-N1: worktree list unchanged after list()");
     assert_eq!(
         head_before, head_after,
         "AC-N2: HEAD unchanged after list()"
