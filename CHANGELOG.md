@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-06-24
 
 ### Added
 - **Copy a file's path to the clipboard.** `y` copies the selected file's repo-relative path
@@ -12,6 +12,12 @@ All notable changes to this project are documented here. The format is based on
   clipboard escape, so it travels through herdr and SSH to your real clipboard with no extra
   tooling, and a confirmation shows in the notices strip. Read-only — like every other key, it
   never touches the file's contents.
+
+### Security
+- The copied path and its confirmation notice are stripped of control characters, so a
+  maliciously-named file (e.g. one with an embedded newline or escape byte) can't paste-inject
+  into a shell or emit a terminal escape when its path is copied — consistent with how the viewer
+  already sanitizes other filesystem-derived strings it displays.
 
 ## [1.2.2] - 2026-06-23
 
