@@ -2036,8 +2036,8 @@ impl HerdrCli for RecordingHerdr {
 fn full_switch_issues_only_read_only_herdr_queries_and_no_pane_calls() {
     // AC-10: a complete W → navigate → confirm (re_root) cycle must issue NO herdr pane-open
     // / pane-split / pane-run call. The only herdr calls allowed are the read-only overlay
-    // queries the picker makes when it opens: `["worktree","list","--json"]` and
-    // `["agent","list","--json"]`. The re_root itself must not touch HerdrCli at all.
+    // queries the picker makes when it opens: `["worktree","list"]` and `["agent","list"]`
+    // (herdr prints JSON by default; no `--json`). The re_root itself must not touch HerdrCli.
     let repo = TempDir::new();
     init_repo_with_commit(repo.path());
     let linked = TempDir::new();
@@ -2079,16 +2079,11 @@ fn full_switch_issues_only_read_only_herdr_queries_and_no_pane_calls() {
             "exactly 2 herdr calls when opening the picker: {:?}",
             *log
         );
-        assert_eq!(
-            log[0],
-            &["worktree", "list", "--json"],
-            "first call: worktree list"
-        );
-        assert_eq!(
-            log[1],
-            &["agent", "list", "--json"],
-            "second call: agent list"
-        );
+        // NOTE: NO `--json` — herdr prints JSON by default and `agent list` REJECTS the flag
+        // (verified live, herdr 0.7.x). Pinning the exact argv here guards against re-introducing
+        // the flag, which silently broke the agent-active overlay.
+        assert_eq!(log[0], &["worktree", "list"], "first call: worktree list");
+        assert_eq!(log[1], &["agent", "list"], "second call: agent list");
     }
 
     // --- Step 2: navigate to the linked (non-current) worktree row ---
@@ -2157,10 +2152,7 @@ fn full_switch_issues_only_read_only_herdr_queries_and_no_pane_calls() {
         );
     }
     // More strongly: every recorded call is one of the permitted read-only queries.
-    let allowed: &[&[&str]] = &[
-        &["worktree", "list", "--json"],
-        &["agent", "list", "--json"],
-    ];
+    let allowed: &[&[&str]] = &[&["worktree", "list"], &["agent", "list"]];
     for call in &final_log {
         let call_refs: Vec<&str> = call.iter().map(String::as_str).collect();
         assert!(

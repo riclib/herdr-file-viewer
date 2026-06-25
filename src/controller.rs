@@ -1295,8 +1295,12 @@ impl Controller {
     /// (AC-4, AC-15).
     fn agent_preselect(&self, rows: &[crate::worktree::Worktree]) -> Option<usize> {
         let herdr = self.herdr.as_ref()?;
-        let wt_json = herdr.run_json(&["worktree", "list", "--json"]).ok()?;
-        let ag_json = herdr.run_json(&["agent", "list", "--json"]).ok()?;
+        // herdr's `worktree list` and `agent list` BOTH print JSON by default; `agent list`
+        // REJECTS a `--json` flag (verified live against herdr 0.7.x — it exits non-zero), so we
+        // pass neither subcommand the flag. (A prior `--json` on the agent query made this overlay
+        // silently fail → always fall back to the current root, AC-4/AC-15.)
+        let wt_json = herdr.run_json(&["worktree", "list"]).ok()?;
+        let ag_json = herdr.run_json(&["agent", "list"]).ok()?;
         let active = crate::worktree::agent_active(
             rows,
             &wt_json,
