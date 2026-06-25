@@ -928,6 +928,7 @@ fn wide_geometry() -> PaneGeometry {
             height: 20,
         }),
         tree_scroll: 0,
+        tree_content_width: 0,
         content_inner: Some(Rect {
             x: 41,
             y: 1,
@@ -968,6 +969,67 @@ fn a_tree_click_maps_through_the_scroll_offset() {
         ctrl.tree().cursor(),
         10,
         "a click on the first visible row selects node (row-offset + tree_scroll)"
+    );
+}
+
+#[test]
+fn dragging_the_tree_horizontal_scrollbar_scrolls_the_tree() {
+    // The tree's horizontal scrollbar (bottom border) is draggable: press at the right end jumps
+    // to max h-scroll, dragging to the left end returns to 0. Synchronous — driven purely by the
+    // fed-back geometry (widest row vs tree width).
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let mut g = wide_geometry(); // tree_inner x1 y1 w38 h20
+    g.tree_content_width = 138; // 100 wider than the 38-col tree → max h-scroll = 100
+    ctrl.set_pane_geometry(g);
+
+    // The tree hbar is on the tree's bottom border: row = tree_inner.y + height = 21, cols [1, 39).
+    let hbar_row = 1 + 20;
+    // Press at the far-right of the track (col 38 = tree_inner.x + width - 1) → max.
+    ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 38, hbar_row));
+    assert_eq!(
+        ctrl.view_state().tree_hscroll,
+        100,
+        "pressing the right end of the tree hbar jumps to max h-scroll"
+    );
+    // Drag to the left end → back to 0.
+    ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 1, hbar_row));
+    assert_eq!(
+        ctrl.view_state().tree_hscroll,
+        0,
+        "dragging the tree hbar to the left end scrolls back to 0"
+    );
+    // Release ends the drag (so the next press is a fresh interaction, not swallowed).
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, hbar_row));
+    assert!(!fx.redraw, "the drag-release is inert (not a click)");
+}
+
+#[test]
+fn dragging_the_content_vertical_scrollbar_scrolls_the_content() {
+    // The content pane's vertical scrollbar (right border) is draggable: press at the bottom jumps
+    // toward max scroll, dragging to the top returns to 0.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_lines(dir.path(), 50);
+    await_marker(&mut ctrl, "L0");
+    ctrl.set_content_viewport(58, 20); // matches wide_geometry; 50 lines / 20 visible → max 30
+    ctrl.set_pane_geometry(wide_geometry()); // content_inner x41 y1 w58 h20 → vbar col = 99
+
+    let vbar_col = 41 + 58; // content_inner.x + width = the right border column
+    // Press at the bottom of the track (row 20 = c.y + height - 1) → max scroll.
+    ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), vbar_col, 20));
+    assert_eq!(
+        ctrl.view_state().content_scroll,
+        30,
+        "pressing the bottom of the content vbar jumps to max scroll"
+    );
+    // Drag to the top of the track → 0.
+    ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), vbar_col, 1));
+    assert_eq!(
+        ctrl.view_state().content_scroll,
+        0,
+        "dragging the content vbar to the top scrolls back to 0"
     );
 }
 

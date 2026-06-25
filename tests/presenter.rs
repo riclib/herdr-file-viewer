@@ -68,6 +68,7 @@ fn sample_state() -> ViewState {
         content_scroll: 0,
         content_hscroll: 0,
         tree_scroll: 0,
+        tree_hscroll: 0,
         wrap: false,
         split_pct: 40,
         zoomed: false,
@@ -423,6 +424,69 @@ fn tree_shows_a_vertical_scrollbar_only_when_it_overflows() {
     assert!(
         overflow.contains('▐'),
         "an overflowing tree shows a scrollbar thumb (▐)\n{overflow}"
+    );
+}
+
+#[test]
+fn tree_shows_a_horizontal_scrollbar_and_scrolls_long_rows() {
+    // The tree gets a horizontal scrollbar (▄ thumb on the bottom border) + horizontal scroll when
+    // the widest row overflows the column — so a long / deeply-nested name can be read sideways.
+    // `tree_hscroll` clips the leading columns, like the content pane. Assertions are scoped to the
+    // TREE column: the content pane's block title is the selected node's name, so a frame-wide
+    // check would false-match the head there regardless of the tree's horizontal scroll.
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let mut state = sample_state();
+    state.notices = vec![];
+    let long = format!("START_{}_END", "x".repeat(60));
+    state.nodes = vec![node(&format!("/r/{long}"), NodeKind::File, 0, false, None)];
+    state.selected = 0;
+
+    // The text inside the tree column (interior + its borders), one line per row.
+    let tree_region = |st: &ViewState| -> String {
+        let buf = render_buffer(st, area.width, area.height);
+        let t = geometry(area, st).tree_inner.expect("tree interior");
+        let mut s = String::new();
+        for y in t.y..(t.y + t.height) {
+            for x in t.x..(t.x + t.width) {
+                s.push_str(buf.cell((x, y)).map_or(" ", |c| c.symbol()));
+            }
+            s.push('\n');
+        }
+        s
+    };
+
+    state.tree_hscroll = 0;
+    let head_region = tree_region(&state);
+    let full = render(&state, area.width, area.height);
+    assert!(
+        full.contains('▄'),
+        "an overflowing tree shows a horizontal scrollbar (▄)\n{full}"
+    );
+    assert!(
+        head_region.contains("START_"),
+        "the row head shows in the tree at hscroll 0\n{head_region}"
+    );
+    assert!(
+        !head_region.contains("_END"),
+        "the row tail is off-screen in the tree at hscroll 0\n{head_region}"
+    );
+
+    state.tree_hscroll = 45;
+    let tail_region = tree_region(&state);
+    assert!(
+        tail_region.contains("_END"),
+        "scrolling right reveals the row tail in the tree\n{tail_region}"
+    );
+    assert!(
+        !tail_region.contains("START_"),
+        "the head is clipped in the tree once scrolled right\n{tail_region}"
     );
 }
 

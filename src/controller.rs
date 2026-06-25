@@ -164,6 +164,9 @@ pub struct Controller {
     baseline: Baseline,
     show_ignored: bool,
     changed_only: bool,
+    /// The tree's horizontal scroll offset (columns), for reading long / deeply-nested rows. Like
+    /// the cursor it is navigation state: reset on a re-root (AC-13), not carried.
+    tree_hscroll: u16,
     focus: Focus,
     /// The pane width the run loop last observed (session state for the narrow-split flag,
     /// AC-21); the Presenter still lays out from the live frame, never this.
@@ -214,9 +217,9 @@ pub struct Controller {
     geom: PaneGeometry,
     /// The previous left-click `(col, row, time)`, for double-click detection.
     last_click: Option<(u16, u16, Instant)>,
-    /// True while the left button is held after pressing on the divider (a resize drag), so the
-    /// release is treated as the end of the drag, not a click.
-    dragging_divider: bool,
+    /// What the held left button is dragging (divider resize or a scrollbar), so the release is
+    /// treated as the end of the drag, not a click. `None` ⇒ no drag in progress.
+    drag: Option<Drag>,
     /// The newer version to advertise, if any (set from the cached value at startup and
     /// refreshed by the background check). `None` ⇒ up-to-date / unknown.
     update_available: Option<Version>,
@@ -276,6 +279,7 @@ impl Controller {
             is_git_repo,
             baseline,
             show_ignored: false,
+            tree_hscroll: 0,
             changed_only: false,
             focus: Focus::Tree,
             width: 0,
@@ -300,7 +304,7 @@ impl Controller {
             latest_seq: 0,
             geom: PaneGeometry::default(),
             last_click: None,
-            dragging_divider: false,
+            drag: None,
             update_available: None,
             update_dismissed: false,
             update_rx: None,
@@ -429,6 +433,7 @@ impl Controller {
         self.zoomed = false;
         self.content_scroll = 0;
         self.content_hscroll = 0;
+        self.tree_hscroll = 0;
         self.overrides.clear();
         self.action_notice = None;
         self.changed = BTreeMap::new();
@@ -635,6 +640,7 @@ impl Controller {
             // Last frame's tree offset, so the Presenter scrolls minimally from it (#45): selecting
             // a row already in view — e.g. a mouse click — never jumps the viewport.
             tree_scroll: self.geom.tree_scroll,
+            tree_hscroll: self.tree_hscroll,
             wrap,
             split_pct: self.split_pct,
             zoomed: self.zoomed,
@@ -820,16 +826,39 @@ impl Controller {
             MouseEventKind::ScrollRight => self.hscroll_at(col, row, HSCROLL_STEP as i32),
             MouseEventKind::ScrollLeft => self.hscroll_at(col, row, -(HSCROLL_STEP as i32)),
             MouseEventKind::Down(MouseButton::Left) => {
-                // A press on the divider begins a resize drag; otherwise wait for the release.
-                self.dragging_divider = matches!(self.hit_test(col, row), MouseRegion::Divider);
-                Effects::noop()
+                // A press on the divider begins a resize drag; on a scrollbar it begins a scroll
+                // drag AND jumps to the pressed position (click-to-scroll). Anything else waits for
+                // the release (a click).
+                match self.hit_test(col, row) {
+                    MouseRegion::Divider => {
+                        self.drag = Some(Drag::Divider);
+                        Effects::noop()
+                    }
+                    MouseRegion::ContentVBar => {
+                        self.drag = Some(Drag::ContentV);
+                        self.scroll_content_to_row(row)
+                    }
+                    MouseRegion::ContentHBar => {
+                        self.drag = Some(Drag::ContentH);
+                        self.scroll_content_h_to_col(col)
+                    }
+                    MouseRegion::TreeHBar => {
+                        self.drag = Some(Drag::TreeH);
+                        self.scroll_tree_h_to_col(col)
+                    }
+                    _ => Effects::noop(),
+                }
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
-                self.resize_split_to_col(col)
-            }
+            MouseEventKind::Drag(MouseButton::Left) => match self.drag {
+                Some(Drag::Divider) => self.resize_split_to_col(col),
+                Some(Drag::ContentV) => self.scroll_content_to_row(row),
+                Some(Drag::ContentH) => self.scroll_content_h_to_col(col),
+                Some(Drag::TreeH) => self.scroll_tree_h_to_col(col),
+                None => Effects::noop(),
+            },
             MouseEventKind::Up(MouseButton::Left) => {
-                if std::mem::take(&mut self.dragging_divider) {
-                    return Effects::noop(); // end of a resize drag, not a click
+                if self.drag.take().is_some() {
+                    return Effects::noop(); // end of a drag, not a click
                 }
                 self.handle_click(col, row)
             }
@@ -869,7 +898,12 @@ impl Controller {
                 self.focus = Focus::Content;
                 Effects::redraw()
             }
-            MouseRegion::Divider | MouseRegion::Outside => {
+            // Scrollbars are handled on press/drag (above), not as a click; reaching here is inert.
+            MouseRegion::Divider
+            | MouseRegion::ContentVBar
+            | MouseRegion::ContentHBar
+            | MouseRegion::TreeHBar
+            | MouseRegion::Outside => {
                 self.last_click = None;
                 Effects::noop()
             }
@@ -894,16 +928,75 @@ impl Controller {
         }
     }
 
-    /// Horizontal wheel / trackpad swipe over the content pane scrolls it sideways, like the
-    /// `←`/`→` keys (for unwrapped long lines). Over the tree it does nothing — the tree has no
-    /// horizontal scroll. `scroll_content_h` clamps to `[0, widest − viewport]` (zero while
-    /// wrapping), so it is inert on wrapped prose, matching the keys.
+    /// Horizontal wheel / trackpad swipe scrolls sideways: the content pane (like the `←`/`→`
+    /// keys, for unwrapped long lines) or the tree (which has no h-scroll keys). Each clamps to
+    /// `[0, widest − viewport]`, so it is inert when nothing overflows.
     fn hscroll_at(&mut self, col: u16, row: u16, delta: i32) -> Effects {
-        if matches!(self.hit_test(col, row), MouseRegion::Content) {
-            self.scroll_content_h(delta)
-        } else {
-            Effects::noop()
+        match self.hit_test(col, row) {
+            MouseRegion::Content => self.scroll_content_h(delta),
+            MouseRegion::TreeRow(_) => self.scroll_tree_h(delta),
+            _ => Effects::noop(),
         }
+    }
+
+    /// Scroll the tree horizontally by `delta` columns, clamped to `[0, widest − tree width]` from
+    /// the last drawn frame, so a long / deeply-nested row can be read sideways without ever
+    /// over-scrolling past the content.
+    fn scroll_tree_h(&mut self, delta: i32) -> Effects {
+        let max = self
+            .geom
+            .tree_inner
+            .map_or(0, |t| self.geom.tree_content_width.saturating_sub(t.width));
+        let next = (self.tree_hscroll as i32 + delta).clamp(0, max as i32);
+        self.tree_hscroll = next as u16;
+        Effects::redraw()
+    }
+
+    /// Map a vertical position on the content scrollbar track to a content scroll offset (drag /
+    /// click-to-scroll). The track spans the content interior's rows; the fraction maps linearly
+    /// onto `[0, max_content_scroll]`. Rounds to the nearest line. No-op without overflow.
+    fn scroll_content_to_row(&mut self, row: u16) -> Effects {
+        let Some(c) = self.geom.content_inner else {
+            return Effects::noop();
+        };
+        let max = self.max_content_scroll();
+        if c.height <= 1 || max == 0 {
+            return Effects::noop();
+        }
+        let rel = row.saturating_sub(c.y).min(c.height - 1) as u32;
+        let span = (c.height - 1) as u32;
+        self.content_scroll = ((rel * max as u32 + span / 2) / span) as u16;
+        Effects::redraw()
+    }
+
+    /// Map a horizontal position on the content horizontal scrollbar to a content h-scroll offset.
+    fn scroll_content_h_to_col(&mut self, col: u16) -> Effects {
+        let Some(c) = self.geom.content_inner else {
+            return Effects::noop();
+        };
+        let max = self.max_content_hscroll();
+        if c.width <= 1 || max == 0 {
+            return Effects::noop();
+        }
+        let rel = col.saturating_sub(c.x).min(c.width - 1) as u32;
+        let span = (c.width - 1) as u32;
+        self.content_hscroll = ((rel * max as u32 + span / 2) / span) as u16;
+        Effects::redraw()
+    }
+
+    /// Map a horizontal position on the tree's horizontal scrollbar to a tree h-scroll offset.
+    fn scroll_tree_h_to_col(&mut self, col: u16) -> Effects {
+        let Some(t) = self.geom.tree_inner else {
+            return Effects::noop();
+        };
+        let max = self.geom.tree_content_width.saturating_sub(t.width);
+        if t.width <= 1 || max == 0 {
+            return Effects::noop();
+        }
+        let rel = col.saturating_sub(t.x).min(t.width - 1) as u32;
+        let span = (t.width - 1) as u32;
+        self.tree_hscroll = ((rel * max as u32 + span / 2) / span) as u16;
+        Effects::redraw()
     }
 
     /// During a divider drag, set the split so the divider tracks the cursor column — clamped
@@ -926,6 +1019,32 @@ impl Controller {
             && (col == dx || col + 1 == dx)
         {
             return MouseRegion::Divider;
+        }
+        // Scrollbars sit on the block borders (just outside the interior rects), drawn only when
+        // the pane overflows — so a hit counts only when the matching scrollbar is actually drawn.
+        // The content pane's vertical bar is on its right border; both panes' horizontal bars are
+        // on their bottom border. (The tree's vertical bar shares the divider column, so it is not
+        // hit-tested as draggable — see `Drag`.)
+        if let Some(c) = self.geom.content_inner {
+            if col == c.x + c.width
+                && (c.y..c.y + c.height).contains(&row)
+                && self.max_content_scroll() > 0
+            {
+                return MouseRegion::ContentVBar;
+            }
+            if row == c.y + c.height
+                && (c.x..c.x + c.width).contains(&col)
+                && self.max_content_hscroll() > 0
+            {
+                return MouseRegion::ContentHBar;
+            }
+        }
+        if let Some(t) = self.geom.tree_inner
+            && row == t.y + t.height
+            && (t.x..t.x + t.width).contains(&col)
+            && self.geom.tree_content_width > t.width
+        {
+            return MouseRegion::TreeHBar;
         }
         if let Some(t) = self.geom.tree_inner
             && t.contains(Position { x: col, y: row })
@@ -1545,7 +1664,24 @@ enum MouseRegion {
     TreeRow(usize),
     Content,
     Divider,
+    /// The content pane's vertical scrollbar (right border) — drag up/down to scroll.
+    ContentVBar,
+    /// The content pane's horizontal scrollbar (bottom border) — drag left/right to scroll.
+    ContentHBar,
+    /// The tree's horizontal scrollbar (bottom border) — drag left/right to scroll the tree.
+    TreeHBar,
     Outside,
+}
+
+/// What a held left-button drag is currently manipulating. Set on press, cleared on release.
+/// (The tree's *vertical* scrollbar shares the divider column, so it is not draggable — the tree
+/// scrolls vertically via the wheel / selection instead.)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drag {
+    Divider,
+    ContentV,
+    ContentH,
+    TreeH,
 }
 
 /// Two left-clicks on the same **row** within [`DOUBLE_CLICK`] are a double-click. The column

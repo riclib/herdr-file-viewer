@@ -54,6 +54,11 @@ pub struct ViewState {
     /// so selecting a row already in view (e.g. a mouse click) never jumps the viewport (#45). `0`
     /// on the first frame and whenever every node fits.
     pub tree_scroll: u16,
+    /// The tree's horizontal scroll offset, in columns — so a deeply-nested or long file name can
+    /// be read sideways when it overflows the tree column. Driven by the horizontal wheel and by
+    /// dragging the tree's horizontal scrollbar (the `←`/`→` keys are expand/collapse in the tree).
+    /// The Presenter clamps it to the widest row at draw, so it can never over-scroll.
+    pub tree_hscroll: u16,
     /// Wrap long content lines (prose: markdown / plain text) instead of truncating them.
     /// Off for diffs and code, whose column alignment must be preserved.
     pub wrap: bool,
@@ -140,6 +145,18 @@ fn row_color(node: &Node) -> Option<Color> {
             None => None,
         },
     }
+}
+
+/// The widest visible tree row, in display columns — drives the tree's horizontal scrollbar and
+/// the controller's horizontal-scroll clamp. Computed from the same [`tree_row`] the tree draws
+/// (selection-independent: the REVERSED highlight doesn't change a row's width), so the drawn
+/// rows and the hit-test/clamp can never disagree.
+fn tree_rows_max_width(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| tree_row(n, false).width())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Render one tree row: `<marker> <indent><glyph><name>`. Indentation grows with depth so
@@ -274,11 +291,21 @@ fn draw_tree(frame: &mut Frame, area: Rect, state: &ViewState) {
         inner.height as usize,
         state.tree_scroll as usize,
     );
+    // Horizontal scroll for long / deeply-nested rows (the tree has no h-scroll keys — ←/→ are
+    // expand/collapse — so this is driven by the wheel and by dragging the tree's h-scrollbar).
+    // Clamp to the widest row so it can never over-scroll past the content.
+    let max_width = tree_rows_max_width(&state.nodes);
+    let hmax = max_width.saturating_sub(inner.width as usize);
+    let hoff = (state.tree_hscroll as usize).min(hmax);
     frame.render_widget(
-        Paragraph::new(rows).scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        Paragraph::new(rows).scroll((
+            offset.min(u16::MAX as usize) as u16,
+            hoff.min(u16::MAX as usize) as u16,
+        )),
         inner,
     );
-    // A vertical scrollbar on the right border when there are more nodes than fit.
+    // A vertical scrollbar on the right border when there are more nodes than fit, and a
+    // horizontal one on the bottom border when the widest row overflows the column.
     draw_vscrollbar(
         frame,
         area,
@@ -286,6 +313,7 @@ fn draw_tree(frame: &mut Frame, area: Rect, state: &ViewState) {
         offset,
         inner.height as usize,
     );
+    draw_hscrollbar(frame, area, max_width, hoff, inner.width as usize);
 }
 
 /// Draw the right column: a notices strip (if any) above the content pane. Returns the
@@ -425,6 +453,9 @@ pub struct PaneGeometry {
     /// the same value [`draw_tree`] scrolled by. Hit-testing adds it to map a screen row to the
     /// node actually drawn there. `0` when every node fits.
     pub tree_scroll: u16,
+    /// The widest visible tree row, in columns — so the controller can clamp the tree's horizontal
+    /// scroll and map a drag on the tree's horizontal scrollbar to an offset. `0` when no tree.
+    pub tree_content_width: u16,
     pub content_inner: Option<Rect>,
     pub divider_x: Option<u16>,
 }
@@ -450,11 +481,19 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         )
         .min(u16::MAX as usize) as u16
     });
+    // The widest tree row, so the controller can clamp tree h-scroll + map a drag on the tree's
+    // h-scrollbar. Only meaningful when the tree is drawn.
+    let tree_content_width = if tree_inner.is_some() {
+        tree_rows_max_width(&state.nodes).min(u16::MAX as usize) as u16
+    } else {
+        0
+    };
     PaneGeometry {
         area_x: body.x,
         area_width: body.width,
         tree_inner,
         tree_scroll,
+        tree_content_width,
         content_inner: content.map(inner),
         divider_x,
     }
