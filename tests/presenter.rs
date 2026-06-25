@@ -594,6 +594,7 @@ fn picker_state() -> ViewState {
             },
         ],
         cursor: 1, // the feature-x row is highlighted (non-zero) — NOT the current row (row 0)
+        hscroll: 0,
     });
     state
 }
@@ -769,7 +770,11 @@ fn picker_overlay_keeps_cursor_visible_with_many_rows() {
             agent: None,
         })
         .collect();
-    state.picker = Some(PickerView { rows, cursor: 37 }); // near the end
+    state.picker = Some(PickerView {
+        rows,
+        cursor: 37,
+        hscroll: 0,
+    }); // near the end
 
     let buf = render_buffer(&state, 100, 24);
 
@@ -803,6 +808,178 @@ fn picker_overlay_keeps_cursor_visible_with_many_rows() {
             .modifier
             .contains(Modifier::REVERSED),
         "the visible cursor row must be REVERSED-highlighted"
+    );
+}
+
+/// Locate the picker overlay's border box in the buffer. The two-column layout also draws
+/// `┌…┐` corners, so anchor on the overlay's title ("Switch worktree"): its `┌` corner is the
+/// cell just left of the title, the `┐` corner is the first `┐` to the right of the title on
+/// that row (gives the right edge), and the box's bottom edge is the first `┘` directly below
+/// the right edge. Returns `(x0, y0, x1, y1)` inclusive. Panics if the picker is not found.
+fn picker_border_box(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
+    let (w, h) = (buf.area().width, buf.area().height);
+    let title = "Switch worktree";
+    // Find the title row + its starting column.
+    let mut anchor: Option<(u16, u16)> = None;
+    'find: for y in 0..h {
+        for x in 0..w {
+            let here = title.chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if here {
+                anchor = Some((x, y));
+                break 'find;
+            }
+        }
+    }
+    let (tx, y0) = anchor.expect("picker title not found in buffer");
+    let x0 = tx - 1; // the `┌` corner is just left of the title
+    // The top-right `┐` is the first one to the right of the title on the same row.
+    let mut x1 = None;
+    for x in tx..w {
+        if buf.cell((x, y0)).is_some_and(|c| c.symbol() == "┐") {
+            x1 = Some(x);
+            break;
+        }
+    }
+    let x1 = x1.expect("picker top-right corner");
+    // The bottom edge is the first `┘` at column x1 below the title row.
+    let mut y1 = None;
+    for y in (y0 + 1)..h {
+        if buf.cell((x1, y)).is_some_and(|c| c.symbol() == "┘") {
+            y1 = Some(y);
+            break;
+        }
+    }
+    let y1 = y1.expect("picker bottom-right corner");
+    (x0, y0, x1, y1)
+}
+
+#[test]
+fn picker_box_is_sized_to_its_content_not_the_whole_pane() {
+    // Picker-layout §2: the overlay box is sized to its content (a few short worktree rows),
+    // not a fixed 60% of the pane. With 3 short rows in an 80x24 frame, the box must be far
+    // smaller than the frame — a tidy box, not a half-screen modal.
+    let buf = render_buffer(&picker_state(), 80, 24);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+    let box_w = x1 - x0 + 1;
+    let box_h = y1 - y0 + 1;
+    // 3 content rows + title + 2 borders ⇒ height ~6; the longest row
+    // "  /work/feature [feature-x]  ● working" is ~38 cols + 2 borders ⇒ width ~40.
+    assert!(
+        box_w < 60,
+        "the box is sized to its content, not ~60% of an 80-col pane (got width {box_w})"
+    );
+    assert!(
+        box_h <= 8,
+        "the box height tracks the row count, not ~60% of 24 rows (got height {box_h})"
+    );
+    assert!(
+        box_w >= 30,
+        "the box is wide enough for the rows (got {box_w})"
+    );
+}
+
+#[test]
+fn picker_box_clamps_to_a_narrow_frame_without_panicking() {
+    // Picker-layout §2: rows wider than the frame must not overflow it — the box caps at the
+    // pane (minus a small margin) and the draw must not panic at a small frame size.
+    let mut state = picker_state();
+    // A very long path — far wider than a 30-col frame.
+    if let Some(p) = state.picker.as_mut() {
+        p.rows[1].path = "/work/some/really/long/nested/worktree/path/that/overflows".to_string();
+    }
+    let buf = render_buffer(&state, 30, 10);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+    assert!(x1 < 30, "the box right edge stays inside the 30-col frame");
+    assert!(y1 < 10, "the box bottom edge stays inside the 10-row frame");
+    assert!(x0 < x1 && y0 < y1, "the box is a valid non-empty rect");
+    // No panic getting here is the core assertion (saturating Rect math at a small size).
+}
+
+#[test]
+fn picker_border_is_blue() {
+    // Picker-layout §1: the overlay border renders in the terminal's ANSI blue (matching herdr's
+    // terminal-theme chrome). Assert the `┌` corner cell carries Color::Blue.
+    use ratatui::style::Color;
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, y0, _, _) = picker_border_box(&buf);
+    let corner = buf.cell((x0, y0)).expect("picker corner cell");
+    assert_eq!(
+        corner.symbol(),
+        "┌",
+        "located the picker's top-left border corner"
+    );
+    assert_eq!(
+        corner.fg,
+        Color::Blue,
+        "the picker border is ANSI blue (herdr terminal-theme chrome)"
+    );
+}
+
+#[test]
+fn picker_applies_horizontal_scroll_to_clip_long_rows() {
+    // Picker-layout §3: when a row is wider than the box (long path on a narrow pane), a non-zero
+    // hscroll shifts the visible text left so later columns become readable, and the leading
+    // columns are clipped off.
+    let mut state = picker_state();
+    if let Some(p) = state.picker.as_mut() {
+        p.rows = vec![PickerRowView {
+            path: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_string(),
+            branch: None,
+            detached: false,
+            is_current: false,
+            agent: None,
+        }];
+        p.cursor = 0;
+        p.hscroll = 0;
+    }
+    // A narrow frame so the box caps and the row genuinely overflows.
+    let out0 = render(&state, 24, 8);
+    assert!(
+        out0.contains("ABCDE"),
+        "at hscroll 0 the row shows from its left edge\n{out0}"
+    );
+
+    if let Some(p) = state.picker.as_mut() {
+        p.hscroll = 8;
+    }
+    let out_shifted = render(&state, 24, 8);
+    assert!(
+        !out_shifted.contains("ABCDE"),
+        "with hscroll the leading columns are clipped off\n{out_shifted}"
+    );
+    assert!(
+        out_shifted.contains("IJKLM"),
+        "with hscroll later columns of the path become visible\n{out_shifted}"
+    );
+}
+
+#[test]
+fn picker_horizontal_scroll_clamps_past_the_end() {
+    // Picker-layout §3: an hscroll far past the widest row is clamped at draw — no panic and no
+    // over-scroll into blank space (the last columns stay visible, not scrolled off entirely).
+    let mut state = picker_state();
+    if let Some(p) = state.picker.as_mut() {
+        p.rows = vec![PickerRowView {
+            path: "ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string(),
+            branch: None,
+            detached: false,
+            is_current: false,
+            agent: None,
+        }];
+        p.cursor = 0;
+        p.hscroll = 9999; // absurdly far past the end
+    }
+    let out = render(&state, 24, 8);
+    // Clamped, not blanked: the tail of the path is still visible.
+    assert!(
+        out.contains("XYZ"),
+        "an over-scroll clamps so the row's tail stays visible (no blank box)\n{out}"
     );
 }
 

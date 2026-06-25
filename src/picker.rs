@@ -11,4 +11,9 @@ pub struct PickerState {
     /// AC-20). All `None` when herdr is absent (AC-15).
     pub agent_statuses: Vec<Option<String>>,
     pub cursor: usize,
+    /// Horizontal scroll offset (columns) for the overlay rows, so long worktree paths can be
+    /// read sideways when the box caps at a narrow pane. A raw monotonic value driven by
+    /// Expand/Collapse; the Presenter clamps it to the live inner width at draw. 0 when the
+    /// picker opens (reset each time) and a no-op while every row fits.
+    pub hscroll: u16,
 }

@@ -71,6 +71,9 @@ pub struct PickerView {
     pub rows: Vec<PickerRowView>,
     /// Index into `rows` of the highlighted row.
     pub cursor: usize,
+    /// Raw horizontal scroll offset (columns) carried from the controller. The Presenter clamps
+    /// it to the live inner width at draw, so it can never over-scroll past the widest row.
+    pub hscroll: u16,
 }
 
 /// One worktree row in the picker overlay.
@@ -335,21 +338,22 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
     dims
 }
 
-/// A `Rect` centered in `area`, sized to `percent_x` × `percent_y` of it — the classic ratatui
-/// centering recipe (three constraints per axis, the middle holding the requested percentage).
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(vertical[1])[1]
+/// A `Rect` of outer size `w` × `h`, centered in `area` and clamped so it never exceeds `area`.
+/// Used to size the picker overlay to its content (caller passes content + borders), capped at
+/// the pane. All math is saturating, so a frame smaller than the requested box never panics —
+/// the box simply shrinks to fit (down to a zero-area rect at a degenerate frame). Centering
+/// rounds the leftover margin down, biasing the box toward the top-left by at most one cell.
+fn centered_rect_sized(w: u16, h: u16, area: Rect) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 /// Draw the worktree picker as a centered, bordered list overlay on top of the columns (AC-1,
@@ -359,17 +363,44 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// `sanitize_label` first, so a worktree path or branch name carrying control bytes cannot
 /// move the cursor or spoof the UI (AC-27, defense-in-depth — exactly as the tree does).
 ///
+/// The box is **sized to its content** (the widest rendered row × the row count, plus the
+/// border and title), then **clamped to the frame** with a small margin and **centered** — so a
+/// few short worktrees draw a tidy box and many long paths grow up to the pane, then cap. It is
+/// recomputed every draw, so it is fully responsive to a pane resize.
+///
 /// When there are more rows than the popup interior is tall (herdr's multi-agent repos have
-/// many worktrees), the row window scrolls so the `cursor` row is always visible (AC-5). The
-/// offset is 0 while every row fits, so the small-list rendering is unchanged.
+/// many worktrees), the row window scrolls so the `cursor` row is always visible (AC-5). When a
+/// row is wider than the (capped) interior, `picker.hscroll` shifts the rows horizontally so a
+/// long path can be read sideways; it is clamped here to `[0, max_row_width - inner_width]`, so
+/// it is a no-op while everything fits and can never over-scroll past the widest row.
 fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
-    let popup = centered_rect(60, 60, area);
+    // Build every row once so we can both measure widths (size-to-content) and draw the window.
+    let rows: Vec<Line> = picker
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| picker_row(row, i == picker.cursor))
+        .collect();
+
+    // Desired interior: the widest row (display width, not byte len — `Line::width` counts
+    // unicode columns) × the row count. The box adds the two border rows/cols plus one title row.
+    let max_row_width = rows.iter().map(Line::width).max().unwrap_or(0);
+    let desired_inner_w = max_row_width.min(u16::MAX as usize) as u16;
+    let desired_inner_h = (rows.len().min(u16::MAX as usize) as u16).max(1);
+    // +2 for the borders on each axis; the title shares the top border row, so no extra height.
+    let want_w = desired_inner_w.saturating_add(2);
+    let want_h = desired_inner_h.saturating_add(2);
+    // Cap at the pane, leaving a one-cell margin all round (never exceed, never underflow).
+    let cap_w = area.width.saturating_sub(2);
+    let cap_h = area.height.saturating_sub(2);
+    let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
+
     // Clear whatever the columns drew beneath the popup so it reads as a true modal.
     frame.render_widget(Clear, popup);
 
     let block = Block::bordered()
         .title("Switch worktree")
-        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -379,15 +410,15 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     let visible = inner.height as usize;
     let offset = picker_scroll_offset(picker.cursor, picker.rows.len(), visible);
 
-    let rows: Vec<Line> = picker
-        .rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible)
-        .map(|(i, row)| picker_row(row, i == picker.cursor))
-        .collect();
-    frame.render_widget(Paragraph::new(rows), inner);
+    // Clamp the horizontal scroll to the live interior: at most `max_row_width - inner_width`
+    // (0 when every row fits). Saturating, so a narrow box never underflows.
+    let max_hscroll = desired_inner_w.saturating_sub(inner.width);
+    let hscroll = picker.hscroll.min(max_hscroll);
+
+    let window: Vec<Line> = rows.into_iter().skip(offset).take(visible).collect();
+    // `Paragraph::scroll((y, x))` clips the leading `x` columns off each line — the horizontal
+    // read for long paths. The vertical window is already applied by skip/take, so y stays 0.
+    frame.render_widget(Paragraph::new(window).scroll((0, hscroll)), inner);
 }
 
 /// The first row index to render so the `cursor` row stays within a window of `visible` rows.

@@ -2012,6 +2012,64 @@ fn picker_navdown_moves_cursor_and_navup_decrements_and_clamps() {
 }
 
 #[test]
+fn picker_expand_scrolls_right_and_collapse_scrolls_left_clamped() {
+    // Picker-layout §3: while the picker is open, Expand (Right / `l`) scrolls the overlay
+    // content right (hscroll increases) and Collapse (Left / `h`) scrolls it left (decreases,
+    // clamped at 0). The cursor (row selection) is untouched, and the picker stays open. The
+    // controller keeps a raw monotonic hscroll; the Presenter clamps it to the live inner
+    // width at draw, so here we only assert the raw value moves in the right direction.
+    let (mut ctrl, _, _) = setup_picker_with_two_worktrees();
+    assert_eq!(
+        ctrl.picker().unwrap().hscroll,
+        0,
+        "hscroll starts at 0 when the picker opens"
+    );
+    let cursor_before = ctrl.picker().unwrap().cursor;
+
+    // Collapse at hscroll 0 is a clamped no-op (already left-most → no redraw).
+    let fx = ctrl.handle(Intent::Collapse);
+    assert_eq!(
+        ctrl.picker().unwrap().hscroll,
+        0,
+        "Collapse at hscroll 0 clamps (stays 0)"
+    );
+    assert!(!fx.redraw, "a clamped Collapse does not redraw");
+
+    // Expand scrolls right by one step.
+    let fx = ctrl.handle(Intent::Expand);
+    assert!(fx.redraw, "Expand scrolls right → redraw");
+    let after_one = ctrl.picker().unwrap().hscroll;
+    assert!(after_one > 0, "Expand increments hscroll");
+
+    // Another Expand scrolls further right.
+    ctrl.handle(Intent::Expand);
+    assert!(
+        ctrl.picker().unwrap().hscroll > after_one,
+        "a second Expand scrolls further right"
+    );
+
+    // Collapse scrolls back left.
+    let fx = ctrl.handle(Intent::Collapse);
+    assert!(fx.redraw, "Collapse scrolls left → redraw");
+    assert_eq!(
+        ctrl.picker().unwrap().hscroll,
+        after_one,
+        "Collapse returns to the previous step"
+    );
+
+    // Cursor never moved, picker stays open.
+    assert_eq!(
+        ctrl.picker().unwrap().cursor,
+        cursor_before,
+        "horizontal scroll does not move the row cursor"
+    );
+    assert!(
+        ctrl.picker().is_some(),
+        "picker stays open through hscroll intents"
+    );
+}
+
+#[test]
 fn picker_activate_reroots_to_selected_and_closes_picker() {
     // AC-7 + AC-5: Activate confirms — re-roots to the selected (non-current) worktree and
     // closes the picker.
