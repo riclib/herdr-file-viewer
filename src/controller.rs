@@ -641,20 +641,24 @@ impl Controller {
     }
 
     /// The owned picker draw model for the Presenter (AC-1, AC-5), or `None` when the picker is
-    /// closed. Maps each worktree row to a [`PickerRowView`] (path + branch + detached) and
-    /// carries the cursor; the path display string is the worktree's full path — informative for
-    /// choosing among worktrees. The Presenter sanitizes the strings (AC-27) and renders the
-    /// detached marker (AC-2).
+    /// closed. Maps each worktree row to a [`PickerRowView`] (path + branch + detached + the
+    /// current marker, AC-18, + the per-row agent status, AC-19) and carries the cursor; the path
+    /// display string is the worktree's full path — informative for choosing among worktrees. The
+    /// Presenter sanitizes the strings (AC-27) and renders the detached/current/agent markers.
     fn picker_view(&self) -> Option<PickerView> {
         let picker = self.picker.as_ref()?;
         Some(PickerView {
             rows: picker
                 .rows
                 .iter()
-                .map(|w| PickerRowView {
+                .enumerate()
+                .map(|(i, w)| PickerRowView {
                     path: w.path.to_string_lossy().into_owned(),
                     branch: w.branch.clone(),
                     detached: w.detached,
+                    is_current: w.is_current,
+                    // Aligned 1:1 with rows; `.get` is defensive against a future divergence.
+                    agent: picker.agent_statuses.get(i).cloned().flatten(),
                 })
                 .collect(),
             cursor: picker.cursor,
@@ -1284,30 +1288,45 @@ impl Controller {
             self.action_notice = Some("could not list worktrees".into());
             return Effects::redraw();
         }
+        // Fetch the herdr overlay ONCE (the two read-only list queries, AC-20) and feed BOTH the
+        // per-row status badges (AC-19) and the agent-active pre-select (AC-3) from it. With no
+        // overlay (herdr absent / query failed), rows carry no badge and the cursor falls back to
+        // the current root (AC-4, AC-15).
         let current_idx = rows.iter().position(|w| w.is_current).unwrap_or(0);
-        let cursor = self.agent_preselect(&rows).unwrap_or(current_idx);
-        self.picker = Some(PickerState { rows, cursor });
+        let overlay = self.herdr_overlay();
+        let agent_statuses = match &overlay {
+            Some((wt, ag)) => crate::worktree::agent_statuses(&rows, wt, ag),
+            None => vec![None; rows.len()],
+        };
+        let cursor = overlay
+            .as_ref()
+            .and_then(|(wt, ag)| {
+                crate::worktree::agent_active(&rows, wt, ag, self.our_workspace_id.as_deref())
+            })
+            .and_then(|active| rows.iter().position(|w| w.path == active))
+            .unwrap_or(current_idx);
+        self.picker = Some(PickerState {
+            rows,
+            agent_statuses,
+            cursor,
+        });
         Effects::redraw()
     }
 
-    /// The agent-active worktree's row index from the optional herdr overlay (AC-3); `None` when
-    /// no herdr, a query/parse failure, or no single agent worktree — caller falls back to current
-    /// (AC-4, AC-15).
-    fn agent_preselect(&self, rows: &[crate::worktree::Worktree]) -> Option<usize> {
+    /// Fetch the herdr agent overlay — the `worktree list` + `agent list` JSON — with exactly the
+    /// two read-only queries (AC-20), or `None` when herdr is absent or either query fails (a
+    /// git-only picker, AC-15). herdr's `worktree list` and `agent list` BOTH print JSON by
+    /// default; `agent list` REJECTS a `--json` flag (verified live against herdr 0.7.x — it exits
+    /// non-zero), so neither subcommand is passed the flag. (A prior `--json` on the agent query
+    /// made this overlay silently fail → always fall back to the current root, AC-4/AC-15.)
+    ///
+    /// This is the single point both the per-row status badges and the agent-active pre-select
+    /// derive from, so opening the picker issues exactly two herdr calls (T-10 spy test).
+    fn herdr_overlay(&self) -> Option<(String, String)> {
         let herdr = self.herdr.as_ref()?;
-        // herdr's `worktree list` and `agent list` BOTH print JSON by default; `agent list`
-        // REJECTS a `--json` flag (verified live against herdr 0.7.x — it exits non-zero), so we
-        // pass neither subcommand the flag. (A prior `--json` on the agent query made this overlay
-        // silently fail → always fall back to the current root, AC-4/AC-15.)
         let wt_json = herdr.run_json(&["worktree", "list"]).ok()?;
         let ag_json = herdr.run_json(&["agent", "list"]).ok()?;
-        let active = crate::worktree::agent_active(
-            rows,
-            &wt_json,
-            &ag_json,
-            self.our_workspace_id.as_deref(),
-        )?;
-        rows.iter().position(|w| w.path == active)
+        Some((wt_json, ag_json))
     }
 
     /// The pane regained focus (the run loop forwards herdr's focus events): re-read git state

@@ -124,9 +124,19 @@ struct HerdrWorktreeEntry {
 
 /// Serde-only view of one entry from `herdr agent list`.
 ///
-/// Only `workspace_id` is read; unknown fields are ignored.
+/// `herdr agent list` reports NON-agent panes too — entries with no `agent` field and an
+/// `agent_status` of `"unknown"`. A REAL agent is one where `agent` is present; only those are
+/// counted for pre-selection (AC-3) and per-row status badges (AC-19). Unknown fields are ignored;
+/// every field is `#[serde(default)]` so a missing field degrades to `None` rather than failing
+/// the parse (defensive — AC-15).
 #[derive(Deserialize)]
 struct HerdrAgentEntry {
+    /// Present only for a DETECTED agent (e.g. `"claude"`); absent for a plain pane.
+    #[serde(default)]
+    agent: Option<String>,
+    /// The agent's reported status (`working`/`idle`/`blocked`/`done`/`unknown`).
+    #[serde(default)]
+    agent_status: Option<String>,
     #[serde(default)]
     workspace_id: Option<String>,
 }
@@ -158,11 +168,15 @@ pub fn agent_active(
     agent_json: &str,
     our_workspace_id: Option<&str>,
 ) -> Option<PathBuf> {
-    // Step 1 — parse agent workspaces (defensive).
+    // Step 1 — parse agent workspaces (defensive). Only entries with a present `agent` field
+    // are REAL agents; non-agent panes (no `agent`, `agent_status: "unknown"`) are excluded so
+    // an idle pane can never mask the agent-active pre-select (AC-3) — consistent with the
+    // per-row status badges (AC-19).
     let agent_workspaces: HashSet<String> = {
         let entries: Vec<HerdrAgentEntry> = serde_json::from_str(agent_json).unwrap_or_default();
         entries
             .into_iter()
+            .filter(|e| e.agent.is_some())
             .filter_map(|e| e.workspace_id)
             .filter(|ws| !ws.is_empty())
             .collect()
@@ -232,6 +246,65 @@ pub fn agent_active(
             canon_w == canon_chosen
         })
         .map(|w| w.path.clone())
+}
+
+/// Per-worktree agent status from the herdr overlay, aligned 1:1 with `worktrees` (same order
+/// and length). `Some(status)` when that worktree's `open_workspace_id` hosts a REAL agent
+/// (`agent` present) — the agent's `agent_status`; `None` otherwise. Defensive: malformed JSON →
+/// all `None`. Pure over the passed-in strings (no fs/process/herdr call).
+///
+/// This reuses the *same* `worktree list` + `agent list` JSON the picker already fetched for the
+/// agent-active pre-select, so it adds no extra subprocess cost (AC-20). Path matching uses the
+/// same canonicalize-with-fallback idiom as [`list`]'s `is_current` fix, so a symlinked worktree
+/// dir (or macOS `/tmp` vs `/private/tmp`) still matches.
+pub fn agent_statuses(
+    worktrees: &[Worktree],
+    worktree_json: &str,
+    agent_json: &str,
+) -> Vec<Option<String>> {
+    // workspace_id → agent_status, for REAL agents only (an entry with a present `agent`). A
+    // non-agent pane (no `agent`) is skipped, so it contributes no badge (AC-19).
+    let mut status_by_ws: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let agents: Vec<HerdrAgentEntry> = serde_json::from_str(agent_json).unwrap_or_default();
+    for e in agents {
+        if e.agent.is_none() {
+            continue; // plain pane, not a real agent
+        }
+        if let Some(ws) = e.workspace_id.filter(|ws| !ws.is_empty()) {
+            status_by_ws.insert(ws, e.agent_status);
+        }
+    }
+
+    // path (canonicalized) → open_workspace_id, from the herdr worktree list.
+    let wt_entries: Vec<HerdrWorktreeEntry> =
+        serde_json::from_str(worktree_json).unwrap_or_default();
+    let mut ws_by_canon_path: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+    for e in wt_entries {
+        let (Some(path), Some(ws)) = (e.path, e.open_workspace_id) else {
+            continue;
+        };
+        if ws.is_empty() {
+            continue;
+        }
+        let pb = PathBuf::from(path);
+        let canon = pb.canonicalize().unwrap_or(pb);
+        ws_by_canon_path.insert(canon, ws);
+    }
+
+    worktrees
+        .iter()
+        .map(|w| {
+            let canon_w = w.path.canonicalize().unwrap_or_else(|_| w.path.clone());
+            let ws = ws_by_canon_path.get(&canon_w)?;
+            // The workspace hosts a real agent → its status (falling back to "unknown" only if
+            // the agent reported no status, which shouldn't happen in practice).
+            status_by_ws
+                .get(ws)
+                .map(|s| s.clone().unwrap_or_else(|| "unknown".to_string()))
+        })
+        .collect()
 }
 
 /// Parse a single record (the set of attribute lines for one worktree).

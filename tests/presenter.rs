@@ -563,8 +563,10 @@ fn no_banner_reserves_no_row_and_shows_nothing() {
     );
 }
 
-/// A picker overlay over the two-column layout: a normal worktree, a second branch, and a
-/// detached-HEAD worktree, with a non-zero cursor.
+/// A picker overlay over the two-column layout: the CURRENT worktree (current marker, no agent),
+/// a second branch hosting a `working` agent (cursor row + agent badge), and a detached-HEAD
+/// worktree (no agent). Exercises the current marker, the agent badge, and the detached marker
+/// together — and proves the current marker (row 0) is distinct from the REVERSED cursor (row 1).
 fn picker_state() -> ViewState {
     let mut state = sample_state();
     state.picker = Some(PickerView {
@@ -573,19 +575,25 @@ fn picker_state() -> ViewState {
                 path: "/work/main".to_string(),
                 branch: Some("main".to_string()),
                 detached: false,
+                is_current: true,
+                agent: None,
             },
             PickerRowView {
                 path: "/work/feature".to_string(),
                 branch: Some("feature-x".to_string()),
                 detached: false,
+                is_current: false,
+                agent: Some("working".to_string()),
             },
             PickerRowView {
                 path: "/work/detached".to_string(),
                 branch: None,
                 detached: true,
+                is_current: false,
+                agent: None,
             },
         ],
-        cursor: 1, // the feature-x row is highlighted (non-zero)
+        cursor: 1, // the feature-x row is highlighted (non-zero) — NOT the current row (row 0)
     });
     state
 }
@@ -661,6 +669,88 @@ fn picker_highlights_the_cursor_row() {
 }
 
 #[test]
+fn picker_marks_the_current_worktree_distinctly_from_the_cursor() {
+    // AC-18: the current worktree carries a "current" marker that is visually distinct from the
+    // selection cursor. In the fixture, row 0 (/work/main) is the current root but NOT the cursor
+    // (cursor is row 1, the agent row). So: the current marker glyph (●) renders, and the current
+    // row is NOT reversed while the cursor row IS — a row can be current without being selected.
+    use ratatui::style::Modifier;
+    let out = render(&picker_state(), 100, 24);
+    assert!(
+        out.contains('●'),
+        "the current worktree shows a current marker (●)\n{out}"
+    );
+
+    let buf = render_buffer(&picker_state(), 100, 24);
+    // Locate the row containing "main" (the current, non-cursor row) and "feature-x" (the cursor
+    // row) and compare their modifiers: current ≠ reversed; cursor = reversed.
+    let find = |needle: &str| -> Modifier {
+        let (w, h) = (buf.area().width, buf.area().height);
+        for y in 0..h {
+            for x in 0..w {
+                let matches = needle.chars().enumerate().all(|(i, ch)| {
+                    let cx = x + i as u16;
+                    cx < w
+                        && buf
+                            .cell((cx, y))
+                            .is_some_and(|c| c.symbol() == ch.to_string())
+                });
+                if matches {
+                    return buf.cell((x, y)).unwrap().modifier;
+                }
+            }
+        }
+        panic!("{needle:?} not found");
+    };
+    assert!(
+        !find("main").contains(Modifier::REVERSED),
+        "the current row (main) is the current root but NOT the cursor → not REVERSED"
+    );
+    assert!(
+        find("feature-x").contains(Modifier::REVERSED),
+        "the cursor row (feature-x) IS REVERSED — distinct from the current marker"
+    );
+}
+
+#[test]
+fn picker_shows_an_agent_status_badge_only_for_agent_rows() {
+    // AC-19: a worktree whose workspace hosts a running agent shows that agent's status as a
+    // badge; a worktree with no agent shows none. In the fixture only the feature-x row has an
+    // agent (`working`), so the status text appears exactly once and the current/detached rows
+    // carry no badge.
+    let out = render(&picker_state(), 100, 24);
+    assert!(
+        out.contains("working"),
+        "the agent row shows its status badge (working)\n{out}"
+    );
+    // The status string is colored — assert it lands in the buffer with a non-default fg so it
+    // reads as a badge, not plain text.
+    use ratatui::style::Color;
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (w, h) = (buf.area().width, buf.area().height);
+    let mut badge_fg: Option<Color> = None;
+    'outer: for y in 0..h {
+        for x in 0..w {
+            let matches = "working".chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if matches {
+                badge_fg = Some(buf.cell((x, y)).unwrap().fg);
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        matches!(badge_fg, Some(c) if c != Color::Reset),
+        "the agent badge is colored by status, got {badge_fg:?}"
+    );
+}
+
+#[test]
 fn picker_overlay_keeps_cursor_visible_with_many_rows() {
     // AC-5: on a repo with more worktrees than fit in the popup (herdr's multi-agent use case),
     // moving the cursor toward the end must scroll the row window so the highlighted row stays
@@ -675,6 +765,8 @@ fn picker_overlay_keeps_cursor_visible_with_many_rows() {
             path: format!("/work/wt-{i:02}"),
             branch: Some(format!("branch-{i:02}")),
             detached: false,
+            is_current: false,
+            agent: None,
         })
         .collect();
     state.picker = Some(PickerView { rows, cursor: 37 }); // near the end

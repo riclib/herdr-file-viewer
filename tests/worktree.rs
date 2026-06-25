@@ -343,17 +343,18 @@ fn worktree_json_three() -> &'static str {
     ]"#
 }
 
-/// Canned `herdr agent list` output — agents in ws-1 and ws-2 (both active).
+/// Canned `herdr agent list` output — agents in ws-1 and ws-2 (both active). Each entry carries
+/// an `agent` field so the real-agent filter detects it (a non-agent pane omits `agent`).
 fn agent_json_two_workspaces() -> &'static str {
     r#"[
-        {"id": "agent-abc", "workspace_id": "ws-1"},
-        {"id": "agent-xyz", "workspace_id": "ws-2"}
+        {"id": "agent-abc", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"},
+        {"id": "agent-xyz", "agent": "claude", "agent_status": "idle", "workspace_id": "ws-2"}
     ]"#
 }
 
 /// Canned agent list — only ws-2 has an agent.
 fn agent_json_one_workspace() -> &'static str {
-    r#"[{"id": "agent-only", "workspace_id": "ws-2"}]"#
+    r#"[{"id": "agent-only", "agent": "claude", "agent_status": "working", "workspace_id": "ws-2"}]"#
 }
 
 /// Canned agent list — no agents at all.
@@ -512,7 +513,7 @@ fn agent_active_two_worktrees_same_workspace_is_ambiguous() {
         {"path": "/repo/wt-c", "open_workspace_id": "ws-3"}
     ]"#;
     // Agent list — only ws-1 has an agent.
-    let ag_json = r#"[{"id": "agent-only", "workspace_id": "ws-1"}]"#;
+    let ag_json = r#"[{"id": "agent-only", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"}]"#;
 
     let worktrees = make_worktrees();
     // No own-workspace hint: Tier 2 must count two qualifying entries → None.
@@ -541,4 +542,83 @@ fn agent_active_path_not_in_slice_returns_none() {
         None,
     );
     assert_eq!(result, None);
+}
+
+// ---------------------------------------------------------------------------
+// agent_statuses: per-row agent status from the herdr overlay (AC-18, AC-19, AC-20)
+// ---------------------------------------------------------------------------
+
+use herdr_file_viewer::worktree::agent_statuses;
+
+/// A worktree with a REAL agent (`agent` present) surfaces its `agent_status` at the matching
+/// row index; a worktree whose workspace has no agent — and a worktree not mentioned by herdr at
+/// all — surfaces `None`. The returned Vec is aligned 1:1 with the `worktrees` slice.
+#[test]
+fn agent_statuses_maps_real_agent_status_per_row() {
+    let worktrees = make_worktrees(); // wt-a, wt-b, wt-c (in that order)
+    // wt-a → ws-1 (working agent), wt-b → ws-2 (idle agent), wt-c → ws-3 (no agent).
+    let statuses = agent_statuses(
+        &worktrees,
+        worktree_json_three(),
+        agent_json_two_workspaces(),
+    );
+    assert_eq!(
+        statuses,
+        vec![Some("working".to_string()), Some("idle".to_string()), None,],
+        "per-row status aligns 1:1 with the worktrees slice"
+    );
+}
+
+/// A herdr `agent list` entry WITHOUT an `agent` field is a plain pane, not a real agent (AC-19):
+/// its workspace must yield no status. Here ws-2 hosts a plain pane (no `agent`), so wt-b → None.
+#[test]
+fn agent_statuses_ignores_non_agent_panes() {
+    let worktrees = make_worktrees();
+    // ws-2 entry has NO `agent` field → it is a plain pane, not a real agent.
+    let agent_json = r#"[
+        {"id": "real", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"},
+        {"id": "pane", "agent_status": "unknown", "workspace_id": "ws-2"}
+    ]"#;
+    let statuses = agent_statuses(&worktrees, worktree_json_three(), agent_json);
+    assert_eq!(
+        statuses,
+        vec![Some("working".to_string()), None, None],
+        "a non-agent pane (no `agent` field) contributes no status badge"
+    );
+}
+
+/// Malformed JSON (either argument) degrades to all-`None`, never a panic (AC-15, AC-20).
+#[test]
+fn agent_statuses_malformed_json_is_all_none() {
+    let worktrees = make_worktrees();
+    let n = worktrees.len();
+    assert_eq!(
+        agent_statuses(&worktrees, "not json {{{", agent_json_two_workspaces()),
+        vec![None; n],
+        "malformed worktree JSON → all None"
+    );
+    assert_eq!(
+        agent_statuses(&worktrees, worktree_json_three(), "also broken"),
+        vec![None; n],
+        "malformed agent JSON → all None"
+    );
+    assert_eq!(
+        agent_statuses(&worktrees, "bad", "bad"),
+        vec![None; n],
+        "both malformed → all None"
+    );
+}
+
+/// An empty worktrees slice yields an empty status Vec (the alignment invariant holds at length 0).
+#[test]
+fn agent_statuses_empty_worktrees_is_empty_vec() {
+    let worktrees: Vec<herdr_file_viewer::worktree::Worktree> = Vec::new();
+    assert_eq!(
+        agent_statuses(
+            &worktrees,
+            worktree_json_three(),
+            agent_json_two_workspaces()
+        ),
+        Vec::<Option<String>>::new()
+    );
 }

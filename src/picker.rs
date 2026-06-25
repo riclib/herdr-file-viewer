@@ -5,5 +5,10 @@ use crate::worktree::Worktree;
 /// controller) when the picker is closed.
 pub struct PickerState {
     pub rows: Vec<Worktree>,
+    /// Per-row agent status, aligned 1:1 with `rows` (`Some` when that worktree's herdr workspace
+    /// hosts a real agent — its `agent_status` — `None` otherwise). Built once when the picker
+    /// opens, from the same herdr overlay used for the preselect (no extra subprocess cost,
+    /// AC-20). All `None` when herdr is absent (AC-15).
+    pub agent_statuses: Vec<Option<String>>,
     pub cursor: usize,
 }

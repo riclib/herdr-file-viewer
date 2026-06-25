@@ -82,6 +82,12 @@ pub struct PickerRowView {
     /// `true` when HEAD is detached (no branch) — shown as a detached marker, never an empty
     /// branch (AC-2, gate L-1).
     pub detached: bool,
+    /// `true` when this is the worktree the viewer is currently rooted at — rendered as a leading
+    /// "current" marker, distinct from the selection cursor (AC-18).
+    pub is_current: bool,
+    /// The hosting agent's status (e.g. `"working"`), or `None` when the worktree's workspace
+    /// hosts no real agent. Rendered as a small trailing badge, colored by status (AC-19).
+    pub agent: Option<String>,
 }
 
 /// The single-character git-status marker shown beside a tree row (AC-7).
@@ -400,8 +406,28 @@ fn picker_scroll_offset(cursor: usize, len: usize, visible: usize) -> usize {
     }
 }
 
-/// Render one picker row: `<path> [branch]`, or `<path> (detached)` when detached (AC-2). The
-/// path and branch are sanitized (AC-27) and the row is reversed when it is the cursor row.
+/// The color for an agent-status badge: `working`/`done` green, `idle` blue, `blocked` red,
+/// anything else (incl. `unknown`) gray. Keeps the badge legible at a glance without overloading
+/// the row's meaning.
+fn agent_badge_color(status: &str) -> Color {
+    match status {
+        "working" | "done" => Color::Green,
+        "idle" => Color::Blue,
+        "blocked" => Color::Red,
+        _ => Color::Gray,
+    }
+}
+
+/// Render one picker row as `<current-marker> <path> [branch]|(detached) <agent-badge>`:
+///
+/// - a leading **current marker** (`●` in cyan) when the row is the worktree the viewer is rooted
+///   at, else a blank — visually distinct from the selection cursor, which stays `REVERSED` on the
+///   highlighted row (AC-18). A row can be current without being selected and vice versa.
+/// - the path + branch (or `(detached)` when HEAD is detached, AC-2), both sanitized (AC-27).
+/// - a trailing **agent badge** (`● <status>`, colored by status) when the worktree's workspace
+///   hosts a real agent, else nothing (AC-19). The status is sanitized too (defense-in-depth).
+///
+/// The whole row is `REVERSED` when it is the cursor row (the same idiom `tree_row` uses).
 fn picker_row(row: &PickerRowView, selected: bool) -> Line<'static> {
     let path = sanitize_label(&row.path);
     let suffix = match &row.branch {
@@ -410,11 +436,32 @@ fn picker_row(row: &PickerRowView, selected: bool) -> Line<'static> {
         // No branch and not detached: show nothing rather than an empty `[]` (defensive).
         None => String::new(),
     };
-    let mut style = Style::new();
-    if selected {
-        style = style.add_modifier(Modifier::REVERSED);
+
+    // Row-wide style: the REVERSED cursor highlight applies to every span on the selected row.
+    let base = if selected {
+        Style::new().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new()
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Leading current marker (AC-18): a cyan ● when current, two spaces otherwise so the path
+    // column stays aligned across current and non-current rows.
+    if row.is_current {
+        spans.push(Span::styled("● ", base.fg(Color::Cyan)));
+    } else {
+        spans.push(Span::styled("  ", base));
     }
-    Line::from(Span::styled(format!("{path}{suffix}"), style))
+    spans.push(Span::styled(format!("{path}{suffix}"), base));
+    // Trailing agent badge (AC-19): colored by status, sanitized (AC-27).
+    if let Some(status) = &row.agent {
+        let status = sanitize_label(status);
+        spans.push(Span::styled(
+            format!("  ● {status}"),
+            base.fg(agent_badge_color(&status)),
+        ));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]

@@ -1684,7 +1684,9 @@ fn switch_worktree_preselects_agent_active() {
         r#"[{{"path": "{}", "open_workspace_id": "ws-agent"}}]"#,
         linked_path
     );
-    let agent_json = r#"[{"id": "agent-1", "workspace_id": "ws-agent"}]"#.to_string();
+    let agent_json =
+        r#"[{"id": "agent-1", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}]"#
+            .to_string();
     ctrl.set_host(
         Box::new(FakeHerdr {
             worktree_json,
@@ -1712,6 +1714,136 @@ fn switch_worktree_preselects_agent_active() {
         !picker.rows[linked_idx].is_current,
         "the agent worktree differs from the current one"
     );
+}
+
+#[test]
+fn picker_populates_per_row_agent_statuses_from_the_overlay() {
+    // AC-19/AC-20: opening the picker surfaces each worktree's hosting-agent status as a per-row
+    // badge, derived ONLY from the same two herdr list queries the pre-select uses — no extra
+    // subprocess. The linked worktree hosts a `working` agent → Some("working"); the current
+    // worktree hosts none → None. The overlay is queried with exactly two read-only calls.
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+    let linked = TempDir::new();
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().unwrap(),
+            "-b",
+            "status-branch",
+        ],
+    );
+
+    let (mut ctrl, _, _) = controller(repo.path(), true, StubGit::default(), false);
+
+    // The linked worktree's workspace hosts a REAL agent (`agent` present) reporting `working`.
+    let linked_path = linked.path().to_str().unwrap();
+    let worktree_json =
+        format!(r#"[{{"path": "{linked_path}", "open_workspace_id": "ws-agent"}}]"#);
+    let agent_json =
+        r#"[{"id": "a1", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}]"#
+            .to_string();
+
+    // Count the herdr calls to prove AC-20 (no extra cost): wrap the FakeHerdr in a recorder.
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    ctrl.set_host(
+        Box::new(RecordingFakeHerdr {
+            calls: Arc::clone(&calls),
+            worktree_json,
+            agent_json,
+        }),
+        None,
+    );
+
+    ctrl.handle(Intent::SwitchWorktree);
+    let picker = ctrl.picker().expect("the picker opens");
+    assert_eq!(
+        picker.agent_statuses.len(),
+        picker.rows.len(),
+        "statuses are aligned 1:1 with rows"
+    );
+    let linked_canon = common::canon(linked.path());
+    for (i, row) in picker.rows.iter().enumerate() {
+        if common::canon(&row.path) == linked_canon {
+            assert_eq!(
+                picker.agent_statuses[i],
+                Some("working".to_string()),
+                "the agent worktree row carries its status badge"
+            );
+        } else {
+            assert_eq!(
+                picker.agent_statuses[i], None,
+                "a worktree with no agent carries no status badge"
+            );
+        }
+    }
+    // AC-20: exactly the two read-only overlay queries — no per-worktree call.
+    let log = calls.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        2,
+        "per-row statuses add no extra herdr call (AC-20): {:?}",
+        *log
+    );
+    assert_eq!(log[0], &["worktree", "list"]);
+    assert_eq!(log[1], &["agent", "list"]);
+}
+
+#[test]
+fn picker_has_no_agent_statuses_without_a_host() {
+    // AC-15/AC-20: with no herdr host wired in, the picker is git-only — every row's status is
+    // None (no badge), and no overlay query is made.
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+    let linked = TempDir::new();
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().unwrap(),
+            "-b",
+            "no-host-branch",
+        ],
+    );
+
+    let (mut ctrl, _, _) = controller(repo.path(), true, StubGit::default(), false);
+    // NOTE: no `set_host` — herdr is absent.
+    ctrl.handle(Intent::SwitchWorktree);
+    let picker = ctrl.picker().expect("the picker opens git-only");
+    assert_eq!(
+        picker.agent_statuses.len(),
+        picker.rows.len(),
+        "statuses are aligned 1:1 with rows even without a host"
+    );
+    assert!(
+        picker.agent_statuses.iter().all(Option::is_none),
+        "no host → every row's agent status is None (git-only, AC-15): {:?}",
+        picker.agent_statuses
+    );
+}
+
+/// A recording `FakeHerdr` for the status-population test: captures each `run_json` argv and
+/// returns canned worktree/agent JSON, so the test can assert exactly two read-only calls (AC-20).
+struct RecordingFakeHerdr {
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+    worktree_json: String,
+    agent_json: String,
+}
+impl HerdrCli for RecordingFakeHerdr {
+    fn run_json(&self, args: &[&str]) -> io::Result<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|s| s.to_string()).collect());
+        match args.first().copied() {
+            Some("worktree") => Ok(self.worktree_json.clone()),
+            Some("agent") => Ok(self.agent_json.clone()),
+            _ => Err(io::Error::other("unexpected herdr subcommand")),
+        }
+    }
 }
 
 #[test]
@@ -2013,7 +2145,9 @@ impl RecordingHerdr {
         Self {
             calls,
             worktree_json: format!(r#"[{{"path": "{path_str}", "open_workspace_id": "ws-spy"}}]"#),
-            agent_json: r#"[{"id": "spy-agent", "workspace_id": "ws-spy"}]"#.to_string(),
+            agent_json:
+                r#"[{"id": "spy-agent", "agent": "claude", "agent_status": "working", "workspace_id": "ws-spy"}]"#
+                    .to_string(),
         }
     }
 }
