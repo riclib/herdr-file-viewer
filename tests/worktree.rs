@@ -274,6 +274,57 @@ fn list_returns_empty_vec_for_non_repo() {
     );
 }
 
+/// `list` flags the current worktree even when git's *emitted* worktree path is a symlink that
+/// resolves elsewhere — i.e. when git's raw path text and the canonical `current_root` differ
+/// (the macOS `/tmp` vs `/private/tmp` case, generalized). `list` recomputes `is_current` by
+/// canonicalizing each row's own path against the canonical `current_root`, so the row whose
+/// path resolves to the current worktree is flagged regardless of textual mismatch (AC-4).
+///
+/// We reproduce a divergent git path on Linux by registering a linked worktree, then replacing
+/// its directory with a symlink to the moved real directory: git keeps emitting the original
+/// (now-symlinked) path, while `current_root` is the canonical (moved) path.
+///
+/// Pre-fix (`parse_porcelain` compares git's RAW path against `canonical_current`) the moved
+/// worktree is marked NOT current — so the picker would preselect row 0 instead of it.
+#[cfg(unix)]
+#[test]
+fn list_flags_current_when_path_is_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+
+    // A linked worktree at `wt_orig`. git records this exact path.
+    let parent = TempDir::new();
+    let wt_orig = parent.path().join("wt");
+    let wt_moved = parent.path().join("wt-moved");
+    git(
+        repo.path(),
+        &["worktree", "add", wt_orig.to_str().unwrap(), "-b", "feat"],
+    );
+
+    // Move the real directory aside and put a symlink in its place, so git's recorded path
+    // (`wt_orig`) is now a symlink that canonicalizes to `wt_moved`.
+    std::fs::rename(&wt_orig, &wt_moved).expect("move worktree dir");
+    symlink(&wt_moved, &wt_orig).expect("symlink original path to moved dir");
+
+    // current_root = the canonical (moved) path; git still emits the symlinked `wt_orig`.
+    let worktrees = list(repo.path(), &wt_moved);
+
+    let canon_moved = common::canon(&wt_moved);
+    let current_rows: Vec<_> = worktrees.iter().filter(|w| w.is_current).collect();
+    assert_eq!(
+        current_rows.len(),
+        1,
+        "exactly one row must be current even when git emits a symlinked path: {worktrees:#?}"
+    );
+    assert_eq!(
+        common::canon(&current_rows[0].path),
+        canon_moved,
+        "the current row must be the worktree the symlinked git path resolves to"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-5 — agent_active: tiered pre-selection resolution (AC-3, AC-4, AC-15)
 // ---------------------------------------------------------------------------

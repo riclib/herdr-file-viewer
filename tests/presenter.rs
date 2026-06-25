@@ -205,6 +205,42 @@ fn hostile_file_name_emits_no_control_bytes_to_the_buffer() {
 }
 
 #[test]
+fn hostile_notice_emits_no_control_bytes_to_the_buffer() {
+    // AC-27 (defense-in-depth): an action notice carrying a worktree path with screen-clear /
+    // cursor-move sequences must be sanitized at the notice sink, exactly like tree rows, the
+    // content title, and picker rows — no control byte may reach the terminal as drawn.
+    let hostile = "switched to \u{1b}[2J\u{1b}[10;10H\u{07}/work/pwned";
+    let mut state = sample_state();
+    state.notices = vec![hostile.to_string()];
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            draw(f, &state);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+
+    let mut cells = String::new();
+    for y in 0..buf.area().height {
+        for x in 0..buf.area().width {
+            if let Some(c) = buf.cell((x, y)) {
+                cells.push_str(c.symbol());
+            }
+        }
+    }
+    assert!(
+        !cells.chars().any(|c| c.is_control()),
+        "no control byte may reach a cell from a notice"
+    );
+    assert!(!cells.contains('\u{1b}'), "no ESC byte in the buffer");
+    assert!(
+        cells.contains("/work/pwned"),
+        "the printable remainder of the notice is still shown"
+    );
+}
+
+#[test]
 fn content_pane_applies_the_vertical_scroll_offset() {
     // With content_scroll = N (and no wrap), the first visible content row is line N: the
     // lines above it are scrolled off the top.
@@ -621,6 +657,60 @@ fn picker_highlights_the_cursor_row() {
     assert!(
         !row_modifier("main").contains(Modifier::REVERSED),
         "a non-cursor row (main) is not REVERSED"
+    );
+}
+
+#[test]
+fn picker_overlay_keeps_cursor_visible_with_many_rows() {
+    // AC-5: on a repo with more worktrees than fit in the popup (herdr's multi-agent use case),
+    // moving the cursor toward the end must scroll the row window so the highlighted row stays
+    // visible. Pre-fix the overlay rendered all rows into the fixed popup with no scroll, so a
+    // cursor near the end fell below the visible area and its row never reached the buffer.
+    use ratatui::style::Modifier;
+
+    let mut state = sample_state();
+    // 40 worktrees — far more than fit in the ~12-row popup interior at 100x24.
+    let rows: Vec<PickerRowView> = (0..40)
+        .map(|i| PickerRowView {
+            path: format!("/work/wt-{i:02}"),
+            branch: Some(format!("branch-{i:02}")),
+            detached: false,
+        })
+        .collect();
+    state.picker = Some(PickerView { rows, cursor: 37 }); // near the end
+
+    let buf = render_buffer(&state, 100, 24);
+
+    // The cursor row's distinctive path must be present in the buffer (the window scrolled to it).
+    let cursor_needle = "wt-37";
+    let mut found_at: Option<(u16, u16)> = None;
+    let (w, h) = (buf.area().width, buf.area().height);
+    for y in 0..h {
+        for x in 0..w {
+            let matches = cursor_needle.chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if matches {
+                found_at = Some((x, y));
+                break;
+            }
+        }
+        if found_at.is_some() {
+            break;
+        }
+    }
+    let (cx, cy) = found_at.expect("the cursor row (wt-37) must be visible after scrolling");
+    // And it carries the REVERSED highlight, so it reads as the selected row.
+    assert!(
+        buf.cell((cx, cy))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED),
+        "the visible cursor row must be REVERSED-highlighted"
     );
 }
 

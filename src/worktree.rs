@@ -50,7 +50,23 @@ pub fn list(repo_root: &Path, current_root: &Path) -> Vec<Worktree> {
         .ok();
 
     match out {
-        Some(o) if o.status.success() => parse_porcelain(&o.stdout, &canonical_current),
+        Some(o) if o.status.success() => {
+            let mut wts = parse_porcelain(&o.stdout, &canonical_current);
+            // `parse_porcelain` flags `is_current` by comparing git's RAW emitted path against
+            // `canonical_current`. git can emit a path that differs textually from the canonical
+            // current root (a symlinked worktree dir; macOS `/tmp` vs `/private/tmp`), which
+            // would mis-flag the current row. Recompute it here — `list` is authoritative for
+            // real paths — by canonicalizing each row's own path. A missing/prunable path won't
+            // canonicalize → `unwrap_or(false)` → correctly not current (AC-4).
+            for wt in &mut wts {
+                wt.is_current = wt
+                    .path
+                    .canonicalize()
+                    .map(|p| p == canonical_current)
+                    .unwrap_or(false);
+            }
+            wts
+        }
         _ => Vec::new(),
     }
 }

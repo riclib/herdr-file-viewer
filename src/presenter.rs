@@ -202,7 +202,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
         let notice_lines: Vec<Line> = state
             .notices
             .iter()
-            .map(|n| Line::styled(n.clone(), Style::new().fg(Color::Yellow)))
+            .map(|n| Line::styled(sanitize_label(n), Style::new().fg(Color::Yellow)))
             .collect();
         frame.render_widget(Paragraph::new(notice_lines), parts[0]);
     }
@@ -352,6 +352,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// idiom `tree_row` uses for the tree selection). The path and branch are both run through
 /// `sanitize_label` first, so a worktree path or branch name carrying control bytes cannot
 /// move the cursor or spoof the UI (AC-27, defense-in-depth — exactly as the tree does).
+///
+/// When there are more rows than the popup interior is tall (herdr's multi-agent repos have
+/// many worktrees), the row window scrolls so the `cursor` row is always visible (AC-5). The
+/// offset is 0 while every row fits, so the small-list rendering is unchanged.
 fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     let popup = centered_rect(60, 60, area);
     // Clear whatever the columns drew beneath the popup so it reads as a true modal.
@@ -363,13 +367,37 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
+    // Scroll the row window so the cursor row stays visible. With `visible` interior rows, keep
+    // `cursor` inside `[offset, offset + visible)`: clamp the offset so it never scrolls past
+    // the end and is 0 whenever all rows fit (preserving the small-list rendering).
+    let visible = inner.height as usize;
+    let offset = picker_scroll_offset(picker.cursor, picker.rows.len(), visible);
+
     let rows: Vec<Line> = picker
         .rows
         .iter()
         .enumerate()
+        .skip(offset)
+        .take(visible)
         .map(|(i, row)| picker_row(row, i == picker.cursor))
         .collect();
     frame.render_widget(Paragraph::new(rows), inner);
+}
+
+/// The first row index to render so the `cursor` row stays within a window of `visible` rows.
+/// Returns 0 when every row fits (or the window is degenerate), and never scrolls past the end.
+fn picker_scroll_offset(cursor: usize, len: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+    // Keep the cursor in view: if it sits below the window, scroll down just enough; if above,
+    // scroll up to it. Clamp so the last window ends at the final row.
+    let max_offset = len - visible;
+    if cursor < visible {
+        0
+    } else {
+        (cursor + 1 - visible).min(max_offset)
+    }
 }
 
 /// Render one picker row: `<path> [branch]`, or `<path> (detached)` when detached (AC-2). The
