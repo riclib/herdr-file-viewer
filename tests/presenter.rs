@@ -984,6 +984,168 @@ fn picker_horizontal_scroll_clamps_past_the_end() {
 }
 
 #[test]
+fn picker_shows_an_esc_close_chip_on_the_top_border() {
+    // Picker-hints §1: herdr-style chrome — an `esc close` chip on the TOP border, right side.
+    // It is a Block title, not an inner row, so it lands on the title row (the box's top edge),
+    // to the right of the existing "Switch worktree" title.
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, y0, x1, _y1) = picker_border_box(&buf);
+
+    // Read the whole top border row text inside the box and confirm the chip is present, to the
+    // right of the left-aligned title.
+    let top = border_row_text(&buf, x0, x1, y0);
+    assert!(
+        top.contains("esc close"),
+        "the top border shows an `esc close` chip\n{top}"
+    );
+    let title_col = first_col_of(&buf, x0, x1, y0, "Switch worktree").expect("title on top border");
+    let chip_col = first_col_of(&buf, x0, x1, y0, "esc close").expect("chip on top border");
+    assert!(
+        chip_col > title_col,
+        "the `esc close` chip is to the RIGHT of the title (top={top:?})"
+    );
+
+    // The chip is dim chrome (DarkGray), not bright content. Check the fg at the chip's first cell.
+    assert_eq!(
+        buf.cell((chip_col, y0)).unwrap().fg,
+        ratatui::style::Color::DarkGray,
+        "the `esc close` chip is dim (DarkGray) chrome"
+    );
+}
+
+/// The text of a border row between columns `x0..=x1` (one char per cell, multi-width cells
+/// contribute their leading char) — for asserting which titles landed on the border.
+fn border_row_text(buf: &ratatui::buffer::Buffer, x0: u16, x1: u16, y: u16) -> String {
+    (x0..=x1)
+        .map(|x| {
+            buf.cell((x, y))
+                .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' '))
+        })
+        .collect()
+}
+
+/// The buffer column where `needle` first begins on row `y` within `x0..=x1`, matching one char
+/// per cell. Returns the absolute column (not a byte offset) so an fg lookup is exact even when
+/// the row contains multi-byte glyphs (the box-drawing border, `·`, arrows).
+fn first_col_of(
+    buf: &ratatui::buffer::Buffer,
+    x0: u16,
+    x1: u16,
+    y: u16,
+    needle: &str,
+) -> Option<u16> {
+    let chars: Vec<char> = needle.chars().collect();
+    for start in x0..=x1 {
+        let fits = chars.iter().enumerate().all(|(i, ch)| {
+            let cx = start + i as u16;
+            cx <= x1
+                && buf
+                    .cell((cx, y))
+                    .is_some_and(|c| c.symbol() == ch.to_string())
+        });
+        if fits {
+            return Some(start);
+        }
+    }
+    None
+}
+
+#[test]
+fn picker_shows_a_key_hint_footer_on_the_bottom_border() {
+    // Picker-hints §2: a dim `·`-separated footer of the picker's real keys on the BOTTOM border.
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, _y0, x1, y1) = picker_border_box(&buf);
+
+    let bottom = border_row_text(&buf, x0, x1, y1);
+    // The footer names move / scroll / switch / cancel keys with herdr's ` · ` separator.
+    assert!(
+        bottom.contains("move") && bottom.contains("scroll"),
+        "the bottom border footer names move + scroll\n{bottom}"
+    );
+    assert!(
+        bottom.contains("switch") && bottom.contains("cancel"),
+        "the bottom border footer names switch + cancel\n{bottom}"
+    );
+    assert!(
+        bottom.contains('·'),
+        "the footer uses herdr's ` · ` separator\n{bottom}"
+    );
+
+    // The footer is dim chrome (DarkGray). Check the fg at the first hint glyph (`move`).
+    let move_col = first_col_of(&buf, x0, x1, y1, "move").expect("footer names `move`");
+    assert_eq!(
+        buf.cell((move_col, y1)).unwrap().fg,
+        ratatui::style::Color::DarkGray,
+        "the footer hint is dim (DarkGray) chrome"
+    );
+}
+
+#[test]
+fn picker_box_is_wide_enough_for_the_chrome_when_rows_are_short() {
+    // Picker-hints §3: size-to-content must include the chrome — even with very short rows, the
+    // box must be wide enough that neither the title+`esc close` nor the footer hint is clipped.
+    let mut state = picker_state();
+    // Rows much shorter than the chrome (the footer is the widest element here).
+    if let Some(p) = state.picker.as_mut() {
+        p.rows = vec![
+            PickerRowView {
+                path: "a".to_string(),
+                branch: None,
+                detached: false,
+                is_current: true,
+                agent: None,
+            },
+            PickerRowView {
+                path: "b".to_string(),
+                branch: None,
+                detached: false,
+                is_current: false,
+                agent: None,
+            },
+        ];
+        p.cursor = 0;
+    }
+    let buf = render_buffer(&state, 100, 24);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+
+    let top = border_row_text(&buf, x0, x1, y0);
+    let bottom = border_row_text(&buf, x0, x1, y1);
+
+    // The full title + chip both appear on the top border (not clipped) despite tiny rows.
+    assert!(
+        top.contains("Switch worktree") && top.contains("esc close"),
+        "short rows still leave room for the title + `esc close` chip\n{top}"
+    );
+    // The full footer appears on the bottom border (not clipped) despite tiny rows.
+    assert!(
+        bottom.contains("move")
+            && bottom.contains("scroll")
+            && bottom.contains("switch")
+            && bottom.contains("cancel"),
+        "short rows still leave room for the full key-hint footer\n{bottom}"
+    );
+}
+
+#[test]
+fn picker_chrome_renders_without_panic_on_a_small_frame() {
+    // Picker-hints §3: at a frame too narrow for the full chrome (24x8 is below the footer's
+    // natural ~43-col width) the box caps at the pane and the hints simply truncate — the draw
+    // must NOT panic (saturating layout math). The draw itself is the assertion: `render_buffer`
+    // would unwrap-panic on a `draw` error, so reaching the size checks proves it stayed sane.
+    let buf = render_buffer(&picker_state(), 24, 8);
+    // The clamped box never exceeds the frame (right/bottom edges stay inside).
+    assert!(buf.area().width <= 24 && buf.area().height <= 8);
+    // A truncated footer is acceptable; the box is still bordered (a `┐` corner exists somewhere).
+    let (w, h) = (buf.area().width, buf.area().height);
+    let has_corner =
+        (0..h).any(|y| (0..w).any(|x| buf.cell((x, y)).is_some_and(|c| c.symbol() == "┐")));
+    assert!(
+        has_corner,
+        "the picker still draws a bordered box at a small frame"
+    );
+}
+
+#[test]
 fn picker_overlay_snapshot() {
     insta::assert_snapshot!("presenter_picker", render(&picker_state(), 100, 24));
 }

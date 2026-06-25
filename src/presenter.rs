@@ -356,6 +356,15 @@ fn centered_rect_sized(w: u16, h: u16, area: Rect) -> Rect {
     }
 }
 
+/// The picker's top-left title (the box label).
+const PICKER_TITLE: &str = "Switch worktree";
+/// The herdr-style `esc close` chip on the top border (right-aligned, dim chrome).
+const PICKER_ESC_CLOSE: &str = "esc close";
+/// The herdr-style key-hint footer on the bottom border — the picker's real bindings, with
+/// herdr's ` · ` separator. Up/Down move the cursor, Left/Right horizontal-scroll, Enter
+/// confirms the switch, Esc cancels. Static (not repo-derived), so no sanitization is needed.
+const PICKER_FOOTER_HINT: &str = "↑↓ move · ←→ scroll · ⏎ switch · esc cancel";
+
 /// Draw the worktree picker as a centered, bordered list overlay on top of the columns (AC-1,
 /// AC-5). Each row is `<path> [branch]`, or `<path> (detached)` when HEAD is detached — never
 /// an empty branch (AC-2, gate L-1). The `cursor` row is highlighted (`REVERSED`, the same
@@ -373,6 +382,11 @@ fn centered_rect_sized(w: u16, h: u16, area: Rect) -> Rect {
 /// row is wider than the (capped) interior, `picker.hscroll` shifts the rows horizontally so a
 /// long path can be read sideways; it is clamped here to `[0, max_row_width - inner_width]`, so
 /// it is a no-op while everything fits and can never over-scroll past the widest row.
+///
+/// herdr-style chrome surrounds the box: a dim `esc close` chip on the top border (right) and a
+/// dim `·`-separated footer of the picker's real keys on the bottom border (AC discoverability).
+/// Both are Block titles, never inner rows, so the rows area / scroll are untouched; the
+/// size-to-content calc widens the box to fit them so short rows don't clip the chrome.
 fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     // Build every row once so we can both measure widths (size-to-content) and draw the window.
     let rows: Vec<Line> = picker
@@ -382,15 +396,32 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
         .map(|(i, row)| picker_row(row, i == picker.cursor))
         .collect();
 
+    // herdr-style chrome: a dim `esc close` chip on the top border (right) and a dim key-hint
+    // footer on the bottom border. These are static affordances (not repo-derived), rendered as
+    // Block titles — never inner rows — so the rows area / scroll above are untouched.
+    let hint_style = Style::new().fg(Color::DarkGray);
+    let top_left = Line::from(PICKER_TITLE);
+    let top_right = Line::styled(PICKER_ESC_CLOSE, hint_style).right_aligned();
+    let footer = Line::styled(PICKER_FOOTER_HINT, hint_style).centered();
+
     // Desired interior: the widest row (display width, not byte len — `Line::width` counts
-    // unicode columns) × the row count. The box adds the two border rows/cols plus one title row.
+    // unicode columns) × the row count — AND wide enough for the chrome so the chip/footer never
+    // truncate when rows are short. The box adds the two border rows/cols plus one title row.
     let max_row_width = rows.iter().map(Line::width).max().unwrap_or(0);
-    let desired_inner_w = max_row_width.min(u16::MAX as usize) as u16;
+    // Top border must fit "Switch worktree" + a one-space gap + "esc close"; the bottom must fit
+    // the footer hint. Take the max so short rows still leave room for the chrome.
+    let min_top = top_left.width() + 1 + top_right.width();
+    let min_bottom = footer.width();
+    let desired_inner_w = max_row_width
+        .max(min_top)
+        .max(min_bottom)
+        .min(u16::MAX as usize) as u16;
     let desired_inner_h = (rows.len().min(u16::MAX as usize) as u16).max(1);
-    // +2 for the borders on each axis; the title shares the top border row, so no extra height.
+    // +2 for the borders on each axis; the titles share the border rows, so no extra height.
     let want_w = desired_inner_w.saturating_add(2);
     let want_h = desired_inner_h.saturating_add(2);
-    // Cap at the pane, leaving a one-cell margin all round (never exceed, never underflow).
+    // Cap at the pane, leaving a one-cell margin all round (never exceed, never underflow). If the
+    // frame is narrower than the chrome wants, the box caps here and the hints simply truncate.
     let cap_w = area.width.saturating_sub(2);
     let cap_h = area.height.saturating_sub(2);
     let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
@@ -399,7 +430,9 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     frame.render_widget(Clear, popup);
 
     let block = Block::bordered()
-        .title("Switch worktree")
+        .title_top(top_left)
+        .title_top(top_right)
+        .title_bottom(footer)
         .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
