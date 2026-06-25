@@ -7,10 +7,25 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **Scrollbars** appear on the tree and content panes whenever there's more to see than fits — a
+  vertical bar when the list or file is taller than the pane, and a horizontal bar when a row /
+  unwrapped line is wider than the pane. They show only where there is something to scroll. The
+  bars render **inside** the pane (one cell off the text) and are **draggable with the mouse**:
+  drag a vertical bar ↕ or a horizontal bar ↔ to scroll, and pressing the track jumps to that
+  position. Dragging the tree's vertical bar scrubs the selection through the file list.
+- **The tree scrolls horizontally** so a long or deeply-nested file name can be read in full — via
+  the horizontal mouse wheel or by dragging the tree's horizontal scrollbar (the `←`/`→` keys stay
+  expand/collapse in the tree).
 - **Hide hidden files (`.`).** A toggle that drops dot-prefixed files and folders from the tree —
   handy when you open a directory (like `$HOME`) that's flooded with them. It's independent of the
   gitignore toggle (`i`) and off by default, so `.gitignore` / `.github` stay visible until you ask
   to hide them. ([#46](https://github.com/smarzban/herdr-file-viewer/issues/46))
+
+### Fixed
+- **The tree now scrolls to follow the selection.** On a long file list the tree stayed pinned to
+  the top, so moving the cursor past the last visible row selected files you couldn't see. The tree
+  now scrolls to keep the selected row in view (mouse clicks still map to the right row when
+  scrolled). ([#45](https://github.com/smarzban/herdr-file-viewer/issues/45))
 
 ## [1.4.0] - 2026-06-25
 
