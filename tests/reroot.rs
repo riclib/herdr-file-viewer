@@ -467,11 +467,16 @@ fn re_root_to_missing_path_keeps_root_and_sets_notice() {
 
     ctrl.re_root(&missing);
 
-    // Root is unchanged — the tree is still rooted at A.
+    // Root is unchanged — the tree is still rooted at A. The guard returned BEFORE any rebuild,
+    // so the tree is the original one built from `a.path()` (the raw fixture path) — compare
+    // against `a.path()`, NOT `common::canon(a.path())`: on macOS the temp dir is under
+    // `/var/folders` (a symlink to `/private/...`), so canonicalizing only the expected side would
+    // never match the raw node paths. (Successful re-roots rebuild via `root::resolve`, whose paths
+    // ARE canonical — those tests canon both sides.)
     let nodes = ctrl.tree().visible_nodes();
     let first = nodes.first().expect("A should still have nodes");
     assert!(
-        first.path.starts_with(common::canon(a.path())),
+        first.path.starts_with(a.path()),
         "tree root must still be A after a failed re_root; got {}",
         first.path.display()
     );
