@@ -238,6 +238,11 @@ pub struct Controller {
     /// The viewer's own herdr workspace id (the agent-overlay's Tier-1 hint). Session-level —
     /// survives a re-root unchanged.
     our_workspace_id: Option<String>,
+    /// The launch base-branch hint (the branch a worktree forked from), carried into a re-root's
+    /// re-resolution so the post-switch Base-mode baseline can recover the common shared-base case
+    /// (review-gate R1, F). Session-level — survives a re-root unchanged: the herdr per-worktree
+    /// hint isn't available cross-worktree, so the launch hint is the best shared-base recovery.
+    base_branch: Option<String>,
 }
 
 impl Controller {
@@ -256,6 +261,9 @@ impl Controller {
         let RootProviders { git, content } = providers(&resolved);
         let root = resolved.root.clone();
         let is_git_repo = resolved.is_git_repo;
+        // The launch base-branch hint is session-level — recorded once here and carried across
+        // re-roots (F). It is `None` outside a repo / when herdr gave no hint.
+        let base_branch = resolved.base_branch.clone();
         // The Content Renderer (and the diff query it needs) live on a worker thread; the
         // controller talks to it over a job channel and reads finished renders off a result
         // channel (AC-23). The worker exits when the job sender (held by the controller) is
@@ -300,6 +308,7 @@ impl Controller {
             picker: None,
             herdr: None,
             our_workspace_id: None,
+            base_branch,
         };
         ctrl.refresh_git_state();
         ctrl.dispatch_render();
@@ -376,8 +385,14 @@ impl Controller {
             ));
             return;
         }
+        // Carry the launch base-branch hint into the re-resolution (review-gate R1, F): herdr's
+        // per-worktree hint isn't available cross-worktree, so the launch hint is the best
+        // shared-base recovery. `resolve_base_branch` re-validates it against the target repo's
+        // refs (worktrees share the repo's refs), recovering a shared base; otherwise it falls
+        // back to main/master as before.
         let resolved = crate::root::resolve(&crate::context::LaunchContext {
             cwd: target.to_path_buf(),
+            base_branch: self.base_branch.clone(),
             ..Default::default()
         });
         // AC-11: re-selecting the worktree we're already rooted at is a clean no-op — no
@@ -450,9 +465,18 @@ impl Controller {
         let baseline = self.baseline;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let status = git.status();
-            let changed = git.changed_set(baseline);
-            let _ = tx.send((status, changed)); // receiver may be gone if re-rooted again — fine
+            // Contain a git-query panic so the thread can't abort the process — parity with the
+            // render worker. On panic we simply don't send; `poll` already handles the resulting
+            // `Disconnected`/empty channel (it drops the receiver), so the markers just don't fill
+            // in for this switch rather than crashing.
+            let computed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let status = git.status();
+                let changed = git.changed_set(baseline);
+                (status, changed)
+            }));
+            if let Ok(result) = computed {
+                let _ = tx.send(result); // receiver may be gone if re-rooted again — fine
+            }
         });
         self.status_rx = Some(rx);
     }
@@ -503,6 +527,20 @@ impl Controller {
     /// (T-14) can draw it and tests can assert the rows / pre-selected cursor.
     pub fn picker(&self) -> Option<&PickerState> {
         self.picker.as_ref()
+    }
+
+    /// Whether a re-root's off-thread status/changed-set fetch is still pending (not yet applied
+    /// by [`poll`]). Exposed so a test can assert that a synchronous refresh drops the pending
+    /// async fetch, so a stale async result cannot later clobber the freshly-refreshed state
+    /// (review-gate R1, G).
+    pub fn status_refresh_pending(&self) -> bool {
+        self.status_rx.is_some()
+    }
+
+    /// The session-level launch base-branch hint, carried across re-roots (review-gate R1, F).
+    /// Exposed so a test can assert the hint survives a re_root.
+    pub fn base_branch_hint(&self) -> Option<&str> {
+        self.base_branch.as_deref()
     }
 
     /// All notices to surface: the transient action notice (if any) followed by the content
@@ -734,6 +772,12 @@ impl Controller {
     /// still works (herdr reserves Shift+mouse for exactly that). Selection/activation happen
     /// on button *release*, so a divider drag is never mistaken for a click.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> Effects {
+        // Modal: while the picker is open it is keyboard-only, so the mouse is inert — a click /
+        // wheel / drag behind the overlay must not drive the tree or content underneath. This
+        // mirrors the keyboard modal gate in `handle`. (review-gate R1, E)
+        if self.picker.is_some() {
+            return Effects::noop();
+        }
         if ev.modifiers.contains(KeyModifiers::SHIFT) {
             return Effects::noop();
         }
@@ -1288,6 +1332,11 @@ impl Controller {
         self.tree.set_status(&status);
         self.changed = self.git.changed_set(self.baseline);
         self.tree.set_changed_only(self.changed_only, &self.changed);
+        // Drop any pending re-root async status fetch (review-gate R1, G): this sync refresh has
+        // just produced the authoritative status/changed-set, so an older in-flight async result
+        // must not later clobber it in `poll`. (A second `re_root` already replaces `status_rx`,
+        // so only this sync-refresh-vs-pending race needs handling here.)
+        self.status_rx = None;
     }
 
     // ---- content coordination ----------------------------------------------------------
@@ -1355,6 +1404,12 @@ impl Controller {
                     self.changed = changed;
                     self.tree.set_changed_only(self.changed_only, &self.changed);
                     self.status_rx = None;
+                    // The synchronous `re_root` dispatched the first render against the *empty*
+                    // changed-set, so a changed file rendered in content/markdown mode, not Diff.
+                    // Now that the real changed-set has landed, re-dispatch so the current
+                    // selection re-renders in the correct view mode (changed → Diff, AC-9).
+                    // (review-gate R1, B).
+                    self.dispatch_render();
                     applied = true;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.status_rx = None,

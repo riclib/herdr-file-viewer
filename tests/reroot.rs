@@ -619,6 +619,235 @@ fn re_root_render_resolves_through_the_respawned_worker() {
     }
 }
 
+/// A Content Renderer that echoes any `raw_diff` it is handed into the rendered text (prefixed
+/// with a marker), so a test can observe that a file rendered in **Diff** mode against a
+/// specific git's diff. For non-diff modes (`raw_diff == None`) it emits a distinct marker.
+struct EchoDiffContent;
+impl ContentProvider for EchoDiffContent {
+    fn render(&self, _path: &Path, _mode: ViewMode, raw_diff: Option<&str>) -> RenderResult {
+        let content = match raw_diff {
+            Some(d) => Text::raw(format!("DIFF:{d}")),
+            None => Text::raw("NON-DIFF-CONTENT"),
+        };
+        RenderResult {
+            content,
+            notices: Vec::new(),
+        }
+    }
+}
+
+/// A factory that, for the root whose canonical path matches `b_root`, hands back a
+/// [`CannedGit`] reporting `b_status` (as both status and changed-set) plus `b_diff` as its
+/// diff, paired with the [`EchoDiffContent`] renderer so a post-switch Diff render is
+/// observable. Every other root gets the empty [`FakeGit`] (still with `EchoDiffContent`).
+fn echo_diff_factory(
+    b_root: PathBuf,
+    b_status: BTreeMap<PathBuf, Status>,
+    b_diff: String,
+) -> Box<dyn Fn(&Resolved) -> RootProviders> {
+    let b_canon = common::canon(&b_root);
+    Box::new(move |resolved: &Resolved| {
+        let git: Arc<dyn GitService> = if common::canon(&resolved.root) == b_canon {
+            Arc::new(CannedGit {
+                status: b_status.clone(),
+                changed: b_status.clone(),
+                diff: b_diff.clone(),
+            })
+        } else {
+            Arc::new(FakeGit)
+        };
+        RootProviders {
+            git,
+            content: Box::new(EchoDiffContent),
+        }
+    })
+}
+
+#[test]
+fn re_root_renders_changed_file_in_diff_mode_after_status_lands() {
+    // Review-gate R1 (B): re_root's synchronous `dispatch_render` runs against the just-cleared
+    // (empty) changed-set, so a changed file would render in content/markdown mode, not Diff.
+    // When the real changed-set lands via `poll`, the render MUST be re-dispatched so the file
+    // now renders in Diff mode against B's git (AC-9). Pre-fix this never re-renders, so the
+    // content stays NON-DIFF until the user navigates away and back.
+    let a = TempDir::new();
+    common::init_repo_with_commit(a.path());
+    std::fs::write(a.path().join("a.txt"), "a\n").unwrap();
+
+    // B has a single file `b.txt` that B's git reports as Modified (so it defaults to Diff), and
+    // B's git diff returns a B-specific marker string the content renderer echoes.
+    let b = TempDir::new();
+    common::init_repo_with_commit(b.path());
+    std::fs::write(b.path().join("b.txt"), "b\n").unwrap();
+    let mut b_status = BTreeMap::new();
+    b_status.insert(PathBuf::from("b.txt"), Status::Modified);
+    let b_diff = "B-SPECIFIC-DIFF-MARKER".to_string();
+
+    let components = Components {
+        providers: echo_diff_factory(b.path().to_path_buf(), b_status, b_diff.clone()),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(a.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+
+    ctrl.re_root(b.path());
+
+    // After the re-root, B's only file (b.txt) is selected. Drain poll until B's changed-set
+    // lands and the render is re-dispatched in Diff mode — observable as B's diff marker showing
+    // in the content. Pre-fix this times out (the content stays NON-DIFF-CONTENT).
+    poll_until(&mut ctrl, Duration::from_secs(5), |c| {
+        flatten(c.content()).contains(&b_diff)
+    });
+    assert!(
+        flatten(ctrl.content()).contains(&b_diff),
+        "after the changed-set lands, the changed file re-renders in Diff mode against B's git \
+         (AC-9); got: {:?}",
+        flatten(ctrl.content())
+    );
+}
+
+#[test]
+fn pending_reroot_status_does_not_clobber_a_later_sync_refresh() {
+    // Review-gate R1 (G): a re-root dispatches an async status/changed-set fetch. If a synchronous
+    // refresh (`r` / focus-gain / editor-return / baseline-toggle) runs while that fetch is still
+    // pending, the stale async result must NOT later overwrite the freshly-refreshed state. The
+    // fix drops the pending fetch (`status_rx = None`) in the SYNC path. Pre-fix the pending fetch
+    // survives the sync refresh and clobbers it on the next `poll`.
+    let repo = TempDir::new();
+    common::init_repo_with_commit(repo.path());
+    std::fs::write(repo.path().join("file.txt"), "x\n").unwrap();
+
+    // Two distinct git repos so re_root actually switches root (A → B). B's factory git is the
+    // empty FakeGit, so the async fetch produces an empty status/changed-set.
+    let b = TempDir::new();
+    common::init_repo_with_commit(b.path());
+    std::fs::write(b.path().join("b.txt"), "b\n").unwrap();
+
+    let components = Components {
+        providers: fake_factory(),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(repo.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+
+    // Re-root to B — this dispatches the off-thread status/changed-set fetch. Do NOT poll yet, so
+    // the async result is still pending (or in flight).
+    ctrl.re_root(b.path());
+
+    // Trigger a SYNCHRONOUS refresh while the async fetch is pending (the `r` key path). The fix
+    // drops the pending async fetch so it cannot clobber this fresh refresh.
+    ctrl.handle(Intent::Refresh);
+
+    // The pending async re-root fetch must have been dropped by the sync refresh — otherwise a
+    // later `poll` could apply the stale async result over the freshly-refreshed state.
+    assert!(
+        !ctrl.status_refresh_pending(),
+        "a synchronous refresh must drop any pending re-root async status fetch (G)"
+    );
+
+    // Draining poll now must be a clean no-op for the status path (nothing stale to apply).
+    ctrl.poll();
+    assert!(
+        !ctrl.status_refresh_pending(),
+        "no pending fetch remains after poll"
+    );
+}
+
+#[test]
+fn re_root_carries_the_base_branch_hint() {
+    // Review-gate R1 (F): the launch base-branch hint is a session-level value that re_root must
+    // carry into the re-resolution (the herdr per-worktree hint isn't available cross-worktree),
+    // so the post-switch Base-mode baseline recovers the common shared-base case. Assert the hint
+    // survives a re_root. (Worktrees share the repo's refs; resolve_base_branch re-validates it.)
+    let a = TempDir::new();
+    common::init_repo_with_commit(a.path());
+    std::fs::write(a.path().join("a.txt"), "a\n").unwrap();
+
+    let b = TempDir::new();
+    common::init_repo_with_commit(b.path());
+    std::fs::write(b.path().join("b.txt"), "b\n").unwrap();
+
+    // Launch with an explicit base-branch hint on the Resolved.
+    let mut resolved = common::resolved(a.path().to_path_buf(), true);
+    resolved.base_branch = Some("develop".to_string());
+
+    let components = Components {
+        providers: fake_factory(),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+    };
+    let mut ctrl = Controller::new(resolved, Baseline::Head, components);
+    assert_eq!(
+        ctrl.base_branch_hint(),
+        Some("develop"),
+        "the launch base-branch hint is recorded"
+    );
+
+    ctrl.re_root(b.path());
+    assert_eq!(
+        ctrl.base_branch_hint(),
+        Some("develop"),
+        "the base-branch hint survives a re_root (F) — it is session-level"
+    );
+}
+
+#[test]
+fn re_root_is_interactive_within_budget_on_a_large_repo() {
+    // AC-17: a re-root happens mid-session, so the synchronous part (resolve + fresh tree + worker
+    // respawn) must return and leave the tree navigable quickly — the heavy git status/changed-set
+    // is async. Mirror tests/tree_perf.rs's magnitude (100 dirs × 100 files = 10k files) so the
+    // budget is meaningful but not flaky. Generous 1s margin.
+    let a = TempDir::new();
+    common::init_repo_with_commit(a.path());
+    std::fs::write(a.path().join("a.txt"), "a\n").unwrap();
+
+    // Build the large target repo B: 100 directories × 100 files = 10,000 files.
+    let b = TempDir::new();
+    common::init_repo_with_commit(b.path());
+    for d in 0..100 {
+        let sub = b.path().join(format!("dir{d:03}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in 0..100 {
+            std::fs::write(sub.join(format!("file{f:03}.txt")), "x").unwrap();
+        }
+    }
+
+    let components = Components {
+        providers: fake_factory(),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(a.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+
+    // The synchronous re_root + first tree enumeration must complete within the budget.
+    let start = Instant::now();
+    ctrl.re_root(b.path());
+    let nodes = ctrl.tree().visible_nodes();
+    let elapsed = start.elapsed();
+
+    assert!(
+        nodes.len() >= 100,
+        "the new root's top-level directories are listed ({} nodes)",
+        nodes.len()
+    );
+    assert!(
+        elapsed.as_secs_f64() < 1.0,
+        "AC-17: re_root must be interactive within 1s, took {elapsed:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-16 — Read-only / ephemeral / repo-only invariants (AC-N1, AC-N2, AC-N3, AC-N4)
 // ---------------------------------------------------------------------------

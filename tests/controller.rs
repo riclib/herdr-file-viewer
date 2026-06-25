@@ -2210,6 +2210,100 @@ fn picker_other_intents_are_inert() {
     );
 }
 
+#[test]
+fn mouse_is_inert_while_the_picker_is_open() {
+    // Review-gate R1 (E): the picker is a keyboard modal — while it is open the mouse must be
+    // inert, just as the keyboard `handle` gate routes only Nav/Activate/Close to the picker. A
+    // click or wheel behind the overlay must not drive the tree/content underneath.
+    let (mut ctrl, _, _) = setup_picker_with_two_worktrees();
+    ctrl.set_pane_geometry(wide_geometry());
+
+    // Capture the underlying tree state and that the picker is open.
+    assert!(
+        ctrl.picker().is_some(),
+        "picker open before the mouse events"
+    );
+    let cursor_before = ctrl.tree().cursor();
+    let root_before = ctrl.root().to_path_buf();
+    let focus_before = ctrl.focus();
+    let picker_cursor_before = ctrl.picker().unwrap().cursor;
+
+    // A left-click on a tree row would (without the guard) move the cursor and focus the tree.
+    let click = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 3));
+    assert!(
+        !click.redraw && !click.quit,
+        "a click is inert while picking"
+    );
+
+    // A scroll over the tree would (without the guard) move the selection.
+    let scroll = ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 6, 3));
+    assert!(
+        !scroll.redraw && !scroll.quit,
+        "a scroll is inert while picking"
+    );
+
+    // A scroll over the content pane would (without the guard) scroll the content.
+    let scroll_c = ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 50, 5));
+    assert!(
+        !scroll_c.redraw && !scroll_c.quit,
+        "a content scroll is inert while picking"
+    );
+
+    // Nothing underneath changed, and the picker is still open and at the same row.
+    assert_eq!(
+        ctrl.tree().cursor(),
+        cursor_before,
+        "the tree cursor must be unchanged behind the open picker"
+    );
+    assert_eq!(ctrl.focus(), focus_before, "focus must be unchanged");
+    assert_eq!(
+        common::canon(ctrl.root()),
+        common::canon(&root_before),
+        "the root must be unchanged"
+    );
+    assert!(
+        ctrl.picker().is_some(),
+        "the picker must still be open after the mouse events"
+    );
+    assert_eq!(
+        ctrl.picker().unwrap().cursor,
+        picker_cursor_before,
+        "the picker cursor must be unchanged (mouse does not drive it)"
+    );
+}
+
+#[test]
+fn picker_opens_in_a_single_worktree_repo() {
+    // AC-1: SwitchWorktree opens the picker even in a repo with no LINKED worktree — the list has
+    // exactly one (current) row. Guards against a future `rows.len() < 2 → no picker` regression:
+    // the picker is the place the user learns there is only one worktree, so it must still open.
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+
+    let (mut ctrl, _, _) = controller(repo.path(), true, StubGit::default(), false);
+    assert!(ctrl.picker().is_none(), "no picker before the switch");
+
+    let fx = ctrl.handle(Intent::SwitchWorktree);
+    assert!(fx.redraw, "opening the picker redraws");
+    let picker = ctrl
+        .picker()
+        .expect("SwitchWorktree opens the picker even with a single worktree (AC-1)");
+    assert_eq!(
+        picker.rows.len(),
+        1,
+        "a single-worktree repo lists exactly one row: {:?}",
+        picker.rows
+    );
+    assert!(
+        picker.rows[0].is_current,
+        "the sole row is the current worktree"
+    );
+    assert_eq!(
+        picker.cursor, 0,
+        "the cursor pre-selects the sole (current) worktree"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-17 — No-events conformance: re_root only via SwitchWorktree (AC-N5)
 // ---------------------------------------------------------------------------
