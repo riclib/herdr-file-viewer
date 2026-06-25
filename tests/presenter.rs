@@ -2,7 +2,7 @@
 //! AC-3 (display), AC-7 (display), AC-13 (truncation notice), AC-25 (fallback notice).
 
 use herdr_file_viewer::git::Status;
-use herdr_file_viewer::presenter::{Focus, ViewState, draw};
+use herdr_file_viewer::presenter::{Focus, PickerRowView, PickerView, ViewState, draw};
 use herdr_file_viewer::render::to_text;
 use herdr_file_viewer::tree::{Node, NodeKind};
 use ratatui::Terminal;
@@ -71,6 +71,7 @@ fn sample_state() -> ViewState {
         split_pct: 40,
         zoomed: false,
         update_banner: None,
+        picker: None,
     }
 }
 
@@ -200,6 +201,42 @@ fn hostile_file_name_emits_no_control_bytes_to_the_buffer() {
     assert!(
         cells.contains("pwned"),
         "the printable remainder is still shown"
+    );
+}
+
+#[test]
+fn hostile_notice_emits_no_control_bytes_to_the_buffer() {
+    // AC-27 (defense-in-depth): an action notice carrying a worktree path with screen-clear /
+    // cursor-move sequences must be sanitized at the notice sink, exactly like tree rows, the
+    // content title, and picker rows — no control byte may reach the terminal as drawn.
+    let hostile = "switched to \u{1b}[2J\u{1b}[10;10H\u{07}/work/pwned";
+    let mut state = sample_state();
+    state.notices = vec![hostile.to_string()];
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            draw(f, &state);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+
+    let mut cells = String::new();
+    for y in 0..buf.area().height {
+        for x in 0..buf.area().width {
+            if let Some(c) = buf.cell((x, y)) {
+                cells.push_str(c.symbol());
+            }
+        }
+    }
+    assert!(
+        !cells.chars().any(|c| c.is_control()),
+        "no control byte may reach a cell from a notice"
+    );
+    assert!(!cells.contains('\u{1b}'), "no ESC byte in the buffer");
+    assert!(
+        cells.contains("/work/pwned"),
+        "the printable remainder of the notice is still shown"
     );
 }
 
@@ -524,6 +561,743 @@ fn no_banner_reserves_no_row_and_shows_nothing() {
         !out.contains("available"),
         "no update text when up-to-date\n{out}"
     );
+}
+
+/// A picker overlay over the two-column layout: the CURRENT worktree (current marker, no agent),
+/// a second branch hosting a `working` agent (cursor row + agent badge), and a detached-HEAD
+/// worktree (no agent). Exercises the current marker, the agent badge, and the detached marker
+/// together — and proves the current marker (row 0) is distinct from the REVERSED cursor (row 1).
+fn picker_state() -> ViewState {
+    let mut state = sample_state();
+    state.picker = Some(PickerView {
+        rows: vec![
+            PickerRowView {
+                path: "/work/main".to_string(),
+                branch: Some("main".to_string()),
+                detached: false,
+                is_current: true,
+                agent: None,
+            },
+            PickerRowView {
+                path: "/work/feature".to_string(),
+                branch: Some("feature-x".to_string()),
+                detached: false,
+                is_current: false,
+                agent: Some("working".to_string()),
+            },
+            PickerRowView {
+                path: "/work/detached".to_string(),
+                branch: None,
+                detached: true,
+                is_current: false,
+                agent: None,
+            },
+        ],
+        cursor: 1, // the feature-x row is highlighted (non-zero) — NOT the current row (row 0)
+        hscroll: 0,
+    });
+    state
+}
+
+#[test]
+fn picker_overlay_renders_rows_over_the_two_columns() {
+    // AC-1/AC-5: the picker overlay is drawn on top of the columns.
+    let out = render(&picker_state(), 100, 24);
+    assert!(
+        out.contains("Switch worktree"),
+        "the picker title is shown\n{out}"
+    );
+    // Each worktree row's path + branch label appears.
+    assert!(out.contains("main"), "the main row is shown\n{out}");
+    assert!(
+        out.contains("feature-x"),
+        "the feature branch label is shown\n{out}"
+    );
+    // The two columns are still drawn underneath (the overlay is partial, centered).
+    assert!(
+        out.contains("Files"),
+        "the tree column is drawn under the overlay\n{out}"
+    );
+}
+
+#[test]
+fn picker_detached_row_shows_a_marker_not_an_empty_branch() {
+    // Gate L-1 / AC-2: a detached-HEAD worktree shows a detached marker, never an empty branch.
+    let out = render(&picker_state(), 100, 24);
+    assert!(
+        out.contains("detached"),
+        "the detached worktree shows a detached marker\n{out}"
+    );
+    // Defense: no row renders an empty `[]` branch label.
+    assert!(
+        !out.contains("[]"),
+        "no row renders an empty branch label\n{out}"
+    );
+}
+
+#[test]
+fn picker_highlights_the_cursor_row() {
+    // AC-5: the cursor row is highlighted (REVERSED) — its background differs from a
+    // non-cursor row. Find the `feature` path (cursor row, idx 1) and a non-cursor `main` row.
+    use ratatui::style::Modifier;
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let row_modifier = |needle: &str| -> Modifier {
+        let (w, h) = (buf.area().width, buf.area().height);
+        for y in 0..h {
+            for x in 0..w {
+                let matches = needle.chars().enumerate().all(|(i, ch)| {
+                    let cx = x + i as u16;
+                    cx < w
+                        && buf
+                            .cell((cx, y))
+                            .is_some_and(|c| c.symbol() == ch.to_string())
+                });
+                if matches {
+                    return buf.cell((x, y)).unwrap().modifier;
+                }
+            }
+        }
+        panic!("{needle:?} not found in buffer");
+    };
+    assert!(
+        row_modifier("feature-x").contains(Modifier::REVERSED),
+        "the cursor row (feature-x) is REVERSED"
+    );
+    assert!(
+        !row_modifier("main").contains(Modifier::REVERSED),
+        "a non-cursor row (main) is not REVERSED"
+    );
+}
+
+#[test]
+fn picker_marks_the_current_worktree_distinctly_from_the_cursor() {
+    // AC-18: the current worktree carries a "current" marker that is visually distinct from the
+    // selection cursor. In the fixture, row 0 (/work/main) is the current root but NOT the cursor
+    // (cursor is row 1, the agent row). So: the current marker glyph (●) renders, and the current
+    // row is NOT reversed while the cursor row IS — a row can be current without being selected.
+    use ratatui::style::Modifier;
+    let out = render(&picker_state(), 100, 24);
+    assert!(
+        out.contains('●'),
+        "the current worktree shows a current marker (●)\n{out}"
+    );
+
+    let buf = render_buffer(&picker_state(), 100, 24);
+    // Locate the row containing "main" (the current, non-cursor row) and "feature-x" (the cursor
+    // row) and compare their modifiers: current ≠ reversed; cursor = reversed.
+    let find = |needle: &str| -> Modifier {
+        let (w, h) = (buf.area().width, buf.area().height);
+        for y in 0..h {
+            for x in 0..w {
+                let matches = needle.chars().enumerate().all(|(i, ch)| {
+                    let cx = x + i as u16;
+                    cx < w
+                        && buf
+                            .cell((cx, y))
+                            .is_some_and(|c| c.symbol() == ch.to_string())
+                });
+                if matches {
+                    return buf.cell((x, y)).unwrap().modifier;
+                }
+            }
+        }
+        panic!("{needle:?} not found");
+    };
+    assert!(
+        !find("main").contains(Modifier::REVERSED),
+        "the current row (main) is the current root but NOT the cursor → not REVERSED"
+    );
+    assert!(
+        find("feature-x").contains(Modifier::REVERSED),
+        "the cursor row (feature-x) IS REVERSED — distinct from the current marker"
+    );
+}
+
+#[test]
+fn picker_shows_an_agent_status_badge_only_for_agent_rows() {
+    // AC-19: a worktree whose workspace hosts a running agent shows that agent's status as a
+    // badge; a worktree with no agent shows none. In the fixture only the feature-x row has an
+    // agent (`working`), so the status text appears exactly once and the current/detached rows
+    // carry no badge.
+    let out = render(&picker_state(), 100, 24);
+    assert!(
+        out.contains("working"),
+        "the agent row shows its status badge (working)\n{out}"
+    );
+    // The status string is colored — assert it lands in the buffer with a non-default fg so it
+    // reads as a badge, not plain text.
+    use ratatui::style::Color;
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (w, h) = (buf.area().width, buf.area().height);
+    let mut badge_fg: Option<Color> = None;
+    'outer: for y in 0..h {
+        for x in 0..w {
+            let matches = "working".chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if matches {
+                badge_fg = Some(buf.cell((x, y)).unwrap().fg);
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        matches!(badge_fg, Some(c) if c != Color::Reset),
+        "the agent badge is colored by status, got {badge_fg:?}"
+    );
+}
+
+#[test]
+fn picker_overlay_keeps_cursor_visible_with_many_rows() {
+    // AC-5: on a repo with more worktrees than fit in the popup (herdr's multi-agent use case),
+    // moving the cursor toward the end must scroll the row window so the highlighted row stays
+    // visible. Pre-fix the overlay rendered all rows into the fixed popup with no scroll, so a
+    // cursor near the end fell below the visible area and its row never reached the buffer.
+    use ratatui::style::Modifier;
+
+    let mut state = sample_state();
+    // 40 worktrees — far more than fit in the ~12-row popup interior at 100x24.
+    let rows: Vec<PickerRowView> = (0..40)
+        .map(|i| PickerRowView {
+            path: format!("/work/wt-{i:02}"),
+            branch: Some(format!("branch-{i:02}")),
+            detached: false,
+            is_current: false,
+            agent: None,
+        })
+        .collect();
+    state.picker = Some(PickerView {
+        rows,
+        cursor: 37,
+        hscroll: 0,
+    }); // near the end
+
+    let buf = render_buffer(&state, 100, 24);
+
+    // The cursor row's distinctive path must be present in the buffer (the window scrolled to it).
+    let cursor_needle = "wt-37";
+    let mut found_at: Option<(u16, u16)> = None;
+    let (w, h) = (buf.area().width, buf.area().height);
+    for y in 0..h {
+        for x in 0..w {
+            let matches = cursor_needle.chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if matches {
+                found_at = Some((x, y));
+                break;
+            }
+        }
+        if found_at.is_some() {
+            break;
+        }
+    }
+    let (cx, cy) = found_at.expect("the cursor row (wt-37) must be visible after scrolling");
+    // And it carries the REVERSED highlight, so it reads as the selected row.
+    assert!(
+        buf.cell((cx, cy))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED),
+        "the visible cursor row must be REVERSED-highlighted"
+    );
+}
+
+/// Locate the picker overlay's border box in the buffer. The two-column layout also draws
+/// `┌…┐` corners, so anchor on the overlay's title ("Switch worktree"): its `┌` corner is the
+/// cell just left of the title, the `┐` corner is the first `┐` to the right of the title on
+/// that row (gives the right edge), and the box's bottom edge is the first `┘` directly below
+/// the right edge. Returns `(x0, y0, x1, y1)` inclusive. Panics if the picker is not found.
+fn picker_border_box(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
+    let (w, h) = (buf.area().width, buf.area().height);
+    let title = "Switch worktree";
+    // Find the title row + its starting column.
+    let mut anchor: Option<(u16, u16)> = None;
+    'find: for y in 0..h {
+        for x in 0..w {
+            let here = title.chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if here {
+                anchor = Some((x, y));
+                break 'find;
+            }
+        }
+    }
+    let (tx, y0) = anchor.expect("picker title not found in buffer");
+    let x0 = tx - 1; // the `┌` corner is just left of the title
+    // The top-right `┐` is the first one to the right of the title on the same row.
+    let mut x1 = None;
+    for x in tx..w {
+        if buf.cell((x, y0)).is_some_and(|c| c.symbol() == "┐") {
+            x1 = Some(x);
+            break;
+        }
+    }
+    let x1 = x1.expect("picker top-right corner");
+    // The bottom edge is the first `┘` at column x1 below the title row.
+    let mut y1 = None;
+    for y in (y0 + 1)..h {
+        if buf.cell((x1, y)).is_some_and(|c| c.symbol() == "┘") {
+            y1 = Some(y);
+            break;
+        }
+    }
+    let y1 = y1.expect("picker bottom-right corner");
+    (x0, y0, x1, y1)
+}
+
+#[test]
+fn picker_box_is_sized_to_its_content_not_the_whole_pane() {
+    // Picker-layout §2: the overlay box is sized to its content (a few short worktree rows),
+    // not a fixed 60% of the pane. With 3 short rows in an 80x24 frame, the box must be far
+    // smaller than the frame — a tidy box, not a half-screen modal.
+    let buf = render_buffer(&picker_state(), 80, 24);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+    let box_w = x1 - x0 + 1;
+    let box_h = y1 - y0 + 1;
+    // 3 content rows + title + 2 borders ⇒ height ~6; the longest row
+    // "  /work/feature [feature-x]  ● working" is ~38 cols + 2 borders ⇒ width ~40.
+    assert!(
+        box_w < 60,
+        "the box is sized to its content, not ~60% of an 80-col pane (got width {box_w})"
+    );
+    assert!(
+        box_h <= 8,
+        "the box height tracks the row count, not ~60% of 24 rows (got height {box_h})"
+    );
+    assert!(
+        box_w >= 30,
+        "the box is wide enough for the rows (got {box_w})"
+    );
+}
+
+#[test]
+fn picker_box_clamps_to_a_narrow_frame_without_panicking() {
+    // Picker-layout §2: rows wider than the frame must not overflow it — the box caps at the
+    // pane (minus a small margin) and the draw must not panic at a small frame size.
+    let mut state = picker_state();
+    // A very long path — far wider than a 30-col frame.
+    if let Some(p) = state.picker.as_mut() {
+        p.rows[1].path = "/work/some/really/long/nested/worktree/path/that/overflows".to_string();
+    }
+    let buf = render_buffer(&state, 30, 10);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+    assert!(x1 < 30, "the box right edge stays inside the 30-col frame");
+    assert!(y1 < 10, "the box bottom edge stays inside the 10-row frame");
+    assert!(x0 < x1 && y0 < y1, "the box is a valid non-empty rect");
+    // No panic getting here is the core assertion (saturating Rect math at a small size).
+}
+
+#[test]
+fn picker_rows_are_inset_from_the_left_border_by_one_padding_col() {
+    // Picker-padding: the rows render into the block's PADDED inner, so a row's first non-blank
+    // cell sits at least 2 columns right of the box's left `│` — one for the border, one for the
+    // horizontal padding gutter. (Before the padding, the first content cell sat at x0 + 1, flush
+    // against the border.)
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, y0, _x1, y1) = picker_border_box(&buf);
+
+    // Scan the interior rows (between the top and bottom border) for the first one carrying a
+    // non-blank cell, and find that cell's column.
+    let (w, _h) = (buf.area().width, buf.area().height);
+    let mut first_content_col: Option<u16> = None;
+    'rows: for y in (y0 + 1)..y1 {
+        for x in (x0 + 1)..w {
+            let cell = buf.cell((x, y));
+            let sym = cell.map_or(" ", |c| c.symbol());
+            // Stop at the right border; only look inside the box.
+            if sym == "│" && x > x0 {
+                break;
+            }
+            if sym != " " && sym != "│" {
+                first_content_col = Some(x);
+                break 'rows;
+            }
+        }
+    }
+    let col = first_content_col.expect("the picker has at least one row with content");
+    assert!(
+        col >= x0 + 2,
+        "row content is inset from the left border by the padding gutter \
+         (first content col {col} must be >= left border {x0} + 2)"
+    );
+}
+
+#[test]
+fn picker_rows_are_inset_from_the_top_border_by_one_padding_row() {
+    // Picker-padding: uniform padding also insets the rows VERTICALLY, so the first row's text
+    // sits at least 2 rows below the box's top border `─` line — one for the border row (which
+    // carries the title), one for the top padding row (a blank line). (With horizontal-only
+    // padding the first row sat at y0 + 1, flush against the top border.) Complements the
+    // left-inset test, which checks the horizontal gutter.
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+
+    // Scan interior rows top-to-bottom for the first one carrying a non-blank, non-border cell,
+    // and record which row it lands on.
+    let mut first_content_row: Option<u16> = None;
+    'rows: for y in (y0 + 1)..y1 {
+        for x in (x0 + 1)..x1 {
+            let sym = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+            if sym != " " && sym != "│" {
+                first_content_row = Some(y);
+                break 'rows;
+            }
+        }
+    }
+    let row = first_content_row.expect("the picker has at least one row with content");
+    assert!(
+        row >= y0 + 2,
+        "row content is inset from the top border by the padding row \
+         (first content row {row} must be >= top border {y0} + 2)"
+    );
+}
+
+#[test]
+fn picker_border_is_blue() {
+    // Picker-layout §1: the overlay border renders in the terminal's ANSI blue (matching herdr's
+    // terminal-theme chrome). Assert the `┌` corner cell carries Color::Blue.
+    use ratatui::style::Color;
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, y0, _, _) = picker_border_box(&buf);
+    let corner = buf.cell((x0, y0)).expect("picker corner cell");
+    assert_eq!(
+        corner.symbol(),
+        "┌",
+        "located the picker's top-left border corner"
+    );
+    assert_eq!(
+        corner.fg,
+        Color::Blue,
+        "the picker border is ANSI blue (herdr terminal-theme chrome)"
+    );
+}
+
+#[test]
+fn picker_applies_horizontal_scroll_to_clip_long_rows() {
+    // Picker-layout §3: when a row is wider than the box (long path on a narrow pane), a non-zero
+    // hscroll shifts the visible text left so later columns become readable, and the leading
+    // columns are clipped off.
+    let mut state = picker_state();
+    if let Some(p) = state.picker.as_mut() {
+        p.rows = vec![PickerRowView {
+            path: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_string(),
+            branch: None,
+            detached: false,
+            is_current: false,
+            agent: None,
+        }];
+        p.cursor = 0;
+        p.hscroll = 0;
+    }
+    // A narrow frame so the box caps and the row genuinely overflows.
+    let out0 = render(&state, 24, 8);
+    assert!(
+        out0.contains("ABCDE"),
+        "at hscroll 0 the row shows from its left edge\n{out0}"
+    );
+
+    if let Some(p) = state.picker.as_mut() {
+        p.hscroll = 8;
+    }
+    let out_shifted = render(&state, 24, 8);
+    assert!(
+        !out_shifted.contains("ABCDE"),
+        "with hscroll the leading columns are clipped off\n{out_shifted}"
+    );
+    assert!(
+        out_shifted.contains("IJKLM"),
+        "with hscroll later columns of the path become visible\n{out_shifted}"
+    );
+}
+
+#[test]
+fn picker_horizontal_scroll_clamps_past_the_end() {
+    // Picker-layout §3: an hscroll far past the widest row is clamped at draw — no panic and no
+    // over-scroll into blank space (the last columns stay visible, not scrolled off entirely).
+    let mut state = picker_state();
+    if let Some(p) = state.picker.as_mut() {
+        p.rows = vec![PickerRowView {
+            path: "ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string(),
+            branch: None,
+            detached: false,
+            is_current: false,
+            agent: None,
+        }];
+        p.cursor = 0;
+        p.hscroll = 9999; // absurdly far past the end
+    }
+    let out = render(&state, 24, 8);
+    // Clamped, not blanked: the tail of the path is still visible.
+    assert!(
+        out.contains("XYZ"),
+        "an over-scroll clamps so the row's tail stays visible (no blank box)\n{out}"
+    );
+}
+
+#[test]
+fn picker_hscroll_is_a_noop_when_all_rows_fit_even_if_chrome_caps_the_box() {
+    // Gate fix: the hscroll clamp must be against the widest ROW, not the (chrome-inflated)
+    // desired inner width. On a narrow frame the box caps so the WIDE footer hint
+    // ("↑↓ move · ←→ scroll · …", ~40 cols) drives `desired_inner_w`, while the SHORT rows fit the
+    // capped interior. A non-zero hscroll must then be a no-op — every row still shows from its
+    // left edge. (Before the fix, `desired_inner_w - inner.width > 0` let scroll-right clip the
+    // rows off-screen for no reason.)
+    let mut state = picker_state();
+    if let Some(p) = state.picker.as_mut() {
+        // A single SHORT row — far narrower than the footer chrome.
+        p.rows = vec![PickerRowView {
+            path: "/a".to_string(),
+            branch: None,
+            detached: false,
+            is_current: false,
+            agent: None,
+        }];
+        p.cursor = 0;
+        p.hscroll = 0;
+    }
+    // A frame narrow enough that the box caps below the chrome width (~40), but wide enough that
+    // the short row still fits the capped interior.
+    let (w, h) = (20, 8);
+    let out0 = render(&state, w, h);
+    assert!(
+        out0.contains("/a"),
+        "at hscroll 0 the short row shows from its left edge\n{out0}"
+    );
+
+    // Scroll right hard. With the clamp against max_row_width (the fix), max_hscroll is 0 here, so
+    // this is a no-op and the row stays fully visible. With the buggy desired_inner_w clamp the
+    // leading `/a` would be clipped off-screen.
+    if let Some(p) = state.picker.as_mut() {
+        p.hscroll = 30;
+    }
+    let out_scrolled = render(&state, w, h);
+    assert!(
+        out_scrolled.contains("/a"),
+        "scrolling right is a no-op while every row fits — the row must not be clipped\n{out_scrolled}"
+    );
+    assert_eq!(
+        out0, out_scrolled,
+        "hscroll has no effect when all rows fit the capped interior"
+    );
+}
+
+#[test]
+fn picker_shows_an_esc_close_chip_on_the_top_border() {
+    // Picker-hints §1: herdr-style chrome — an `esc close` chip on the TOP border, right side.
+    // It is a Block title, not an inner row, so it lands on the title row (the box's top edge),
+    // to the right of the existing "Switch worktree" title.
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, y0, x1, _y1) = picker_border_box(&buf);
+
+    // Read the whole top border row text inside the box and confirm the chip is present, to the
+    // right of the left-aligned title.
+    let top = border_row_text(&buf, x0, x1, y0);
+    assert!(
+        top.contains("esc close"),
+        "the top border shows an `esc close` chip\n{top}"
+    );
+    let title_col = first_col_of(&buf, x0, x1, y0, "Switch worktree").expect("title on top border");
+    let chip_col = first_col_of(&buf, x0, x1, y0, "esc close").expect("chip on top border");
+    assert!(
+        chip_col > title_col,
+        "the `esc close` chip is to the RIGHT of the title (top={top:?})"
+    );
+
+    // The chip is no longer dimmed: its fg matches the worktree PATH text (the default/terminal
+    // foreground, `Color::Reset`), not DarkGray. Compare it to a path cell's fg directly.
+    let path_fg = path_text_fg(&buf);
+    let chip_fg = buf.cell((chip_col, y0)).unwrap().fg;
+    assert_eq!(
+        chip_fg, path_fg,
+        "the `esc close` chip uses the same fg as the worktree path text (default), not DarkGray"
+    );
+    assert_eq!(
+        chip_fg,
+        ratatui::style::Color::Reset,
+        "the chip uses the default/terminal foreground (Color::Reset)"
+    );
+}
+
+/// The foreground color of a worktree PATH cell in the picker rows — the baseline the chrome
+/// hints are expected to match. Anchors on the `/work/main` path (the current, non-cursor row),
+/// reading the fg of its first path glyph. The path spans carry no explicit fg, so this is the
+/// default `Color::Reset`.
+fn path_text_fg(buf: &ratatui::buffer::Buffer) -> ratatui::style::Color {
+    let needle = "/work/main";
+    let (w, h) = (buf.area().width, buf.area().height);
+    for y in 0..h {
+        for x in 0..w {
+            let matches = needle.chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if matches {
+                return buf.cell((x, y)).unwrap().fg;
+            }
+        }
+    }
+    panic!("{needle:?} path text not found in buffer");
+}
+
+/// The text of a border row between columns `x0..=x1` (one char per cell, multi-width cells
+/// contribute their leading char) — for asserting which titles landed on the border.
+fn border_row_text(buf: &ratatui::buffer::Buffer, x0: u16, x1: u16, y: u16) -> String {
+    (x0..=x1)
+        .map(|x| {
+            buf.cell((x, y))
+                .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' '))
+        })
+        .collect()
+}
+
+/// The buffer column where `needle` first begins on row `y` within `x0..=x1`, matching one char
+/// per cell. Returns the absolute column (not a byte offset) so an fg lookup is exact even when
+/// the row contains multi-byte glyphs (the box-drawing border, `·`, arrows).
+fn first_col_of(
+    buf: &ratatui::buffer::Buffer,
+    x0: u16,
+    x1: u16,
+    y: u16,
+    needle: &str,
+) -> Option<u16> {
+    let chars: Vec<char> = needle.chars().collect();
+    for start in x0..=x1 {
+        let fits = chars.iter().enumerate().all(|(i, ch)| {
+            let cx = start + i as u16;
+            cx <= x1
+                && buf
+                    .cell((cx, y))
+                    .is_some_and(|c| c.symbol() == ch.to_string())
+        });
+        if fits {
+            return Some(start);
+        }
+    }
+    None
+}
+
+#[test]
+fn picker_shows_a_key_hint_footer_on_the_bottom_border() {
+    // Picker-hints §2: a dim `·`-separated footer of the picker's real keys on the BOTTOM border.
+    let buf = render_buffer(&picker_state(), 100, 24);
+    let (x0, _y0, x1, y1) = picker_border_box(&buf);
+
+    let bottom = border_row_text(&buf, x0, x1, y1);
+    // The footer names move / scroll / switch / cancel keys with herdr's ` · ` separator.
+    assert!(
+        bottom.contains("move") && bottom.contains("scroll"),
+        "the bottom border footer names move + scroll\n{bottom}"
+    );
+    assert!(
+        bottom.contains("switch") && bottom.contains("cancel"),
+        "the bottom border footer names switch + cancel\n{bottom}"
+    );
+    assert!(
+        bottom.contains('·'),
+        "the footer uses herdr's ` · ` separator\n{bottom}"
+    );
+
+    // The footer is no longer dimmed: its fg matches the worktree PATH text (the default/terminal
+    // foreground, `Color::Reset`), not DarkGray. Check the fg at the first hint glyph (`move`).
+    let move_col = first_col_of(&buf, x0, x1, y1, "move").expect("footer names `move`");
+    let path_fg = path_text_fg(&buf);
+    let footer_fg = buf.cell((move_col, y1)).unwrap().fg;
+    assert_eq!(
+        footer_fg, path_fg,
+        "the footer hint uses the same fg as the worktree path text (default), not DarkGray"
+    );
+    assert_eq!(
+        footer_fg,
+        ratatui::style::Color::Reset,
+        "the footer uses the default/terminal foreground (Color::Reset)"
+    );
+}
+
+#[test]
+fn picker_box_is_wide_enough_for_the_chrome_when_rows_are_short() {
+    // Picker-hints §3: size-to-content must include the chrome — even with very short rows, the
+    // box must be wide enough that neither the title+`esc close` nor the footer hint is clipped.
+    let mut state = picker_state();
+    // Rows much shorter than the chrome (the footer is the widest element here).
+    if let Some(p) = state.picker.as_mut() {
+        p.rows = vec![
+            PickerRowView {
+                path: "a".to_string(),
+                branch: None,
+                detached: false,
+                is_current: true,
+                agent: None,
+            },
+            PickerRowView {
+                path: "b".to_string(),
+                branch: None,
+                detached: false,
+                is_current: false,
+                agent: None,
+            },
+        ];
+        p.cursor = 0;
+    }
+    let buf = render_buffer(&state, 100, 24);
+    let (x0, y0, x1, y1) = picker_border_box(&buf);
+
+    let top = border_row_text(&buf, x0, x1, y0);
+    let bottom = border_row_text(&buf, x0, x1, y1);
+
+    // The full title + chip both appear on the top border (not clipped) despite tiny rows.
+    assert!(
+        top.contains("Switch worktree") && top.contains("esc close"),
+        "short rows still leave room for the title + `esc close` chip\n{top}"
+    );
+    // The full footer appears on the bottom border (not clipped) despite tiny rows.
+    assert!(
+        bottom.contains("move")
+            && bottom.contains("scroll")
+            && bottom.contains("switch")
+            && bottom.contains("cancel"),
+        "short rows still leave room for the full key-hint footer\n{bottom}"
+    );
+}
+
+#[test]
+fn picker_chrome_renders_without_panic_on_a_small_frame() {
+    // Picker-hints §3: at a frame too narrow for the full chrome (24x8 is below the footer's
+    // natural ~43-col width) the box caps at the pane and the hints simply truncate — the draw
+    // must NOT panic (saturating layout math). The draw itself is the assertion: `render_buffer`
+    // would unwrap-panic on a `draw` error, so reaching the size checks proves it stayed sane.
+    let buf = render_buffer(&picker_state(), 24, 8);
+    // The clamped box never exceeds the frame (right/bottom edges stay inside).
+    assert!(buf.area().width <= 24 && buf.area().height <= 8);
+    // A truncated footer is acceptable; the box is still bordered (a `┐` corner exists somewhere).
+    let (w, h) = (buf.area().width, buf.area().height);
+    let has_corner =
+        (0..h).any(|y| (0..w).any(|x| buf.cell((x, y)).is_some_and(|c| c.symbol() == "┐")));
+    assert!(
+        has_corner,
+        "the picker still draws a bordered box at a small frame"
+    );
+}
+
+#[test]
+fn picker_overlay_snapshot() {
+    insta::assert_snapshot!("presenter_picker", render(&picker_state(), 100, 24));
 }
 
 #[test]

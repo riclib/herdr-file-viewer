@@ -13,7 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 /// Which column currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +59,38 @@ pub struct ViewState {
     /// When `Some`, a one-row "update available" status line is drawn across the bottom of the
     /// frame (the columns take the remaining rows). `None` ⇒ no footer, layout unchanged.
     pub update_banner: Option<String>,
+    /// When `Some`, the worktree picker overlay is drawn on top of the two columns (AC-1, AC-5).
+    /// `None` ⇒ no overlay.
+    pub picker: Option<PickerView>,
+}
+
+/// The worktree picker's draw model (an owned snapshot of the controller's picker state, so
+/// the Presenter stays borrow-free). Built by the Session Controller's `view_state()`.
+pub struct PickerView {
+    /// The worktree rows, in display order.
+    pub rows: Vec<PickerRowView>,
+    /// Index into `rows` of the highlighted row.
+    pub cursor: usize,
+    /// Raw horizontal scroll offset (columns) carried from the controller. The Presenter clamps
+    /// it to the live inner width at draw, so it can never over-scroll past the widest row.
+    pub hscroll: u16,
+}
+
+/// One worktree row in the picker overlay.
+pub struct PickerRowView {
+    /// The worktree's path (displayed, sanitized for control bytes — AC-27).
+    pub path: String,
+    /// The branch name, or `None` when HEAD is detached.
+    pub branch: Option<String>,
+    /// `true` when HEAD is detached (no branch) — shown as a detached marker, never an empty
+    /// branch (AC-2, gate L-1).
+    pub detached: bool,
+    /// `true` when this is the worktree the viewer is currently rooted at — rendered as a leading
+    /// "current" marker, distinct from the selection cursor (AC-18).
+    pub is_current: bool,
+    /// The hosting agent's status (e.g. `"working"`), or `None` when the worktree's workspace
+    /// hosts no real agent. Rendered as a small trailing badge, colored by status (AC-19).
+    pub agent: Option<String>,
 }
 
 /// The single-character git-status marker shown beside a tree row (AC-7).
@@ -179,7 +211,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
         let notice_lines: Vec<Line> = state
             .notices
             .iter()
-            .map(|n| Line::styled(n.clone(), Style::new().fg(Color::Yellow)))
+            .map(|n| Line::styled(sanitize_label(n), Style::new().fg(Color::Yellow)))
             .collect();
         frame.render_widget(Paragraph::new(notice_lines), parts[0]);
     }
@@ -294,10 +326,232 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
     if let Some(area) = tree {
         draw_tree(frame, area, state);
     }
-    match content {
+    let dims = match content {
         Some(area) => draw_content(frame, area, state),
         None => (0, 0),
+    };
+    // The worktree picker is a modal overlay: drawn last, on TOP of whatever columns are
+    // visible (AC-1, AC-5), so it is never obscured by the layout beneath it.
+    if let Some(picker) = &state.picker {
+        draw_picker_overlay(frame, frame.area(), picker);
     }
+    dims
+}
+
+/// A `Rect` of outer size `w` × `h`, centered in `area` and clamped so it never exceeds `area`.
+/// Used to size the picker overlay to its content (caller passes content + borders), capped at
+/// the pane. All math is saturating, so a frame smaller than the requested box never panics —
+/// the box simply shrinks to fit (down to a zero-area rect at a degenerate frame). Centering
+/// rounds the leftover margin down, biasing the box toward the top-left by at most one cell.
+fn centered_rect_sized(w: u16, h: u16, area: Rect) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+/// Uniform inner padding (cells on every side) between the picker rows and the box border, so the
+/// content reads with a little breathing room — matching herdr's indented popup content. Applied
+/// both horizontally (a column gutter each side) and vertically (a blank row above the first row
+/// and below the last), so the rows never sit flush against the border or the title/footer chrome.
+const PICKER_PADDING: u16 = 1;
+/// The picker's top-left title (the box label).
+const PICKER_TITLE: &str = "Switch worktree";
+/// The herdr-style `esc close` chip on the top border (right-aligned, dim chrome).
+const PICKER_ESC_CLOSE: &str = "esc close";
+/// The herdr-style key-hint footer on the bottom border — the picker's real bindings, with
+/// herdr's ` · ` separator. Up/Down move the cursor, Left/Right horizontal-scroll, Enter
+/// confirms the switch, Esc cancels. Static (not repo-derived), so no sanitization is needed.
+const PICKER_FOOTER_HINT: &str = "↑↓ move · ←→ scroll · ⏎ switch · esc cancel";
+
+/// Draw the worktree picker as a centered, bordered list overlay on top of the columns (AC-1,
+/// AC-5). Each row is `<path> [branch]`, or `<path> (detached)` when HEAD is detached — never
+/// an empty branch (AC-2, gate L-1). The `cursor` row is highlighted (`REVERSED`, the same
+/// idiom `tree_row` uses for the tree selection). The path and branch are both run through
+/// `sanitize_label` first, so a worktree path or branch name carrying control bytes cannot
+/// move the cursor or spoof the UI (AC-27, defense-in-depth — exactly as the tree does).
+///
+/// The box is **sized to its content** (the widest rendered row × the row count, plus the
+/// border, title, and uniform inner padding), then **clamped to the frame** with a small margin
+/// and **centered** — so a
+/// few short worktrees draw a tidy box and many long paths grow up to the pane, then cap. It is
+/// recomputed every draw, so it is fully responsive to a pane resize.
+///
+/// When there are more rows than the popup interior is tall (herdr's multi-agent repos have
+/// many worktrees), the row window scrolls so the `cursor` row is always visible (AC-5). When a
+/// row is wider than the (capped) interior, `picker.hscroll` shifts the rows horizontally so a
+/// long path can be read sideways; it is clamped here to `[0, max_row_width - inner_width]`, so
+/// it is a no-op while everything fits and can never over-scroll past the widest row.
+///
+/// herdr-style chrome surrounds the box: a dim `esc close` chip on the top border (right) and a
+/// dim `·`-separated footer of the picker's real keys on the bottom border (AC discoverability).
+/// Both are Block titles, never inner rows, so the rows area / scroll are untouched; the
+/// size-to-content calc widens the box to fit them so short rows don't clip the chrome.
+fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
+    // Build every row once so we can both measure widths (size-to-content) and draw the window.
+    let rows: Vec<Line> = picker
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| picker_row(row, i == picker.cursor))
+        .collect();
+
+    // herdr-style chrome: an `esc close` chip on the top border (right) and a key-hint footer on
+    // the bottom border. These are static affordances (not repo-derived), rendered as Block titles
+    // — never inner rows — so the rows area / scroll above are untouched. The two hint strings are
+    // drawn in the default/terminal foreground — the SAME color as the worktree path text in the
+    // rows. We set `Color::Reset` explicitly: title spans inherit the Block's (blue) border style,
+    // so without an override they would tint blue rather than match the un-styled path text. (The
+    // current-marker cyan and the agent badges keep their own colors — only the hints change.)
+    let hint_style = Style::new().fg(Color::Reset);
+    let top_left = Line::from(PICKER_TITLE);
+    let top_right = Line::styled(PICKER_ESC_CLOSE, hint_style).right_aligned();
+    let footer = Line::styled(PICKER_FOOTER_HINT, hint_style).centered();
+
+    // Desired interior: the widest row (display width, not byte len — `Line::width` counts
+    // unicode columns) × the row count — AND wide enough for the chrome so the chip/footer never
+    // truncate when rows are short. The box adds the two border rows/cols plus one title row.
+    let max_row_width = rows.iter().map(Line::width).max().unwrap_or(0);
+    // Top border must fit "Switch worktree" + a one-space gap + "esc close"; the bottom must fit
+    // the footer hint. Take the max so short rows still leave room for the chrome.
+    let min_top = top_left.width() + 1 + top_right.width();
+    let min_bottom = footer.width();
+    let desired_inner_w = max_row_width
+        .max(min_top)
+        .max(min_bottom)
+        .min(u16::MAX as usize) as u16;
+    let desired_inner_h = (rows.len().min(u16::MAX as usize) as u16).max(1);
+    // Outer width = inner content + 2 (borders) + 2 (one col of horizontal padding each side), so
+    // the rows aren't squeezed against the border. Outer height = inner rows + 2 (top/bottom
+    // borders, which the title/footer chrome share) + 2 (one row of vertical padding top and
+    // bottom), so a blank padded line sits between the top border/title and the first row, and
+    // between the last row and the bottom border/footer. Saturating so huge content never
+    // overflows u16.
+    let want_w = desired_inner_w
+        .saturating_add(2)
+        .saturating_add(PICKER_PADDING * 2);
+    let want_h = desired_inner_h
+        .saturating_add(2)
+        .saturating_add(PICKER_PADDING * 2);
+    // Cap at the pane, leaving a one-cell margin all round (never exceed, never underflow). If the
+    // frame is narrower than the chrome wants, the box caps here and the hints simply truncate.
+    let cap_w = area.width.saturating_sub(2);
+    let cap_h = area.height.saturating_sub(2);
+    let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
+
+    // Clear whatever the columns drew beneath the popup so it reads as a true modal.
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title_top(top_left)
+        .title_top(top_right)
+        .title_bottom(footer)
+        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        // A 1-cell gutter on every side so the rows aren't flush against the border (or the
+        // title/footer chrome that shares the border rows). `inner()` subtracts this all round
+        // automatically, so the rows, cursor highlight, current marker, agent badge, vertical
+        // scroll, and hscroll all flow from the padded interior below.
+        .padding(Padding::uniform(PICKER_PADDING));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Scroll the row window so the cursor row stays visible. With `visible` interior rows, keep
+    // `cursor` inside `[offset, offset + visible)`: clamp the offset so it never scrolls past
+    // the end and is 0 whenever all rows fit (preserving the small-list rendering).
+    let visible = inner.height as usize;
+    let offset = picker_scroll_offset(picker.cursor, picker.rows.len(), visible);
+
+    // Clamp the horizontal scroll to the widest ROW: at most `max_row_width - inner_width`
+    // (0 when every row fits). NOT against `desired_inner_w`, which is inflated by the title/footer
+    // chrome — clamping there would let scroll-right push the rows off-screen on a narrow pane even
+    // when every row fits. Saturating, so a narrow box never underflows.
+    let max_hscroll = (max_row_width.min(u16::MAX as usize) as u16).saturating_sub(inner.width);
+    let hscroll = picker.hscroll.min(max_hscroll);
+
+    let window: Vec<Line> = rows.into_iter().skip(offset).take(visible).collect();
+    // `Paragraph::scroll((y, x))` clips the leading `x` columns off each line — the horizontal
+    // read for long paths. The vertical window is already applied by skip/take, so y stays 0.
+    frame.render_widget(Paragraph::new(window).scroll((0, hscroll)), inner);
+}
+
+/// The first row index to render so the `cursor` row stays within a window of `visible` rows.
+/// Returns 0 when every row fits (or the window is degenerate), and never scrolls past the end.
+fn picker_scroll_offset(cursor: usize, len: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+    // Keep the cursor in view: if it sits below the window, scroll down just enough; if above,
+    // scroll up to it. Clamp so the last window ends at the final row.
+    let max_offset = len - visible;
+    if cursor < visible {
+        0
+    } else {
+        (cursor + 1 - visible).min(max_offset)
+    }
+}
+
+/// The color for an agent-status badge: `working`/`done` green, `idle` blue, `blocked` red,
+/// anything else (incl. `unknown`) gray. Keeps the badge legible at a glance without overloading
+/// the row's meaning.
+fn agent_badge_color(status: &str) -> Color {
+    match status {
+        "working" | "done" => Color::Green,
+        "idle" => Color::Blue,
+        "blocked" => Color::Red,
+        _ => Color::Gray,
+    }
+}
+
+/// Render one picker row as `<current-marker> <path> [branch]|(detached) <agent-badge>`:
+///
+/// - a leading **current marker** (`●` in cyan) when the row is the worktree the viewer is rooted
+///   at, else a blank — visually distinct from the selection cursor, which stays `REVERSED` on the
+///   highlighted row (AC-18). A row can be current without being selected and vice versa.
+/// - the path + branch (or `(detached)` when HEAD is detached, AC-2), both sanitized (AC-27).
+/// - a trailing **agent badge** (`● <status>`, colored by status) when the worktree's workspace
+///   hosts a real agent, else nothing (AC-19). The status is sanitized too (defense-in-depth).
+///
+/// The whole row is `REVERSED` when it is the cursor row (the same idiom `tree_row` uses).
+fn picker_row(row: &PickerRowView, selected: bool) -> Line<'static> {
+    let path = sanitize_label(&row.path);
+    let suffix = match &row.branch {
+        Some(branch) => format!(" [{}]", sanitize_label(branch)),
+        None if row.detached => " (detached)".to_string(),
+        // No branch and not detached: show nothing rather than an empty `[]` (defensive).
+        None => String::new(),
+    };
+
+    // Row-wide style: the REVERSED cursor highlight applies to every span on the selected row.
+    let base = if selected {
+        Style::new().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new()
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Leading current marker (AC-18): a cyan ● when current, two spaces otherwise so the path
+    // column stays aligned across current and non-current rows.
+    if row.is_current {
+        spans.push(Span::styled("● ", base.fg(Color::Cyan)));
+    } else {
+        spans.push(Span::styled("  ", base));
+    }
+    spans.push(Span::styled(format!("{path}{suffix}"), base));
+    // Trailing agent badge (AC-19): colored by status, sanitized (AC-27).
+    if let Some(status) = &row.agent {
+        let status = sanitize_label(status);
+        spans.push(Span::styled(
+            format!("  ● {status}"),
+            base.fg(agent_badge_color(&status)),
+        ));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]

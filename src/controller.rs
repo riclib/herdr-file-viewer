@@ -17,8 +17,11 @@
 //! than clobbering the current selection.
 
 use crate::git::{Baseline, Status};
+use crate::herdr::HerdrCli;
 use crate::intent::Intent;
-use crate::presenter::{Focus, PaneGeometry, ViewState};
+use crate::picker::PickerState;
+use crate::presenter::{Focus, PaneGeometry, PickerRowView, PickerView, ViewState};
+use crate::root::Resolved;
 use crate::tree::{Node, NodeKind, TreeModel};
 use crate::update::{self, UpdateState, Version};
 use crate::view_policy::{FileDescriptor, ViewMode, applicable_modes, default_mode};
@@ -91,12 +94,21 @@ pub trait Clipboard {
     fn copy(&mut self, text: &str) -> io::Result<()>;
 }
 
-/// The injected components the controller orchestrates.
-pub struct Components {
+/// The root-bound providers rebuilt on every (re-)root. Editor/clipboard are NOT here — they
+/// survive a re-root unchanged, so they live on [`Components`] directly. ADR-0004.
+pub struct RootProviders {
     /// Shared (`Arc`) because both the controller (status / changed-set) and the render
     /// worker (diff, off the input thread) query git.
     pub git: Arc<dyn GitService>,
     pub content: Box<dyn ContentProvider>,
+}
+
+/// The injected components the controller orchestrates.
+pub struct Components {
+    /// Builds the root-bound providers for a given [`Resolved`]. Called once at launch, and
+    /// again per re-root (T-7/T-8). `Fn` (not `FnOnce`) because a re-root re-invokes it.
+    /// ADR-0004.
+    pub providers: Box<dyn Fn(&Resolved) -> RootProviders>,
     pub editor: Box<dyn EditorHandoff>,
     pub clipboard: Box<dyn Clipboard>,
 }
@@ -138,6 +150,12 @@ struct RenderJob {
     baseline: Baseline,
     is_git: bool,
 }
+
+/// A re-root's off-thread git result: the working-tree status (tree markers, AC-7) and the
+/// changed-set against the active baseline (the changed-only filter, AC-6), both keyed by
+/// repo-root-relative path. Carried over a one-shot channel from the worker `re_root` spawns to
+/// the `poll` that applies them.
+type StatusResult = (BTreeMap<PathBuf, Status>, BTreeMap<PathBuf, Status>);
 
 /// The interaction orchestrator and the ephemeral session state.
 pub struct Controller {
@@ -183,6 +201,9 @@ pub struct Controller {
     git: Arc<dyn GitService>,
     editor: Box<dyn EditorHandoff>,
     clipboard: Box<dyn Clipboard>,
+    /// The provider factory (ADR-0004), kept so a re-root can rebuild the root-bound providers
+    /// (Git Service + Content Renderer) against the new root.
+    providers: Box<dyn Fn(&Resolved) -> RootProviders>,
     /// Render dispatch to the worker thread (AC-23). `latest_seq` is the most recently
     /// dispatched job; a `poll`ed result with a smaller seq is stale and dropped.
     job_tx: mpsc::Sender<RenderJob>,
@@ -204,66 +225,50 @@ pub struct Controller {
     update_dismissed: bool,
     /// One-shot receiver for the background update check's result (`None` when no check ran).
     update_rx: Option<mpsc::Receiver<Option<Version>>>,
+    /// One-shot receiver for a re-root's off-thread status/changed-set computation (AC-17).
+    /// `Some` between a re-root and the tick that applies the result; `None` otherwise.
+    status_rx: Option<mpsc::Receiver<StatusResult>>,
+    /// The open worktree picker's state, or `None` when closed (AC-1). A re-root closes it
+    /// (AC-13); the switch itself is wired in later tasks.
+    picker: Option<PickerState>,
+    /// The herdr query channel for the agent-active overlay (AC-3), injected post-construction
+    /// via [`set_host`](Self::set_host). `None` until then ⇒ a git-only picker (AC-15).
+    /// Session-level — survives a re-root unchanged.
+    herdr: Option<Box<dyn HerdrCli>>,
+    /// The viewer's own herdr workspace id (the agent-overlay's Tier-1 hint). Session-level —
+    /// survives a re-root unchanged.
+    our_workspace_id: Option<String>,
+    /// The launch base-branch hint (the branch a worktree forked from), carried into a re-root's
+    /// re-resolution so the post-switch Base-mode baseline can recover the common shared-base case
+    /// (review-gate R1, F). Session-level — survives a re-root unchanged: the herdr per-worktree
+    /// hint isn't available cross-worktree, so the launch hint is the best shared-base recovery.
+    base_branch: Option<String>,
 }
 
 impl Controller {
-    /// Build the controller rooted at `root`. When `is_git_repo`, the initial working-tree
-    /// status (tree markers, AC-7) and the changed-set against `baseline` are loaded from
-    /// git; otherwise the viewer is a plain browser (AC-26). The initial selection's content
-    /// is rendered so the first frame is populated.
-    pub fn new(
-        root: PathBuf,
-        is_git_repo: bool,
-        baseline: Baseline,
-        components: Components,
-    ) -> Self {
+    /// Build the controller for the resolved root. The root-bound providers (Git Service +
+    /// Content Renderer) are built by the factory in `components` for this `resolved` (ADR-0004),
+    /// the seam a later re-root re-invokes. When `resolved.is_git_repo`, the initial working-tree
+    /// status (tree markers, AC-7) and the changed-set against `baseline` are loaded from git;
+    /// otherwise the viewer is a plain browser (AC-26). The initial selection's content is
+    /// rendered so the first frame is populated.
+    pub fn new(resolved: Resolved, baseline: Baseline, components: Components) -> Self {
         let Components {
-            git,
-            content,
+            providers,
             editor,
             clipboard,
         } = components;
+        let RootProviders { git, content } = providers(&resolved);
+        let root = resolved.root.clone();
+        let is_git_repo = resolved.is_git_repo;
+        // The launch base-branch hint is session-level — recorded once here and carried across
+        // re-roots (F). It is `None` outside a repo / when herdr gave no hint.
+        let base_branch = resolved.base_branch.clone();
         // The Content Renderer (and the diff query it needs) live on a worker thread; the
         // controller talks to it over a job channel and reads finished renders off a result
         // channel (AC-23). The worker exits when the job sender (held by the controller) is
-        // dropped.
-        let (job_tx, job_rx) = mpsc::channel::<RenderJob>();
-        let (result_tx, result_rx) = mpsc::channel::<(u64, RenderResult)>();
-        let worker_git = Arc::clone(&git);
-        std::thread::spawn(move || {
-            while let Ok(mut job) = job_rx.recv() {
-                // Collapse any backlog: under rapid navigation only the most recent selection
-                // matters, so skip superseded jobs rather than render each in turn.
-                while let Ok(newer) = job_rx.try_recv() {
-                    job = newer;
-                }
-                // The diff is read here, off the input thread, so a large/slow diff never
-                // blocks input (AC-23). Other modes don't need git. The full-file diff view
-                // asks git for whole-file context; the compact diff uses git's default.
-                let raw_diff =
-                    if matches!(job.mode, ViewMode::Diff | ViewMode::FullDiff) && job.is_git {
-                        let full = job.mode == ViewMode::FullDiff;
-                        job.rel
-                            .as_deref()
-                            .map(|rel| worker_git.diff(rel, job.baseline, full))
-                    } else {
-                        None
-                    };
-                // Contain a renderer panic so the worker survives — otherwise the thread would
-                // die and rendering would stop for the rest of the session. The unwind is caught
-                // here and a placeholder is surfaced in place of the failed render.
-                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    content.render(&job.path, job.mode, raw_diff.as_deref())
-                }))
-                .unwrap_or_else(|_| RenderResult {
-                    content: Text::raw("[content unavailable — renderer error]"),
-                    notices: vec!["the renderer failed unexpectedly; showing a placeholder".into()],
-                });
-                if result_tx.send((job.seq, result)).is_err() {
-                    break; // controller gone
-                }
-            }
-        });
+        // dropped — which is also how a re-root retires the old worker.
+        let (job_tx, result_rx) = Self::spawn_worker(Arc::clone(&git), content);
 
         let mut ctrl = Controller {
             tree: TreeModel::new(root.clone()),
@@ -289,6 +294,7 @@ impl Controller {
             git,
             editor,
             clipboard,
+            providers,
             job_tx,
             result_rx,
             latest_seq: 0,
@@ -298,10 +304,181 @@ impl Controller {
             update_available: None,
             update_dismissed: false,
             update_rx: None,
+            status_rx: None,
+            picker: None,
+            herdr: None,
+            our_workspace_id: None,
+            base_branch,
         };
         ctrl.refresh_git_state();
         ctrl.dispatch_render();
         ctrl
+    }
+
+    /// Spawn the off-thread render worker that owns `git` (for the diff query) and `content`
+    /// (the Content Renderer), returning the job sender and result receiver the controller keeps
+    /// (AC-23). The worker runs until the job sender is dropped — so `new` spawns it once, and a
+    /// re-root spawns a fresh one and drops the old sender to retire the old worker. The loop
+    /// body is the same one `new` used inline before T-7 extracted it; behavior is unchanged.
+    fn spawn_worker(
+        git: Arc<dyn GitService>,
+        content: Box<dyn ContentProvider>,
+    ) -> (mpsc::Sender<RenderJob>, mpsc::Receiver<(u64, RenderResult)>) {
+        let (job_tx, job_rx) = mpsc::channel::<RenderJob>();
+        let (result_tx, result_rx) = mpsc::channel::<(u64, RenderResult)>();
+        std::thread::spawn(move || {
+            while let Ok(mut job) = job_rx.recv() {
+                // Collapse any backlog: under rapid navigation only the most recent selection
+                // matters, so skip superseded jobs rather than render each in turn.
+                while let Ok(newer) = job_rx.try_recv() {
+                    job = newer;
+                }
+                // The diff is read here, off the input thread, so a large/slow diff never
+                // blocks input (AC-23). Other modes don't need git. The full-file diff view
+                // asks git for whole-file context; the compact diff uses git's default.
+                let raw_diff =
+                    if matches!(job.mode, ViewMode::Diff | ViewMode::FullDiff) && job.is_git {
+                        let full = job.mode == ViewMode::FullDiff;
+                        job.rel
+                            .as_deref()
+                            .map(|rel| git.diff(rel, job.baseline, full))
+                    } else {
+                        None
+                    };
+                // Contain a renderer panic so the worker survives — otherwise the thread would
+                // die and rendering would stop for the rest of the session. The unwind is caught
+                // here and a placeholder is surfaced in place of the failed render.
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    content.render(&job.path, job.mode, raw_diff.as_deref())
+                }))
+                .unwrap_or_else(|_| RenderResult {
+                    content: Text::raw("[content unavailable — renderer error]"),
+                    notices: vec!["the renderer failed unexpectedly; showing a placeholder".into()],
+                });
+                if result_tx.send((job.seq, result)).is_err() {
+                    break; // controller gone
+                }
+            }
+        });
+        (job_tx, result_rx)
+    }
+
+    /// Re-root the running session to `target`: re-resolve it through the same Root Resolver used
+    /// at launch, rebuild the root-bound providers (Git Service + Content Renderer) via the stored
+    /// factory (ADR-0004), and respawn the render worker — overwriting `job_tx`/`result_rx` drops
+    /// the old sender, so the previous worker (which owns the old providers) exits. A fresh
+    /// [`TreeModel`] and reset navigation/view state follow (AC-13), while the user's *preferences*
+    /// — `show_ignored`, `changed_only`, `split_pct`, `wrap_override`, `baseline` — are carried
+    /// across unchanged (AC-12). The structural re-root (resolve + fresh tree + worker respawn +
+    /// carried prefs + nav reset) is **synchronous**, so the tree is immediately navigable; the
+    /// heavier git status + changed-set fills in **asynchronously**, applied by [`poll`] (AC-17),
+    /// so input is never blocked. Finally the first frame is rendered. A missing or
+    /// non-directory `target` produces a non-fatal notice and leaves all state unchanged
+    /// (AC-16); re-selecting the current root is a silent no-op (AC-11).
+    pub fn re_root(&mut self, target: &Path) {
+        // AC-16: a missing or non-directory target aborts with a non-fatal notice. No state
+        // change — the viewer stays on its current root with all state intact.
+        if !target.is_dir() {
+            self.action_notice = Some(format!(
+                "cannot switch worktree: {} is not an accessible directory",
+                target.display()
+            ));
+            return;
+        }
+        // Carry the launch base-branch hint into the re-resolution (review-gate R1, F): herdr's
+        // per-worktree hint isn't available cross-worktree, so the launch hint is the best
+        // shared-base recovery. `resolve_base_branch` re-validates it against the target repo's
+        // refs (worktrees share the repo's refs), recovering a shared base; otherwise it falls
+        // back to main/master as before.
+        let resolved = crate::root::resolve(&crate::context::LaunchContext {
+            cwd: target.to_path_buf(),
+            base_branch: self.base_branch.clone(),
+            ..Default::default()
+        });
+        // AC-11: re-selecting the worktree we're already rooted at is a clean no-op — no
+        // rebuild, no notice, no state change (canonicalize so /tmp vs /private/tmp matches).
+        let target_canon = resolved
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| resolved.root.clone());
+        let current_canon = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        if target_canon == current_canon {
+            return;
+        }
+
+        // Rebuild the root-bound providers for the new root and respawn the worker. Overwriting
+        // `job_tx` drops the old sender, so the old worker (holding the old git Arc + content)
+        // exits; the new worker owns the new providers.
+        let RootProviders { git, content } = (self.providers)(&resolved);
+        let (job_tx, result_rx) = Self::spawn_worker(Arc::clone(&git), content);
+        self.git = git;
+        self.job_tx = job_tx;
+        self.result_rx = result_rx;
+
+        // New root + fresh tree (this alone clears the cursor + expansions).
+        self.root = resolved.root.clone();
+        self.is_git_repo = resolved.is_git_repo;
+        self.tree = TreeModel::new(resolved.root.clone());
+
+        // Reset navigation/view state (AC-13). The picker is closed on a switch (AC-13 "picker
+        // is closed"); `herdr`/`our_workspace_id` are session-level and deliberately left intact.
+        self.focus = Focus::Tree;
+        self.zoomed = false;
+        self.content_scroll = 0;
+        self.content_hscroll = 0;
+        self.overrides.clear();
+        self.action_notice = None;
+        self.changed = BTreeMap::new();
+        self.picker = None;
+
+        // PREFERENCES ARE CARRIED (AC-12) — deliberately NOT reset: show_ignored, changed_only,
+        // split_pct, wrap_override, baseline keep their current values. The fresh TreeModel starts
+        // with default filter flags. `show_ignored` is git-independent, so apply it now. The
+        // changed-only *filter* is NOT applied here: it must be applied against the REAL
+        // changed-set, which `dispatch_status_refresh` computes off-thread — applying it now would
+        // filter against the just-cleared empty set. `poll` applies it when the changed-set lands.
+        self.tree.set_show_ignored(self.show_ignored);
+
+        // A re-root happens mid-session, so input must never block (AC-17): compute the new root's
+        // status + changed-set OFF the input thread and let `poll` apply the markers + changed-only
+        // filter when they arrive (as content rendering does, AC-23). The structural re-root above
+        // is synchronous, so the tree is immediately navigable. Then render the first frame.
+        self.dispatch_status_refresh();
+        self.dispatch_render();
+    }
+
+    /// Compute the new root's working-tree status + changed-set OFF the input thread (AC-17),
+    /// to be applied by [`poll`]. A non-repo has no git state — apply the (empty) changed-only
+    /// filter synchronously and clear any pending fetch. Unlike `refresh_git_state` (which runs
+    /// synchronously on launch / editor-return / baseline-toggle / refresh / focus-gain), this is
+    /// the re-root path, where the heavier status/changed-set work must not block input.
+    fn dispatch_status_refresh(&mut self) {
+        if !self.is_git_repo {
+            self.tree.set_changed_only(self.changed_only, &self.changed); // self.changed is empty
+            self.status_rx = None;
+            return;
+        }
+        let git = Arc::clone(&self.git);
+        let baseline = self.baseline;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Contain a git-query panic so the thread can't abort the process — parity with the
+            // render worker. On panic we simply don't send; `poll` already handles the resulting
+            // `Disconnected`/empty channel (it drops the receiver), so the markers just don't fill
+            // in for this switch rather than crashing.
+            let computed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let status = git.status();
+                let changed = git.changed_set(baseline);
+                (status, changed)
+            }));
+            if let Ok(result) = computed {
+                let _ = tx.send(result); // receiver may be gone if re-rooted again — fine
+            }
+        });
+        self.status_rx = Some(rx);
     }
 
     // ---- state accessors (used by the Presenter wiring and tests) ----------------------
@@ -321,11 +498,49 @@ impl Controller {
     pub fn zoomed(&self) -> bool {
         self.zoomed
     }
+    /// The tree column's width as a percentage of the pane (carried across a re-root, AC-12).
+    pub fn split_pct(&self) -> u16 {
+        self.split_pct
+    }
+    /// Whether the `w` content-wrap override is on (carried across a re-root, AC-12).
+    pub fn wrap_override(&self) -> bool {
+        self.wrap_override
+    }
     pub fn tree(&self) -> &TreeModel {
         &self.tree
     }
+    /// The current tree root. Exposed so tests can assert re-root results (T-13).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
     pub fn content(&self) -> &Text<'static> {
         &self.content
+    }
+
+    /// The transient action notice from the last intent, if any. Exposed for tests that need
+    /// to inspect it directly (e.g. the re-root failure guard, AC-16).
+    pub fn action_notice(&self) -> Option<&str> {
+        self.action_notice.as_deref()
+    }
+
+    /// The open worktree picker's state, or `None` when it is closed. Exposed so the Presenter
+    /// (T-14) can draw it and tests can assert the rows / pre-selected cursor.
+    pub fn picker(&self) -> Option<&PickerState> {
+        self.picker.as_ref()
+    }
+
+    /// Whether a re-root's off-thread status/changed-set fetch is still pending (not yet applied
+    /// by [`poll`]). Exposed so a test can assert that a synchronous refresh drops the pending
+    /// async fetch, so a stale async result cannot later clobber the freshly-refreshed state
+    /// (review-gate R1, G).
+    pub fn status_refresh_pending(&self) -> bool {
+        self.status_rx.is_some()
+    }
+
+    /// The session-level launch base-branch hint, carried across re-roots (review-gate R1, F).
+    /// Exposed so a test can assert the hint survives a re_root.
+    pub fn base_branch_hint(&self) -> Option<&str> {
+        self.base_branch.as_deref()
     }
 
     /// All notices to surface: the transient action notice (if any) followed by the content
@@ -360,6 +575,17 @@ impl Controller {
     pub fn set_update(&mut self, state: UpdateState) {
         self.update_available = state.initial;
         self.update_rx = state.rx;
+    }
+
+    /// Inject the host query channel + the viewer's own workspace id (mirrors [`set_update`]).
+    /// Called by `app::run` after construction; tests that exercise the picker call it with a
+    /// fake [`HerdrCli`]. Session-level — NOT reset on a re-root (the viewer's workspace doesn't
+    /// change when the tree does). Absent ⇒ a git-only picker with no agent overlay (AC-15).
+    ///
+    /// [`set_update`]: Self::set_update
+    pub fn set_host(&mut self, herdr: Box<dyn HerdrCli>, workspace_id: Option<String>) {
+        self.herdr = Some(herdr);
+        self.our_workspace_id = workspace_id;
     }
 
     /// Record the content viewport `(width, height)` the Presenter last drew into, so content
@@ -410,7 +636,34 @@ impl Controller {
             split_pct: self.split_pct,
             zoomed: self.zoomed,
             update_banner: self.update_banner(),
+            picker: self.picker_view(),
         }
+    }
+
+    /// The owned picker draw model for the Presenter (AC-1, AC-5), or `None` when the picker is
+    /// closed. Maps each worktree row to a [`PickerRowView`] (path + branch + detached + the
+    /// current marker, AC-18, + the per-row agent status, AC-19) and carries the cursor; the path
+    /// display string is the worktree's full path — informative for choosing among worktrees. The
+    /// Presenter sanitizes the strings (AC-27) and renders the detached/current/agent markers.
+    fn picker_view(&self) -> Option<PickerView> {
+        let picker = self.picker.as_ref()?;
+        Some(PickerView {
+            rows: picker
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, w)| PickerRowView {
+                    path: w.path.to_string_lossy().into_owned(),
+                    branch: w.branch.clone(),
+                    detached: w.detached,
+                    is_current: w.is_current,
+                    // Aligned 1:1 with rows; `.get` is defensive against a future divergence.
+                    agent: picker.agent_statuses.get(i).cloned().flatten(),
+                })
+                .collect(),
+            cursor: picker.cursor,
+            hscroll: picker.hscroll,
+        })
     }
 
     /// Whether the content pane wraps for `node`: forced on by the `w` override, else the
@@ -437,6 +690,11 @@ impl Controller {
         // The action notice is transient: clear it at the top of each intent so a stale
         // failure message does not linger past the next action.
         self.action_notice = None;
+        // Modal: while the picker is open, Nav/Activate/Close drive the picker, not the tree;
+        // every other intent is inert (a modal selection). (AC-5)
+        if self.picker.is_some() {
+            return self.handle_picker_intent(intent);
+        }
         match intent {
             Intent::NavUp => self.navigate(-1),
             Intent::NavDown => self.navigate(1),
@@ -457,7 +715,84 @@ impl Controller {
             Intent::ToggleZoom => self.toggle_zoom(),
             Intent::Refresh => self.refresh(),
             Intent::DismissUpdate => self.dismiss_update(),
+            Intent::SwitchWorktree => self.open_worktree_picker(),
             Intent::Close => self.close_or_unzoom(),
+        }
+    }
+
+    /// Route an intent while the worktree picker is open (modal). NavUp/NavDown move the
+    /// highlight, Expand/Collapse (Right/Left) scroll the overlay rows horizontally so long
+    /// worktree paths can be read sideways, Activate confirms (re-root to the selected worktree,
+    /// AC-7; re-selecting the current worktree is a no-op via re_root, AC-11), Close cancels (no
+    /// state change, AC-6). All other intents are inert.
+    fn handle_picker_intent(&mut self, intent: Intent) -> Effects {
+        match intent {
+            Intent::NavUp => {
+                if let Some(p) = self.picker.as_mut()
+                    && p.cursor > 0
+                {
+                    p.cursor -= 1;
+                    return Effects::redraw();
+                }
+                Effects::noop()
+            }
+            Intent::NavDown => {
+                if let Some(p) = self.picker.as_mut()
+                    && p.cursor + 1 < p.rows.len()
+                {
+                    p.cursor += 1;
+                    return Effects::redraw();
+                }
+                Effects::noop()
+            }
+            Intent::Expand => {
+                // Right (→/l): scroll the overlay rows right so a long path can be read sideways.
+                // Monotonic here — the Presenter clamps to the live inner width at draw, so an
+                // over-scroll past the widest row is harmless and not surfaced to the controller.
+                if let Some(p) = self.picker.as_mut() {
+                    let next = p.hscroll.saturating_add(HSCROLL_STEP);
+                    if next != p.hscroll {
+                        p.hscroll = next;
+                        return Effects::redraw();
+                    }
+                }
+                Effects::noop()
+            }
+            Intent::Collapse => {
+                // Left (←/h): scroll the overlay rows left, clamped at the left edge (0).
+                if let Some(p) = self.picker.as_mut()
+                    && p.hscroll > 0
+                {
+                    p.hscroll = p.hscroll.saturating_sub(HSCROLL_STEP);
+                    return Effects::redraw();
+                }
+                Effects::noop()
+            }
+            Intent::Activate => {
+                // Take the selected target, CLOSE the picker, then re-root. Closing first
+                // guarantees the picker closes even if re_root early-returns (e.g. re-selecting
+                // the current root is a no-op — AC-11 — and would not reach re_root's own
+                // picker-clear). `.get(p.cursor)` is defensive: the picker is never opened with
+                // empty rows and the cursor is bounds-clamped, but the invariant is distant —
+                // use a local guard so a future change cannot introduce a panic.
+                let target = self
+                    .picker
+                    .as_ref()
+                    .and_then(|p| p.rows.get(p.cursor))
+                    .map(|w| w.path.clone());
+                self.picker = None;
+                if let Some(target) = target {
+                    self.re_root(&target);
+                }
+                Effects::redraw()
+            }
+            Intent::Close => {
+                // Cancel: close the picker; nothing else changes (AC-6).
+                self.picker = None;
+                Effects::redraw()
+            }
+            // Modal: any other intent is inert while picking.
+            _ => Effects::noop(),
         }
     }
 
@@ -466,6 +801,12 @@ impl Controller {
     /// still works (herdr reserves Shift+mouse for exactly that). Selection/activation happen
     /// on button *release*, so a divider drag is never mistaken for a click.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> Effects {
+        // Modal: while the picker is open it is keyboard-only, so the mouse is inert — a click /
+        // wheel / drag behind the overlay must not drive the tree or content underneath. This
+        // mirrors the keyboard modal gate in `handle`. (review-gate R1, E)
+        if self.picker.is_some() {
+            return Effects::noop();
+        }
         if ev.modifiers.contains(KeyModifiers::SHIFT) {
             return Effects::noop();
         }
@@ -767,6 +1108,11 @@ impl Controller {
         // filter consistent with it.
         self.changed = self.git.changed_set(self.baseline);
         self.tree.set_changed_only(self.changed_only, &self.changed);
+        // Drop any pending re-root async status fetch (review-gate R2): this synchronous
+        // recompute is now authoritative, so a stale in-flight async result must not clobber
+        // it in `poll`. Invariant: every synchronous git-state recompute invalidates a pending
+        // re-root async fetch. Mirrors `refresh_git_state` → `drop_pending_status`.
+        self.drop_pending_status();
         self.dispatch_render(); // a diff is relative to the baseline, so it must re-render
         Effects::redraw()
     }
@@ -951,6 +1297,64 @@ impl Controller {
         self.update_available.as_ref().map(update::banner_text)
     }
 
+    /// Open the worktree picker (AC-1). Gated to a git repo — outside one it is a no-op with a
+    /// non-fatal notice and no picker (AC-14). Rows come from the read-only git worktree list; the
+    /// pre-select is the agent-active worktree when herdr reports one (AC-3), else the current root
+    /// (AC-4). A missing/failing herdr overlay degrades to the git-only list (AC-15).
+    fn open_worktree_picker(&mut self) -> Effects {
+        if !self.is_git_repo {
+            self.action_notice =
+                Some("worktree switch is only available inside a git repository".into());
+            return Effects::redraw();
+        }
+        let rows = crate::worktree::list(&self.root, &self.root);
+        if rows.is_empty() {
+            // git failed/no worktrees (shouldn't happen in a repo) — notice, no picker.
+            self.action_notice = Some("could not list worktrees".into());
+            return Effects::redraw();
+        }
+        // Fetch the herdr overlay ONCE (the two read-only list queries, AC-20) and feed BOTH the
+        // per-row status badges (AC-19) and the agent-active pre-select (AC-3) from it. With no
+        // overlay (herdr absent / query failed), rows carry no badge and the cursor falls back to
+        // the current root (AC-4, AC-15).
+        let current_idx = rows.iter().position(|w| w.is_current).unwrap_or(0);
+        let overlay = self.herdr_overlay();
+        let agent_statuses = match &overlay {
+            Some((wt, ag)) => crate::worktree::agent_statuses(&rows, wt, ag),
+            None => vec![None; rows.len()],
+        };
+        let cursor = overlay
+            .as_ref()
+            .and_then(|(wt, ag)| {
+                crate::worktree::agent_active(&rows, wt, ag, self.our_workspace_id.as_deref())
+            })
+            .and_then(|active| rows.iter().position(|w| w.path == active))
+            .unwrap_or(current_idx);
+        self.picker = Some(PickerState {
+            rows,
+            agent_statuses,
+            cursor,
+            hscroll: 0,
+        });
+        Effects::redraw()
+    }
+
+    /// Fetch the herdr agent overlay — the `worktree list` + `agent list` JSON — with exactly the
+    /// two read-only queries (AC-20), or `None` when herdr is absent or either query fails (a
+    /// git-only picker, AC-15). herdr's `worktree list` and `agent list` BOTH print JSON by
+    /// default; `agent list` REJECTS a `--json` flag (verified live against herdr 0.7.x — it exits
+    /// non-zero), so neither subcommand is passed the flag. (A prior `--json` on the agent query
+    /// made this overlay silently fail → always fall back to the current root, AC-4/AC-15.)
+    ///
+    /// This is the single point both the per-row status badges and the agent-active pre-select
+    /// derive from, so opening the picker issues exactly two herdr calls (T-10 spy test).
+    fn herdr_overlay(&self) -> Option<(String, String)> {
+        let herdr = self.herdr.as_ref()?;
+        let wt_json = herdr.run_json(&["worktree", "list"]).ok()?;
+        let ag_json = herdr.run_json(&["agent", "list"]).ok()?;
+        Some((wt_json, ag_json))
+    }
+
     /// The pane regained focus (the run loop forwards herdr's focus events): re-read git state
     /// so external changes show in the tree. No-op without a repo (AC-26) — so an external
     /// change to a non-git directory costs nothing. In **changed-only** mode the refresh
@@ -982,6 +1386,18 @@ impl Controller {
         self.tree.set_status(&status);
         self.changed = self.git.changed_set(self.baseline);
         self.tree.set_changed_only(self.changed_only, &self.changed);
+        // Drop any pending re-root async status fetch (review-gate R1, G + R2): this sync
+        // refresh has just produced the authoritative status/changed-set, so an older in-flight
+        // async result must not later clobber it in `poll`. Invariant: every synchronous
+        // git-state recompute invalidates a pending re-root async fetch.
+        self.drop_pending_status();
+    }
+
+    /// Drop any pending re-root async status/changed-set fetch so a stale in-flight result
+    /// cannot later overwrite a freshly-recomputed synchronous git state in [`poll`]. Must be
+    /// called after every synchronous git-state recompute (review-gate R1 G + R2).
+    fn drop_pending_status(&mut self) {
+        self.status_rx = None;
     }
 
     // ---- content coordination ----------------------------------------------------------
@@ -1037,6 +1453,29 @@ impl Controller {
                 applied = true;
             }
             // else: a superseded selection's render — drop it.
+        }
+        // A re-root's off-thread status/changed-set (one-shot, AC-17): apply the new root's
+        // markers and the carried changed-only filter against the freshly-arrived changed-set,
+        // then drop the receiver. A *disconnected* channel means a second re-root superseded this
+        // fetch (its `send` failed) — drop the receiver so we stop polling a dead channel.
+        if let Some(rx) = &self.status_rx {
+            match rx.try_recv() {
+                Ok((status, changed)) => {
+                    self.tree.set_status(&status);
+                    self.changed = changed;
+                    self.tree.set_changed_only(self.changed_only, &self.changed);
+                    self.status_rx = None;
+                    // The synchronous `re_root` dispatched the first render against the *empty*
+                    // changed-set, so a changed file rendered in content/markdown mode, not Diff.
+                    // Now that the real changed-set has landed, re-dispatch so the current
+                    // selection re-renders in the correct view mode (changed → Diff, AC-9).
+                    // (review-gate R1, B).
+                    self.dispatch_render();
+                    applied = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.status_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
         }
         // A finished background update check (one-shot): adopt its verdict and drop the receiver.
         // `Some(v)` shows/refreshes the banner; `None` (a successful check that found nothing

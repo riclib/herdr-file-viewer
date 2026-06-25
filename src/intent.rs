@@ -54,6 +54,11 @@ pub enum Intent {
     /// Dismiss the "update available" banner for this session (it returns next launch while
     /// still behind). Read-only — touches only in-memory UI state.
     DismissUpdate,
+    /// Open the worktree picker to re-root the viewer at another git worktree of the current
+    /// repository (the worktree switch). Read-only — it re-roots the in-pane view; it never
+    /// checks out a branch or mutates any worktree (AC-N1/N2). The picker is keyboard-operable
+    /// (AC-5); a switch happens ONLY in response to this explicit action (AC-N5).
+    SwitchWorktree,
     /// Close the viewer and return control to the prior pane (AC-20).
     Close,
 }
@@ -61,7 +66,7 @@ pub enum Intent {
 impl Intent {
     /// Every intent variant — lets the dispatcher and tests enumerate the closed set so
     /// keyboard-completeness (AC-18) and the no-edit invariant (AC-N3) stay checkable.
-    pub const ALL: [Intent; 20] = [
+    pub const ALL: [Intent; 21] = [
         Intent::NavUp,
         Intent::NavDown,
         Intent::Expand,
@@ -81,6 +86,7 @@ impl Intent {
         Intent::ToggleZoom,
         Intent::Refresh,
         Intent::DismissUpdate,
+        Intent::SwitchWorktree,
         Intent::Close,
     ];
 }
@@ -117,6 +123,7 @@ mod tests {
                 | Intent::ToggleZoom
                 | Intent::Refresh
                 | Intent::DismissUpdate
+                | Intent::SwitchWorktree
                 | Intent::Close => false,
             };
             assert!(
@@ -133,6 +140,14 @@ mod tests {
             set.len(),
             Intent::ALL.len(),
             "Intent::ALL must have no duplicates"
+        );
+    }
+
+    #[test]
+    fn switch_worktree_is_in_all() {
+        assert!(
+            Intent::ALL.contains(&Intent::SwitchWorktree),
+            "Intent::ALL must contain SwitchWorktree"
         );
     }
 }
