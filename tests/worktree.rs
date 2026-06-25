@@ -336,30 +336,32 @@ use std::path::PathBuf;
 ///
 /// wt-a → ws-1, wt-b → ws-2, wt-c → ws-3 (no agent).
 fn worktree_json_three() -> &'static str {
-    r#"[
+    // Real herdr 0.7.x nests the entries under `result.worktrees`.
+    r#"{"id": 1, "result": {"type": "worktree_list", "worktrees": [
         {"path": "/repo/wt-a", "open_workspace_id": "ws-1", "branch": "main",     "is_bare": false, "is_detached": false},
         {"path": "/repo/wt-b", "open_workspace_id": "ws-2", "branch": "feat",     "is_bare": false, "is_detached": false},
         {"path": "/repo/wt-c", "open_workspace_id": "ws-3", "branch": "other",    "is_bare": false, "is_detached": false}
-    ]"#
+    ]}}"#
 }
 
 /// Canned `herdr agent list` output — agents in ws-1 and ws-2 (both active). Each entry carries
 /// an `agent` field so the real-agent filter detects it (a non-agent pane omits `agent`).
 fn agent_json_two_workspaces() -> &'static str {
-    r#"[
+    // Real herdr 0.7.x nests the entries under `result.agents`.
+    r#"{"id": 2, "result": {"type": "agent_list", "agents": [
         {"id": "agent-abc", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"},
         {"id": "agent-xyz", "agent": "claude", "agent_status": "idle", "workspace_id": "ws-2"}
-    ]"#
+    ]}}"#
 }
 
 /// Canned agent list — only ws-2 has an agent.
 fn agent_json_one_workspace() -> &'static str {
-    r#"[{"id": "agent-only", "agent": "claude", "agent_status": "working", "workspace_id": "ws-2"}]"#
+    r#"{"id": 2, "result": {"type": "agent_list", "agents": [{"id": "agent-only", "agent": "claude", "agent_status": "working", "workspace_id": "ws-2"}]}}"#
 }
 
 /// Canned agent list — no agents at all.
 fn agent_json_empty() -> &'static str {
-    r#"[]"#
+    r#"{"id": 2, "result": {"type": "agent_list", "agents": []}}"#
 }
 
 /// Build a `&[Worktree]` slice from `parse_porcelain` canned bytes + direct `Worktree`
@@ -506,14 +508,14 @@ fn agent_active_empty_our_workspace_id_does_not_trigger_tier1() {
 /// entries, not on distinct workspace ids.
 #[test]
 fn agent_active_two_worktrees_same_workspace_is_ambiguous() {
-    // Build a JSON where wt-a and wt-b both point to ws-1.
-    let wt_json = r#"[
+    // Build a JSON where wt-a and wt-b both point to ws-1 (real nested herdr shape).
+    let wt_json = r#"{"id": 1, "result": {"worktrees": [
         {"path": "/repo/wt-a", "open_workspace_id": "ws-1"},
         {"path": "/repo/wt-b", "open_workspace_id": "ws-1"},
         {"path": "/repo/wt-c", "open_workspace_id": "ws-3"}
-    ]"#;
+    ]}}"#;
     // Agent list — only ws-1 has an agent.
-    let ag_json = r#"[{"id": "agent-only", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"}]"#;
+    let ag_json = r#"{"id": 2, "result": {"agents": [{"id": "agent-only", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"}]}}"#;
 
     let worktrees = make_worktrees();
     // No own-workspace hint: Tier 2 must count two qualifying entries → None.
@@ -574,11 +576,11 @@ fn agent_statuses_maps_real_agent_status_per_row() {
 #[test]
 fn agent_statuses_ignores_non_agent_panes() {
     let worktrees = make_worktrees();
-    // ws-2 entry has NO `agent` field → it is a plain pane, not a real agent.
-    let agent_json = r#"[
+    // ws-2 entry has NO `agent` field → it is a plain pane, not a real agent (real nested shape).
+    let agent_json = r#"{"id": 2, "result": {"agents": [
         {"id": "real", "agent": "claude", "agent_status": "working", "workspace_id": "ws-1"},
         {"id": "pane", "agent_status": "unknown", "workspace_id": "ws-2"}
-    ]"#;
+    ]}}"#;
     let statuses = agent_statuses(&worktrees, worktree_json_three(), agent_json);
     assert_eq!(
         statuses,

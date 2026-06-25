@@ -1681,11 +1681,11 @@ fn switch_worktree_preselects_agent_active() {
     // agent worktree) fires with no own-workspace hint.
     let linked_path = linked.path().to_str().unwrap();
     let worktree_json = format!(
-        r#"[{{"path": "{}", "open_workspace_id": "ws-agent"}}]"#,
+        r#"{{"id": 1, "result": {{"worktrees": [{{"path": "{}", "open_workspace_id": "ws-agent"}}]}}}}"#,
         linked_path
     );
     let agent_json =
-        r#"[{"id": "agent-1", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}]"#
+        r#"{"id": 2, "result": {"agents": [{"id": "agent-1", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}]}}"#
             .to_string();
     ctrl.set_host(
         Box::new(FakeHerdr {
@@ -1740,10 +1740,11 @@ fn picker_populates_per_row_agent_statuses_from_the_overlay() {
 
     // The linked worktree's workspace hosts a REAL agent (`agent` present) reporting `working`.
     let linked_path = linked.path().to_str().unwrap();
-    let worktree_json =
-        format!(r#"[{{"path": "{linked_path}", "open_workspace_id": "ws-agent"}}]"#);
+    let worktree_json = format!(
+        r#"{{"id": 1, "result": {{"worktrees": [{{"path": "{linked_path}", "open_workspace_id": "ws-agent"}}]}}}}"#
+    );
     let agent_json =
-        r#"[{"id": "a1", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}]"#
+        r#"{"id": 2, "result": {"agents": [{"id": "a1", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}]}}"#
             .to_string();
 
     // Count the herdr calls to prove AC-20 (no extra cost): wrap the FakeHerdr in a recorder.
@@ -2202,9 +2203,11 @@ impl RecordingHerdr {
         let path_str = linked_path.to_str().unwrap_or("");
         Self {
             calls,
-            worktree_json: format!(r#"[{{"path": "{path_str}", "open_workspace_id": "ws-spy"}}]"#),
+            worktree_json: format!(
+                r#"{{"id": 1, "result": {{"worktrees": [{{"path": "{path_str}", "open_workspace_id": "ws-spy"}}]}}}}"#
+            ),
             agent_json:
-                r#"[{"id": "spy-agent", "agent": "claude", "agent_status": "working", "workspace_id": "ws-spy"}]"#
+                r#"{"id": 2, "result": {"agents": [{"id": "spy-agent", "agent": "claude", "agent_status": "working", "workspace_id": "ws-spy"}]}}"#
                     .to_string(),
         }
     }

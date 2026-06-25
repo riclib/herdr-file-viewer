@@ -141,6 +141,37 @@ struct HerdrAgentEntry {
     workspace_id: Option<String>,
 }
 
+/// Envelope for `herdr worktree list` — the entries live under `result.worktrees`, not at the
+/// top level. herdr wraps every reply as `{"id":…,"result":{…,"worktrees":[…]}}`. Both fields are
+/// `#[serde(default)]` so a missing `result` / `worktrees` (or a wholly unexpected shape) degrades
+/// to an empty list rather than failing the parse (defensive — AC-15).
+#[derive(Deserialize, Default)]
+struct WorktreeListEnvelope {
+    #[serde(default)]
+    result: WorktreeListResult,
+}
+
+#[derive(Deserialize, Default)]
+struct WorktreeListResult {
+    #[serde(default)]
+    worktrees: Vec<HerdrWorktreeEntry>,
+}
+
+/// Envelope for `herdr agent list` — the entries live under `result.agents`. Same nested
+/// `{"id":…,"result":{"agents":[…]}}` shape and the same defensive degradation as the worktree
+/// envelope (AC-15).
+#[derive(Deserialize, Default)]
+struct AgentListEnvelope {
+    #[serde(default)]
+    result: AgentListResult,
+}
+
+#[derive(Deserialize, Default)]
+struct AgentListResult {
+    #[serde(default)]
+    agents: Vec<HerdrAgentEntry>,
+}
+
 /// Resolve which worktree an active herdr agent is running in, using the tiered rule:
 ///
 /// 1. Parse `agent_json` → the set of workspace ids that host a running agent.
@@ -173,7 +204,9 @@ pub fn agent_active(
     // an idle pane can never mask the agent-active pre-select (AC-3) — consistent with the
     // per-row status badges (AC-19).
     let agent_workspaces: HashSet<String> = {
-        let entries: Vec<HerdrAgentEntry> = serde_json::from_str(agent_json).unwrap_or_default();
+        let entries = serde_json::from_str::<AgentListEnvelope>(agent_json)
+            .map(|e| e.result.agents)
+            .unwrap_or_default();
         entries
             .into_iter()
             .filter(|e| e.agent.is_some())
@@ -183,8 +216,9 @@ pub fn agent_active(
     };
 
     // Step 2 — parse herdr worktree entries (defensive).
-    let wt_entries: Vec<HerdrWorktreeEntry> =
-        serde_json::from_str(worktree_json).unwrap_or_default();
+    let wt_entries = serde_json::from_str::<WorktreeListEnvelope>(worktree_json)
+        .map(|e| e.result.worktrees)
+        .unwrap_or_default();
 
     // Step 3 — collect qualifying entries (path present, workspace_id ∈ agent_workspaces).
     let qualifying: Vec<(PathBuf, String)> = wt_entries
@@ -266,7 +300,9 @@ pub fn agent_statuses(
     // non-agent pane (no `agent`) is skipped, so it contributes no badge (AC-19).
     let mut status_by_ws: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
-    let agents: Vec<HerdrAgentEntry> = serde_json::from_str(agent_json).unwrap_or_default();
+    let agents = serde_json::from_str::<AgentListEnvelope>(agent_json)
+        .map(|e| e.result.agents)
+        .unwrap_or_default();
     for e in agents {
         if e.agent.is_none() {
             continue; // plain pane, not a real agent
@@ -277,8 +313,9 @@ pub fn agent_statuses(
     }
 
     // path (canonicalized) → open_workspace_id, from the herdr worktree list.
-    let wt_entries: Vec<HerdrWorktreeEntry> =
-        serde_json::from_str(worktree_json).unwrap_or_default();
+    let wt_entries = serde_json::from_str::<WorktreeListEnvelope>(worktree_json)
+        .map(|e| e.result.worktrees)
+        .unwrap_or_default();
     let mut ws_by_canon_path: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
     for e in wt_entries {
