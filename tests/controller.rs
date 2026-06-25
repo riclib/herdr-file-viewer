@@ -2209,3 +2209,107 @@ fn picker_other_intents_are_inert() {
         "root unchanged for inert intents (double-check)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-17 — No-events conformance: re_root only via SwitchWorktree (AC-N5)
+// ---------------------------------------------------------------------------
+
+/// AC-N5 (automatable analog): the viewer re-roots only in response to the explicit
+/// `SwitchWorktree → picker → Activate` sequence — no other intent ever changes the root,
+/// and no event/timer path exists (the manifest side of AC-N5 is covered in tests/manifest.rs
+/// by `declares_no_event_hooks`).
+///
+/// Assertions:
+/// 1. Every intent in `Intent::ALL` except `SwitchWorktree`, applied with the picker CLOSED,
+///    leaves the root UNCHANGED and the picker CLOSED.
+/// 2. `SwitchWorktree` opens the picker but does NOT itself change the root.
+/// 3. The only re-root path is `SwitchWorktree` → `NavDown` → `Activate`.
+#[test]
+fn re_root_only_reachable_via_switch_worktree_intent() {
+    // Set up a real git repo with a linked worktree, so a re-root is *possible* — it just
+    // must only happen via the explicit picker-confirm path.
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+    std::fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+
+    let linked = TempDir::new();
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().unwrap(),
+            "-b",
+            "acn5-branch",
+        ],
+    );
+    // Leak the TempDirs so the directories survive the duration of the test.
+    std::mem::forget(linked);
+
+    let (mut ctrl, _, _) = controller(repo.path(), true, StubGit::default(), false);
+
+    // -------------------------------------------------------------------------
+    // Part 1: every intent except SwitchWorktree, with the picker CLOSED,
+    // must leave the root UNCHANGED and the picker CLOSED.
+    // -------------------------------------------------------------------------
+    let root_before = ctrl.root().to_path_buf();
+    assert!(
+        ctrl.picker().is_none(),
+        "precondition: picker starts closed"
+    );
+
+    for &intent in Intent::ALL.iter().filter(|&&i| i != Intent::SwitchWorktree) {
+        ctrl.handle(intent);
+        // Drain any async poll to be safe — none should produce a root change.
+        ctrl.poll();
+
+        assert_eq!(
+            common::canon(ctrl.root()),
+            common::canon(&root_before),
+            "AC-N5: intent {intent:?} must not change the root (picker closed path)"
+        );
+        assert!(
+            ctrl.picker().is_none(),
+            "AC-N5: intent {intent:?} must not open the picker (and leave it auto-confirmed)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 2: SwitchWorktree opens the picker but does NOT change the root.
+    // -------------------------------------------------------------------------
+    ctrl.handle(Intent::SwitchWorktree);
+
+    assert!(
+        ctrl.picker().is_some(),
+        "AC-N5: SwitchWorktree must open the picker"
+    );
+    assert_eq!(
+        common::canon(ctrl.root()),
+        common::canon(&root_before),
+        "AC-N5: SwitchWorktree itself must not re-root — it only opens the picker"
+    );
+
+    // Close the picker to reset state for Part 3.
+    ctrl.handle(Intent::Close);
+    assert!(ctrl.picker().is_none(), "picker closed after Close intent");
+
+    // -------------------------------------------------------------------------
+    // Part 3: SwitchWorktree → NavDown → Activate is the ONLY path that changes the root.
+    // -------------------------------------------------------------------------
+    ctrl.handle(Intent::SwitchWorktree);
+    assert!(
+        ctrl.picker().is_some(),
+        "picker opens for the full-switch path"
+    );
+    // Move the cursor away from the current worktree (index 0 / pre-selected current).
+    ctrl.handle(Intent::NavDown);
+    // Confirm: this is the one and only re-root path.
+    ctrl.handle(Intent::Activate);
+
+    assert!(ctrl.picker().is_none(), "picker closes after Activate");
+    assert_ne!(
+        common::canon(ctrl.root()),
+        common::canon(&root_before),
+        "AC-N5: root MUST change after SwitchWorktree → NavDown → Activate"
+    );
+}
