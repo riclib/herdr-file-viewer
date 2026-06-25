@@ -59,6 +59,10 @@ pub struct ViewState {
     /// dragging the tree's horizontal scrollbar (the `←`/`→` keys are expand/collapse in the tree).
     /// The Presenter clamps it to the widest row at draw, so it can never over-scroll.
     pub tree_hscroll: u16,
+    /// The content's total RENDERED row count — wrapped rows under `wrap`, raw lines otherwise (the
+    /// controller's wrapped-aware count). The content vertical scrollbar sizes/positions against
+    /// this so the thumb is correct under wrap, where raw `content.lines.len()` undercounts.
+    pub content_rows: u16,
     /// Wrap long content lines (prose: markdown / plain text) instead of truncating them.
     /// Off for diffs and code, whose column alignment must be preserved.
     pub wrap: bool,
@@ -297,19 +301,21 @@ fn content_notice_split(inner: Rect, notices_len: usize) -> (Rect, Rect) {
     (parts[0], parts[1])
 }
 
-/// The content area split into the text rect + optional in-pane scrollbar tracks. `max_line_width`
-/// is the widest raw content line; under `wrap` there is no horizontal overflow. Two-pass like
-/// [`tree_bars`]. Shared by [`draw_content`] and [`geometry`].
+/// The content area split into the text rect + optional in-pane scrollbar tracks. `total_rows` is
+/// the RENDERED row count (wrapped rows under `wrap`, raw lines otherwise) — so the vertical bar
+/// appears whenever the file truly overflows, including a few long lines that wrap past the
+/// viewport. `max_line_width` is the widest raw line; under `wrap` there is no horizontal overflow.
+/// Two-pass like [`tree_bars`]. Shared by [`draw_content`] and [`geometry`].
 fn content_bars(
     content_area: Rect,
-    total_lines: usize,
+    total_rows: usize,
     max_line_width: usize,
     wrap: bool,
 ) -> (Rect, Option<Rect>, Option<Rect>) {
     let max_w = if wrap { 0 } else { max_line_width };
-    let v0 = total_lines > content_area.height as usize;
+    let v0 = total_rows > content_area.height as usize;
     let h0 = max_w > content_area.width as usize;
-    let needs_v = total_lines > content_area.height.saturating_sub(if h0 { 2 } else { 0 }) as usize;
+    let needs_v = total_rows > content_area.height.saturating_sub(if h0 { 2 } else { 0 }) as usize;
     let needs_h = max_w > content_area.width.saturating_sub(if v0 { 2 } else { 0 }) as usize;
     bar_layout(content_area, needs_v, needs_h)
 }
@@ -364,11 +370,15 @@ fn draw_tree(frame: &mut Frame, area: Rect, state: &ViewState) {
         text,
     );
     if let Some(track) = vbar {
+        // The tree's vertical thumb tracks the CURSOR (selected index), not the viewport offset —
+        // the tree has no independent vertical scroll (its position follows the selection, #45), so
+        // dragging the bar scrubs the selection and the thumb must follow it. (The content vbar,
+        // which has a real offset, uses that — see `draw_content`.)
         draw_vscrollbar(
             frame,
             track,
             state.nodes.len(),
-            offset,
+            state.selected,
             text.height as usize,
         );
     }
@@ -404,12 +414,13 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     }
 
     // Reserve an in-pane gutter for whichever scrollbars overflow, then render the file into the
-    // (possibly shrunk) text rect. Counts come from the raw content lines — exact when unwrapped
-    // (code/diffs, the primary scroll case) and a close approximation under wrap; the horizontal
-    // bar is suppressed under wrap, where there is nothing to scroll sideways.
-    let total_lines = state.content.lines.len();
+    // (possibly shrunk) text rect. The VERTICAL extent is the controller's rendered row count
+    // (`content_rows`) — wrapped rows under wrap, raw lines otherwise — so the bar is correct even
+    // for a few long lines that wrap past the viewport. The horizontal bar uses the widest raw line
+    // and is suppressed under wrap, where there is nothing to scroll sideways.
+    let total_rows = state.content_rows as usize;
     let max_width = content_max_line_width(&state.content);
-    let (text, vbar, hbar) = content_bars(content_area, total_lines, max_width, state.wrap);
+    let (text, vbar, hbar) = content_bars(content_area, total_rows, max_width, state.wrap);
 
     let mut content =
         Paragraph::new(state.content.clone()).scroll((state.content_scroll, state.content_hscroll));
@@ -422,7 +433,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
         draw_vscrollbar(
             frame,
             track,
-            total_lines,
+            total_rows,
             state.content_scroll as usize,
             text.height as usize,
         );
@@ -563,7 +574,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
             let (_notices, content_area) = content_notice_split(ci, state.notices.len());
             let (text, v, h) = content_bars(
                 content_area,
-                state.content.lines.len(),
+                state.content_rows as usize,
                 content_max_line_width(&state.content),
                 state.wrap,
             );

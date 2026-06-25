@@ -69,6 +69,7 @@ fn sample_state() -> ViewState {
         content_hscroll: 0,
         tree_scroll: 0,
         tree_hscroll: 0,
+        content_rows: 3, // the fixture content is three lines
         wrap: false,
         split_pct: 40,
         zoomed: false,
@@ -568,6 +569,7 @@ fn content_pane_shows_a_vertical_scrollbar_when_content_overflows() {
             .collect::<Vec<_>>()
             .join("\n"),
     );
+    state.content_rows = 60; // the controller's rendered-row count drives the vertical bar
     let out = render(&state, 100, 12);
     assert!(
         out.contains('▐'),
@@ -576,10 +578,82 @@ fn content_pane_shows_a_vertical_scrollbar_when_content_overflows() {
 
     // A short file shows none.
     state.content = to_text("only\ntwo\n");
+    state.content_rows = 2;
     let short = render(&state, 100, 12);
     assert!(
         !short.contains('▐'),
         "content that fits shows no vertical scrollbar\n{short}"
+    );
+}
+
+#[test]
+fn content_vertical_scrollbar_is_driven_by_rendered_rows_not_raw_lines() {
+    // Review (codex/opus/kimi/glm): under wrap, the vertical bar must reflect WRAPPED rows, not raw
+    // lines — else a file with few but long lines that wraps past the viewport gets no bar. The
+    // presenter sizes the bar from `content_rows` (the controller's rendered-row count), so a single
+    // raw line with a large content_rows shows a bar, and a small content_rows shows none.
+    let mut state = sample_state();
+    state.notices = vec![];
+    state.content = to_text(&"word ".repeat(400)); // ONE raw line
+    state.wrap = true;
+
+    state.content_rows = 60; // wraps to ~60 rows >> the ~22-row viewport
+    let overflow = render(&state, 100, 24);
+    assert!(
+        overflow.contains('▐'),
+        "a single long line that wraps past the viewport shows a vertical scrollbar\n{overflow}"
+    );
+
+    state.content_rows = 5; // wraps to only 5 rows → fits
+    let fits = render(&state, 100, 24);
+    assert!(
+        !fits.contains('▐'),
+        "no vertical bar when the wrapped rows fit (despite content_scroll units)\n{fits}"
+    );
+}
+
+#[test]
+fn tree_vertical_thumb_tracks_the_selection() {
+    // Review (codex/glm): the tree's vertical thumb reflects the CURSOR position, so dragging it
+    // (which scrubs the selection) makes the thumb follow — rather than the thumb being driven by
+    // the viewport offset while the drag moves the cursor (they'd diverge). With many nodes, a low
+    // selection puts the thumb near the top; a high selection puts it near the bottom.
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let mut state = sample_state();
+    state.notices = vec![];
+    state.nodes = (0..40)
+        .map(|i| {
+            node(
+                &format!("/r/file-{i:02}.rs"),
+                NodeKind::File,
+                0,
+                false,
+                None,
+            )
+        })
+        .collect();
+    let track = geometry(area, &state).tree_vbar.expect("tree vbar present");
+    let thumb_top = |st: &ViewState| -> u16 {
+        let buf = render_buffer(st, area.width, area.height);
+        (track.y..track.y + track.height)
+            .find(|&y| buf.cell((track.x, y)).is_some_and(|c| c.symbol() == "▐"))
+            .expect("a thumb cell")
+    };
+
+    state.selected = 0;
+    let low = thumb_top(&state);
+    state.selected = 39;
+    let high = thumb_top(&state);
+    assert!(
+        high > low,
+        "the thumb moves down as the selection moves down (tracks the cursor): sel0={low} sel39={high}"
     );
 }
 
@@ -608,6 +682,7 @@ fn content_vertical_scrollbar_thumb_reaches_the_bottom_at_max_scroll() {
             .join("\n"),
     );
     state.wrap = false;
+    state.content_rows = 60; // the rendered-row count drives the vertical bar
     let track = geometry(area, &state)
         .content_vbar
         .expect("content vbar present");

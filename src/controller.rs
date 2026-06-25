@@ -628,6 +628,11 @@ impl Controller {
         let nodes = self.tree.visible_nodes();
         let selected = self.tree.cursor();
         let wrap = self.wrap_for(nodes.get(selected));
+        // The wrapped-aware content row total, so the content vertical scrollbar sizes/positions
+        // against the SAME extent the scroll clamp uses (raw `lines.len()` undercounts under wrap,
+        // mis-sizing the thumb / hiding the bar). Computed with the wrap we already have — no extra
+        // tree walk.
+        let content_rows = self.rendered_line_count_for(wrap);
         ViewState {
             nodes,
             selected,
@@ -641,6 +646,7 @@ impl Controller {
             // a row already in view — e.g. a mouse click — never jumps the viewport.
             tree_scroll: self.geom.tree_scroll,
             tree_hscroll: self.tree_hscroll,
+            content_rows,
             wrap,
             split_pct: self.split_pct,
             zoomed: self.zoomed,
@@ -828,28 +834,22 @@ impl Controller {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A press on the divider begins a resize drag; on a scrollbar it begins a scroll
                 // drag AND jumps to the pressed position (click-to-scroll). Anything else waits for
-                // the release (a click).
-                match self.hit_test(col, row) {
-                    MouseRegion::Divider => {
-                        self.drag = Some(Drag::Divider);
-                        Effects::noop()
-                    }
-                    MouseRegion::ContentVBar => {
-                        self.drag = Some(Drag::ContentV);
-                        self.scroll_content_to_row(row)
-                    }
-                    MouseRegion::ContentHBar => {
-                        self.drag = Some(Drag::ContentH);
-                        self.scroll_content_h_to_col(col)
-                    }
-                    MouseRegion::TreeVBar => {
-                        self.drag = Some(Drag::TreeV);
-                        self.scroll_tree_to_row(row)
-                    }
-                    MouseRegion::TreeHBar => {
-                        self.drag = Some(Drag::TreeH);
-                        self.scroll_tree_h_to_col(col)
-                    }
+                // the release (a click). Always (re)set `drag` from the press — so a stale drag from
+                // a release we never saw (e.g. swallowed by a modal) can't keep acting on later moves.
+                let region = self.hit_test(col, row);
+                self.drag = match region {
+                    MouseRegion::Divider => Some(Drag::Divider),
+                    MouseRegion::ContentVBar => Some(Drag::ContentV),
+                    MouseRegion::ContentHBar => Some(Drag::ContentH),
+                    MouseRegion::TreeVBar => Some(Drag::TreeV),
+                    MouseRegion::TreeHBar => Some(Drag::TreeH),
+                    _ => None,
+                };
+                match region {
+                    MouseRegion::ContentVBar => self.scroll_content_to_row(row),
+                    MouseRegion::ContentHBar => self.scroll_content_h_to_col(col),
+                    MouseRegion::TreeVBar => self.scroll_tree_to_row(row),
+                    MouseRegion::TreeHBar => self.scroll_tree_h_to_col(col),
                     _ => Effects::noop(),
                 }
             }
@@ -863,7 +863,11 @@ impl Controller {
             },
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.drag.take().is_some() {
-                    return Effects::noop(); // end of a drag, not a click
+                    // End of a drag, not a click. Clear the pending-click so a tree-row click made
+                    // before the drag can't pair with a later one as a double-click — the drag may
+                    // have scrolled the viewport, so the same screen row now maps to a different node.
+                    self.last_click = None;
+                    return Effects::noop();
                 }
                 self.handle_click(col, row)
             }
@@ -1024,6 +1028,12 @@ impl Controller {
         }
         let idx = ((rel * (len as u32 - 1) + span / 2) / span) as usize;
         self.focus = Focus::Tree;
+        // A drag fires many events on the same row; only re-select (and re-render the content, an
+        // expensive job) when the target actually changes, so a held scrub doesn't re-render the
+        // same file every tick.
+        if idx == self.tree.cursor() {
+            return Effects::redraw();
+        }
         self.tree.set_cursor(idx);
         self.dispatch_render();
         Effects::redraw()
@@ -1124,7 +1134,15 @@ impl Controller {
     /// make it undershoot. Off the per-frame path: only scroll / resize / wrap-toggle keypaths
     /// reach it (`set_content_viewport` early-returns on an unchanged size).
     fn rendered_line_count(&self) -> u16 {
-        let count = if self.effective_wrap() {
+        self.rendered_line_count_for(self.effective_wrap())
+    }
+
+    /// Like [`rendered_line_count`] but takes the wrap flag, so a caller that already knows it
+    /// (e.g. `view_state`, which computes wrap from the visible nodes it just built) avoids the
+    /// extra tree walk `effective_wrap` would do. This is the wrapped-aware row total the content
+    /// vertical scrollbar must size/position against — raw `lines.len()` undercounts under wrap.
+    fn rendered_line_count_for(&self, wrap: bool) -> u16 {
+        let count = if wrap {
             let w = self.content_width.max(1) as usize;
             self.content
                 .lines
