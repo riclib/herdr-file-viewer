@@ -30,6 +30,7 @@ pub fn map_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Char('e') => Some(Intent::OpenInEditor),
         KeyCode::Char('y') => Some(Intent::CopyRepoPath),
         KeyCode::Char('Y') => Some(Intent::CopyAbsPath),
+        KeyCode::Char('W') => Some(Intent::SwitchWorktree),
         KeyCode::Tab => Some(Intent::ToggleFocus),
         KeyCode::Char('<') => Some(Intent::ShrinkTree),
         KeyCode::Char('>') => Some(Intent::GrowTree),
@@ -69,6 +70,7 @@ mod tests {
         (KeyCode::Char('e'), Intent::OpenInEditor),
         (KeyCode::Char('y'), Intent::CopyRepoPath),
         (KeyCode::Char('Y'), Intent::CopyAbsPath),
+        (KeyCode::Char('W'), Intent::SwitchWorktree),
         (KeyCode::Tab, Intent::ToggleFocus),
         (KeyCode::Char('<'), Intent::ShrinkTree),
         (KeyCode::Char('>'), Intent::GrowTree),
@@ -148,6 +150,23 @@ mod tests {
             map_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::CONTROL)),
             None
         );
+    }
+
+    #[test]
+    fn shift_w_maps_to_switch_worktree_and_lowercase_w_stays_toggle_wrap() {
+        // `W` (Shift+w, Char('W')) summons the worktree picker (AC-5/AC-N5).
+        // `w` (ToggleWrap) must be unaffected — no collision.
+        // A Ctrl chord on `W` must fire nothing.
+        assert_eq!(map_key(k(KeyCode::Char('W'))), Some(Intent::SwitchWorktree));
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT)),
+            Some(Intent::SwitchWorktree)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(map_key(k(KeyCode::Char('w'))), Some(Intent::ToggleWrap));
     }
 
     #[test]

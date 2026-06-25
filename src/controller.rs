@@ -607,6 +607,9 @@ impl Controller {
             Intent::ToggleZoom => self.toggle_zoom(),
             Intent::Refresh => self.refresh(),
             Intent::DismissUpdate => self.dismiss_update(),
+            // Picker is wired in T-12 (Worktree Picker state + open-on-SwitchWorktree). Placeholder no-op
+            // keeps the exhaustive match complete and the build green until then.
+            Intent::SwitchWorktree => Effects::noop(),
             Intent::Close => self.close_or_unzoom(),
         }
     }
