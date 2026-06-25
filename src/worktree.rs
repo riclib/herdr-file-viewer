@@ -285,7 +285,8 @@ pub fn agent_active(
 /// Per-worktree agent status from the herdr overlay, aligned 1:1 with `worktrees` (same order
 /// and length). `Some(status)` when that worktree's `open_workspace_id` hosts a REAL agent
 /// (`agent` present) — the agent's `agent_status`; `None` otherwise. Defensive: malformed JSON →
-/// all `None`. Pure over the passed-in strings (no fs/process/herdr call).
+/// all `None`. Spawns no process and makes no herdr call, but DOES `canonicalize()` each path
+/// (a filesystem stat) for symlink-stable matching, exactly like [`list`].
 ///
 /// This reuses the *same* `worktree list` + `agent list` JSON the picker already fetched for the
 /// agent-active pre-select, so it adds no extra subprocess cost (AC-20). Path matching uses the

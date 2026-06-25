@@ -546,6 +546,48 @@ fn agent_active_path_not_in_slice_returns_none() {
     assert_eq!(result, None);
 }
 
+/// **Real-agent filter guard (AC-3)** — a plain (non-agent) herdr pane in our OWN workspace must
+/// NOT count toward the agent-active pre-select. Without `.filter(|e| e.agent.is_some())` in
+/// `agent_active`, the plain pane's workspace would qualify and Tier 1 would return OUR (current)
+/// worktree; with the filter, our workspace is excluded, leaving the real agent's worktree as the
+/// unique Tier-2 winner. This test is RED if the filter is removed — the guard the mutation found
+/// missing.
+///
+/// Setup: two worktrees — the current one in "ws-current" (a PLAIN pane, no `agent`) and a second
+/// in "ws-agent" (a REAL `claude` agent). our_workspace_id = "ws-current".
+/// Expected: `Some("/repo/wt-agent")` — the real agent's worktree, NOT the current one.
+#[test]
+fn agent_active_ignores_non_agent_panes() {
+    // Worktree list (real nested herdr shape): current → ws-current, second → ws-agent.
+    let wt_json = r#"{"id": 1, "result": {"worktrees": [
+        {"path": "/repo/wt-current", "open_workspace_id": "ws-current"},
+        {"path": "/repo/wt-agent",   "open_workspace_id": "ws-agent"}
+    ]}}"#;
+    // Agent list: ws-current is a PLAIN PANE (no `agent` field), ws-agent is a REAL agent.
+    let ag_json = r#"{"id": 2, "result": {"agents": [
+        {"id": "pane",  "agent_status": "unknown", "workspace_id": "ws-current"},
+        {"id": "claude", "agent": "claude", "agent_status": "working", "workspace_id": "ws-agent"}
+    ]}}"#;
+    // The worktrees slice must contain both rows so the resolved path can be matched back.
+    let worktrees = parse_porcelain(
+        &{
+            let mut b = Vec::new();
+            b.extend_from_slice(b"worktree /repo/wt-current\0branch refs/heads/main\0");
+            b.push(b'\0');
+            b.extend_from_slice(b"worktree /repo/wt-agent\0branch refs/heads/feat\0");
+            b
+        },
+        std::path::Path::new("/repo/wt-current"),
+    );
+
+    let result = agent_active(&worktrees, wt_json, ag_json, Some("ws-current"));
+    assert_eq!(
+        result,
+        Some(PathBuf::from("/repo/wt-agent")),
+        "a plain (non-agent) pane in our workspace must not count — the real agent's worktree wins"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // agent_statuses: per-row agent status from the herdr overlay (AC-18, AC-19, AC-20)
 // ---------------------------------------------------------------------------

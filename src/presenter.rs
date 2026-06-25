@@ -443,9 +443,11 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     let visible = inner.height as usize;
     let offset = picker_scroll_offset(picker.cursor, picker.rows.len(), visible);
 
-    // Clamp the horizontal scroll to the live interior: at most `max_row_width - inner_width`
-    // (0 when every row fits). Saturating, so a narrow box never underflows.
-    let max_hscroll = desired_inner_w.saturating_sub(inner.width);
+    // Clamp the horizontal scroll to the widest ROW: at most `max_row_width - inner_width`
+    // (0 when every row fits). NOT against `desired_inner_w`, which is inflated by the title/footer
+    // chrome — clamping there would let scroll-right push the rows off-screen on a narrow pane even
+    // when every row fits. Saturating, so a narrow box never underflows.
+    let max_hscroll = (max_row_width.min(u16::MAX as usize) as u16).saturating_sub(inner.width);
     let hscroll = picker.hscroll.min(max_hscroll);
 
     let window: Vec<Line> = rows.into_iter().skip(offset).take(visible).collect();

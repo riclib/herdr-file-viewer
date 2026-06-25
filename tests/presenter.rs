@@ -984,6 +984,53 @@ fn picker_horizontal_scroll_clamps_past_the_end() {
 }
 
 #[test]
+fn picker_hscroll_is_a_noop_when_all_rows_fit_even_if_chrome_caps_the_box() {
+    // Gate fix: the hscroll clamp must be against the widest ROW, not the (chrome-inflated)
+    // desired inner width. On a narrow frame the box caps so the WIDE footer hint
+    // ("↑↓ move · ←→ scroll · …", ~40 cols) drives `desired_inner_w`, while the SHORT rows fit the
+    // capped interior. A non-zero hscroll must then be a no-op — every row still shows from its
+    // left edge. (Before the fix, `desired_inner_w - inner.width > 0` let scroll-right clip the
+    // rows off-screen for no reason.)
+    let mut state = picker_state();
+    if let Some(p) = state.picker.as_mut() {
+        // A single SHORT row — far narrower than the footer chrome.
+        p.rows = vec![PickerRowView {
+            path: "/a".to_string(),
+            branch: None,
+            detached: false,
+            is_current: false,
+            agent: None,
+        }];
+        p.cursor = 0;
+        p.hscroll = 0;
+    }
+    // A frame narrow enough that the box caps below the chrome width (~40), but wide enough that
+    // the short row still fits the capped interior.
+    let (w, h) = (20, 8);
+    let out0 = render(&state, w, h);
+    assert!(
+        out0.contains("/a"),
+        "at hscroll 0 the short row shows from its left edge\n{out0}"
+    );
+
+    // Scroll right hard. With the clamp against max_row_width (the fix), max_hscroll is 0 here, so
+    // this is a no-op and the row stays fully visible. With the buggy desired_inner_w clamp the
+    // leading `/a` would be clipped off-screen.
+    if let Some(p) = state.picker.as_mut() {
+        p.hscroll = 30;
+    }
+    let out_scrolled = render(&state, w, h);
+    assert!(
+        out_scrolled.contains("/a"),
+        "scrolling right is a no-op while every row fits — the row must not be clipped\n{out_scrolled}"
+    );
+    assert_eq!(
+        out0, out_scrolled,
+        "hscroll has no effect when all rows fit the capped interior"
+    );
+}
+
+#[test]
 fn picker_shows_an_esc_close_chip_on_the_top_border() {
     // Picker-hints §1: herdr-style chrome — an `esc close` chip on the TOP border, right side.
     // It is a Block title, not an inner row, so it lands on the title row (the box's top edge),
