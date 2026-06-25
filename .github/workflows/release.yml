@@ -24,15 +24,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Fail fast if the pushed tag disagrees with the crate version, so we never publish a release
-      # whose assets don't match the source the install step clones.
-      - name: Verify tag matches Cargo.toml version
+      # Fail fast if the pushed tag disagrees with the crate version OR the herdr manifest version,
+      # so we never publish a release whose assets/manifest don't match the source the install step
+      # clones. (herdr displays the herdr-plugin.toml version, which must track Cargo.toml.)
+      - name: Verify tag matches Cargo.toml and herdr-plugin.toml versions
         shell: bash
         run: |
           tag="${GITHUB_REF_NAME#v}"
           crate="$(grep -E '^version *= *"' Cargo.toml | head -n1 | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          manifest="$(grep -E '^version *= *"' herdr-plugin.toml | head -n1 | sed -E 's/^version *= *"([^"]+)".*/\1/')"
           if [ "$tag" != "$crate" ]; then
             echo "tag $GITHUB_REF_NAME ($tag) != Cargo.toml version ($crate)" >&2
+            exit 1
+          fi
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $GITHUB_REF_NAME ($tag) != herdr-plugin.toml version ($manifest)" >&2
             exit 1
           fi
 
