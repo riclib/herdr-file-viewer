@@ -15,9 +15,10 @@ All notable changes to this project are documented here. The format is based on
 ### Added
 - **Scrollbars** appear on the tree and content panes whenever there's more to see than fits — a
   vertical bar when the list or file is taller than the pane, and a horizontal bar when a row /
-  unwrapped line is wider than the pane. They show only where there is something to scroll, and the
-  bars are **draggable with the mouse** (drag ↕ to scroll vertically, ↔ to scroll horizontally;
-  pressing the track jumps to that position).
+  unwrapped line is wider than the pane. They show only where there is something to scroll. The
+  bars render **inside** the pane (one cell off the text) and are **draggable with the mouse**:
+  drag a vertical bar ↕ or a horizontal bar ↔ to scroll, and pressing the track jumps to that
+  position. Dragging the tree's vertical bar scrubs the selection through the file list.
 - **The tree scrolls horizontally** so a long or deeply-nested file name can be read in full — via
   the horizontal mouse wheel or by dragging the tree's horizontal scrollbar (the `←`/`→` keys stay
   expand/collapse in the tree).

@@ -491,6 +491,72 @@ fn tree_shows_a_horizontal_scrollbar_and_scrolls_long_rows() {
 }
 
 #[test]
+fn scrollbars_are_inside_the_pane_with_a_one_column_gap() {
+    // The bars live INSIDE the box (a reserved gutter), not on the border, with a one-cell gap
+    // between the text and the bar. Asserted structurally via geometry: the vertical bar is a
+    // 1-col track exactly one column right of the text's right edge (the gap), spanning the text
+    // rows; the horizontal bar is one row below the text's bottom edge.
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let mut state = sample_state();
+    state.notices = vec![];
+    // Overflow both ways: many rows (vbar) + one very wide row (hbar).
+    state.nodes = (0..40)
+        .map(|i| {
+            node(
+                &format!("/r/file-{i:02}.rs"),
+                NodeKind::File,
+                0,
+                false,
+                None,
+            )
+        })
+        .collect();
+    state.nodes[0] = node(
+        &format!("/r/{}", "w".repeat(80)),
+        NodeKind::File,
+        0,
+        false,
+        None,
+    );
+    state.selected = 0;
+
+    let g = geometry(area, &state);
+    let t = g.tree_inner.expect("tree text rect");
+    let v = g
+        .tree_vbar
+        .expect("tree vbar present when overflowing vertically");
+    let h = g
+        .tree_hbar
+        .expect("tree hbar present when overflowing horizontally");
+
+    assert_eq!(v.width, 1, "the vertical bar is one column wide");
+    assert_eq!(
+        v.x,
+        t.x + t.width + 1,
+        "exactly one gap column between the text and the vertical bar (bar is inside, not on the border)"
+    );
+    assert_eq!(v.height, t.height, "the vertical bar spans the text rows");
+
+    assert_eq!(h.height, 1, "the horizontal bar is one row tall");
+    assert_eq!(
+        h.y,
+        t.y + t.height + 1,
+        "exactly one gap row between the text and the horizontal bar"
+    );
+    assert_eq!(
+        h.x, t.x,
+        "the horizontal bar starts at the text's left edge"
+    );
+}
+
+#[test]
 fn content_pane_shows_a_vertical_scrollbar_when_content_overflows() {
     // The content pane gets a vertical scrollbar when it has more lines than the viewport is tall.
     // The tree (7 nodes) does NOT overflow a 12-row frame, so the only ▐ is the content scrollbar.
@@ -520,14 +586,14 @@ fn content_pane_shows_a_vertical_scrollbar_when_content_overflows() {
 #[test]
 fn content_vertical_scrollbar_thumb_reaches_the_bottom_at_max_scroll() {
     // Review (codex): at the last scroll position the thumb must reach the bottom of the track —
-    // leaving track below it would falsely imply more content remains. The content pane's right
-    // border is the frame's rightmost column; with the block spanning the full height the track is
-    // inset by one row each end, so the bottom track cell is row h-2. At scroll 0 the thumb is at
-    // the top (not that bottom cell); at the max scroll it is.
+    // leaving track below it would falsely imply more content remains. The bar now lives INSIDE the
+    // pane (a gutter column), so find it by its thumb glyph rather than the border position: the
+    // track is the column containing `▐`; its cells are `▐` (thumb) or `│` (track). At max scroll
+    // the bottom-most track cell is the thumb; at scroll 0 it is the track (thumb sits at the top).
     let (w, h) = (100u16, 18u16);
     let mut state = sample_state();
     state.notices = vec![];
-    // 60 lines into a (h-2)=16-row viewport → max scroll 44.
+    // 60 lines into a 16-row text area → max scroll 44.
     state.content = to_text(
         &(0..60)
             .map(|i| format!("line {i}"))
@@ -535,23 +601,41 @@ fn content_vertical_scrollbar_thumb_reaches_the_bottom_at_max_scroll() {
             .join("\n"),
     );
     state.wrap = false;
-    let bottom_track_row = h - 2;
-    let rightmost = w - 1;
+
+    // The symbol of the bottom-most track cell in the vertical-scrollbar column of a render. The
+    // bar column is the one containing `▐`; its track cells are `▐` (thumb) or `│` (track).
+    let bottom_track_cell = |buf: &ratatui::buffer::Buffer| -> String {
+        let mut bar_col = None;
+        'find: for x in 0..w {
+            for y in 0..h {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "▐") {
+                    bar_col = Some(x);
+                    break 'find;
+                }
+            }
+        }
+        let col = bar_col.expect("a vertical scrollbar (▐) is drawn");
+        let bottom = (0..h)
+            .filter(|&y| {
+                buf.cell((col, y))
+                    .is_some_and(|c| c.symbol() == "▐" || c.symbol() == "│")
+            })
+            .max()
+            .expect("the track has cells");
+        buf.cell((col, bottom)).unwrap().symbol().to_string()
+    };
 
     state.content_scroll = 0;
-    let top = render_buffer(&state, w, h);
-    assert_ne!(
-        top.cell((rightmost, bottom_track_row)).unwrap().symbol(),
-        "▐",
-        "at scroll 0 the thumb sits at the top, not the bottom track row"
-    );
-
-    state.content_scroll = 44; // the max scroll for this content/viewport
-    let bottom = render_buffer(&state, w, h);
     assert_eq!(
-        bottom.cell((rightmost, bottom_track_row)).unwrap().symbol(),
+        bottom_track_cell(&render_buffer(&state, w, h)),
+        "│",
+        "at scroll 0 the bottom of the track is plain track (thumb is at the top)"
+    );
+    state.content_scroll = 44; // the max scroll for this content/viewport
+    assert_eq!(
+        bottom_track_cell(&render_buffer(&state, w, h)),
         "▐",
-        "at max scroll the thumb reaches the bottom track row"
+        "at max scroll the thumb reaches the bottom of the track"
     );
 }
 

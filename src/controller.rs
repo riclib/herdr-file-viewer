@@ -842,6 +842,10 @@ impl Controller {
                         self.drag = Some(Drag::ContentH);
                         self.scroll_content_h_to_col(col)
                     }
+                    MouseRegion::TreeVBar => {
+                        self.drag = Some(Drag::TreeV);
+                        self.scroll_tree_to_row(row)
+                    }
                     MouseRegion::TreeHBar => {
                         self.drag = Some(Drag::TreeH);
                         self.scroll_tree_h_to_col(col)
@@ -853,6 +857,7 @@ impl Controller {
                 Some(Drag::Divider) => self.resize_split_to_col(col),
                 Some(Drag::ContentV) => self.scroll_content_to_row(row),
                 Some(Drag::ContentH) => self.scroll_content_h_to_col(col),
+                Some(Drag::TreeV) => self.scroll_tree_to_row(row),
                 Some(Drag::TreeH) => self.scroll_tree_h_to_col(col),
                 None => Effects::noop(),
             },
@@ -902,6 +907,7 @@ impl Controller {
             MouseRegion::Divider
             | MouseRegion::ContentVBar
             | MouseRegion::ContentHBar
+            | MouseRegion::TreeVBar
             | MouseRegion::TreeHBar
             | MouseRegion::Outside => {
                 self.last_click = None;
@@ -952,50 +958,74 @@ impl Controller {
         Effects::redraw()
     }
 
-    /// Map a vertical position on the content scrollbar track to a content scroll offset (drag /
-    /// click-to-scroll). The track spans the content interior's rows; the fraction maps linearly
-    /// onto `[0, max_content_scroll]`. Rounds to the nearest line. No-op without overflow.
+    /// The fraction `[0,1]` of a press/drag along a scrollbar track of `len` cells starting at
+    /// `start`, as a rounding numerator/denominator: returns `(rel, span)` so callers stay in
+    /// integer math (`offset = round(rel/span * max)`). `span` is 0 for a degenerate 1-cell track.
+    fn track_fraction(pos: u16, start: u16, len: u16) -> (u32, u32) {
+        let rel = pos.saturating_sub(start).min(len.saturating_sub(1)) as u32;
+        (rel, len.saturating_sub(1) as u32)
+    }
+
+    /// Map a vertical press/drag on the content scrollbar track to a content scroll offset. The
+    /// track is the fed-back `content_vbar` rect; the fraction maps linearly onto
+    /// `[0, max_content_scroll]`, rounded to the nearest line. No-op without overflow.
     fn scroll_content_to_row(&mut self, row: u16) -> Effects {
-        let Some(c) = self.geom.content_inner else {
+        let Some(track) = self.geom.content_vbar else {
             return Effects::noop();
         };
         let max = self.max_content_scroll();
-        if c.height <= 1 || max == 0 {
+        let (rel, span) = Self::track_fraction(row, track.y, track.height);
+        if span == 0 || max == 0 {
             return Effects::noop();
         }
-        let rel = row.saturating_sub(c.y).min(c.height - 1) as u32;
-        let span = (c.height - 1) as u32;
         self.content_scroll = ((rel * max as u32 + span / 2) / span) as u16;
         Effects::redraw()
     }
 
-    /// Map a horizontal position on the content horizontal scrollbar to a content h-scroll offset.
+    /// Map a horizontal press/drag on the content horizontal scrollbar to a content h-scroll offset.
     fn scroll_content_h_to_col(&mut self, col: u16) -> Effects {
-        let Some(c) = self.geom.content_inner else {
+        let Some(track) = self.geom.content_hbar else {
             return Effects::noop();
         };
         let max = self.max_content_hscroll();
-        if c.width <= 1 || max == 0 {
+        let (rel, span) = Self::track_fraction(col, track.x, track.width);
+        if span == 0 || max == 0 {
             return Effects::noop();
         }
-        let rel = col.saturating_sub(c.x).min(c.width - 1) as u32;
-        let span = (c.width - 1) as u32;
         self.content_hscroll = ((rel * max as u32 + span / 2) / span) as u16;
         Effects::redraw()
     }
 
-    /// Map a horizontal position on the tree's horizontal scrollbar to a tree h-scroll offset.
+    /// Map a horizontal press/drag on the tree's horizontal scrollbar to a tree h-scroll offset.
     fn scroll_tree_h_to_col(&mut self, col: u16) -> Effects {
-        let Some(t) = self.geom.tree_inner else {
+        let Some(track) = self.geom.tree_hbar else {
             return Effects::noop();
         };
-        let max = self.geom.tree_content_width.saturating_sub(t.width);
-        if t.width <= 1 || max == 0 {
+        let max = self.geom.tree_content_width.saturating_sub(track.width);
+        let (rel, span) = Self::track_fraction(col, track.x, track.width);
+        if span == 0 || max == 0 {
             return Effects::noop();
         }
-        let rel = col.saturating_sub(t.x).min(t.width - 1) as u32;
-        let span = (t.width - 1) as u32;
         self.tree_hscroll = ((rel * max as u32 + span / 2) / span) as u16;
+        Effects::redraw()
+    }
+
+    /// Map a vertical press/drag on the tree's vertical scrollbar to a selection — scrubbing the
+    /// cursor through the file list, which scrolls the tree to keep it in view (the tree has no
+    /// independent vertical offset; its position follows the selection, #45).
+    fn scroll_tree_to_row(&mut self, row: u16) -> Effects {
+        let Some(track) = self.geom.tree_vbar else {
+            return Effects::noop();
+        };
+        let len = self.tree.visible_nodes().len();
+        let (rel, span) = Self::track_fraction(row, track.y, track.height);
+        if span == 0 || len <= 1 {
+            return Effects::noop();
+        }
+        let idx = ((rel * (len as u32 - 1) + span / 2) / span) as usize;
+        self.focus = Focus::Tree;
+        self.tree.set_cursor(idx);
+        self.dispatch_render();
         Effects::redraw()
     }
 
@@ -1020,34 +1050,24 @@ impl Controller {
         {
             return MouseRegion::Divider;
         }
-        // Scrollbars sit on the block borders (just outside the interior rects), drawn only when
-        // the pane overflows — so a hit counts only when the matching scrollbar is actually drawn.
-        // The content pane's vertical bar is on its right border; both panes' horizontal bars are
-        // on their bottom border. (The tree's vertical bar shares the divider column, so it is not
-        // hit-tested as draggable — see `Drag`.)
-        if let Some(c) = self.geom.content_inner {
-            if col == c.x + c.width
-                && (c.y..c.y + c.height).contains(&row)
-                && self.max_content_scroll() > 0
-            {
-                return MouseRegion::ContentVBar;
-            }
-            if row == c.y + c.height
-                && (c.x..c.x + c.width).contains(&col)
-                && self.max_content_hscroll() > 0
-            {
-                return MouseRegion::ContentHBar;
-            }
+        // Scrollbars live INSIDE the panes (a reserved gutter), fed back as 1-cell track rects that
+        // are present only when that bar is drawn — so a hit on a `Some` track is a real bar. Check
+        // them before the text rects. The tree's vertical bar no longer shares the divider column.
+        let pos = Position { x: col, y: row };
+        if self.geom.content_vbar.is_some_and(|r| r.contains(pos)) {
+            return MouseRegion::ContentVBar;
         }
-        if let Some(t) = self.geom.tree_inner
-            && row == t.y + t.height
-            && (t.x..t.x + t.width).contains(&col)
-            && self.geom.tree_content_width > t.width
-        {
+        if self.geom.content_hbar.is_some_and(|r| r.contains(pos)) {
+            return MouseRegion::ContentHBar;
+        }
+        if self.geom.tree_vbar.is_some_and(|r| r.contains(pos)) {
+            return MouseRegion::TreeVBar;
+        }
+        if self.geom.tree_hbar.is_some_and(|r| r.contains(pos)) {
             return MouseRegion::TreeHBar;
         }
         if let Some(t) = self.geom.tree_inner
-            && t.contains(Position { x: col, y: row })
+            && t.contains(pos)
         {
             // Map the screen row to the node actually drawn there: the on-screen offset plus the
             // tree's scroll offset (#45), the same value `draw_tree` scrolled by. The row index may
@@ -1664,23 +1684,26 @@ enum MouseRegion {
     TreeRow(usize),
     Content,
     Divider,
-    /// The content pane's vertical scrollbar (right border) — drag up/down to scroll.
+    /// The content pane's vertical scrollbar — drag up/down to scroll.
     ContentVBar,
-    /// The content pane's horizontal scrollbar (bottom border) — drag left/right to scroll.
+    /// The content pane's horizontal scrollbar — drag left/right to scroll.
     ContentHBar,
-    /// The tree's horizontal scrollbar (bottom border) — drag left/right to scroll the tree.
+    /// The tree's vertical scrollbar — drag up/down to scrub the selection through the list.
+    TreeVBar,
+    /// The tree's horizontal scrollbar — drag left/right to scroll the tree sideways.
     TreeHBar,
     Outside,
 }
 
 /// What a held left-button drag is currently manipulating. Set on press, cleared on release.
-/// (The tree's *vertical* scrollbar shares the divider column, so it is not draggable — the tree
-/// scrolls vertically via the wheel / selection instead.)
+/// The scrollbars now live *inside* the panes (not on the borders), so all four are draggable —
+/// the tree's vertical bar no longer collides with the divider.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Drag {
     Divider,
     ContentV,
     ContentH,
+    TreeV,
     TreeH,
 }
 
