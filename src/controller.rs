@@ -348,13 +348,36 @@ impl Controller {
     /// across unchanged (AC-12). The structural re-root (resolve + fresh tree + worker respawn +
     /// carried prefs + nav reset) is **synchronous**, so the tree is immediately navigable; the
     /// heavier git status + changed-set fills in **asynchronously**, applied by [`poll`] (AC-17),
-    /// so input is never blocked. Finally the first frame is rendered. Assumes `target` is a
-    /// valid, usable directory — failure/no-op handling is a later task.
+    /// so input is never blocked. Finally the first frame is rendered. A missing or
+    /// non-directory `target` produces a non-fatal notice and leaves all state unchanged
+    /// (AC-16); re-selecting the current root is a silent no-op (AC-11).
     pub fn re_root(&mut self, target: &Path) {
+        // AC-16: a missing or non-directory target aborts with a non-fatal notice. No state
+        // change — the viewer stays on its current root with all state intact.
+        if !target.is_dir() {
+            self.action_notice = Some(format!(
+                "cannot switch worktree: {} is not an accessible directory",
+                target.display()
+            ));
+            return;
+        }
         let resolved = crate::root::resolve(&crate::context::LaunchContext {
             cwd: target.to_path_buf(),
             ..Default::default()
         });
+        // AC-11: re-selecting the worktree we're already rooted at is a clean no-op — no
+        // rebuild, no notice, no state change (canonicalize so /tmp vs /private/tmp matches).
+        let target_canon = resolved
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| resolved.root.clone());
+        let current_canon = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        if target_canon == current_canon {
+            return;
+        }
 
         // Rebuild the root-bound providers for the new root and respawn the worker. Overwriting
         // `job_tx` drops the old sender, so the old worker (holding the old git Arc + content)
@@ -447,6 +470,12 @@ impl Controller {
     }
     pub fn content(&self) -> &Text<'static> {
         &self.content
+    }
+
+    /// The transient action notice from the last intent, if any. Exposed for tests that need
+    /// to inspect it directly (e.g. the re-root failure guard, AC-16).
+    pub fn action_notice(&self) -> Option<&str> {
+        self.action_notice.as_deref()
     }
 
     /// All notices to surface: the transient action notice (if any) followed by the content

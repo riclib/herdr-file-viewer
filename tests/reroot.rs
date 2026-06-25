@@ -436,6 +436,113 @@ fn re_root_markers_reflect_new_root_git() {
 }
 
 #[test]
+fn re_root_to_missing_path_keeps_root_and_sets_notice() {
+    // AC-16: if the target path does not exist (or is not a directory), re_root must leave all
+    // state intact and set a non-fatal action notice — no partial re-root, no panic.
+    let a = TempDir::new();
+    common::init_repo_with_commit(a.path());
+    std::fs::write(a.path().join("a.txt"), "a\n").unwrap();
+
+    let components = Components {
+        providers: fake_factory(),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(a.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+
+    // Move the cursor and set a preference so we can confirm nothing changed.
+    ctrl.handle(Intent::GrowTree);
+    let split_before = ctrl.split_pct();
+
+    // The target path does not exist.
+    let missing = a.path().join("does-not-exist");
+    assert!(
+        !missing.exists(),
+        "precondition: missing path must not exist"
+    );
+
+    ctrl.re_root(&missing);
+
+    // Root is unchanged — the tree is still rooted at A.
+    let nodes = ctrl.tree().visible_nodes();
+    let first = nodes.first().expect("A should still have nodes");
+    assert!(
+        first.path.starts_with(common::canon(a.path())),
+        "tree root must still be A after a failed re_root; got {}",
+        first.path.display()
+    );
+
+    // A non-fatal notice is set.
+    assert!(
+        ctrl.action_notice().is_some(),
+        "a non-fatal notice must be set when re_root targets a missing path"
+    );
+    let notice = ctrl.action_notice().unwrap();
+    assert!(
+        notice.contains("cannot switch worktree"),
+        "notice should mention 'cannot switch worktree'; got: {notice}"
+    );
+
+    // Preferences are undisturbed.
+    assert_eq!(
+        ctrl.split_pct(),
+        split_before,
+        "split_pct must be unchanged"
+    );
+}
+
+#[test]
+fn re_root_to_current_root_is_a_noop() {
+    // AC-11: re-selecting the current root is a clean no-op — no rebuild, no notice set.
+    let a = TempDir::new();
+    common::init_repo_with_commit(a.path());
+    std::fs::write(a.path().join("a.txt"), "a\n").unwrap();
+
+    let components = Components {
+        providers: fake_factory(),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(a.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+
+    // Move the cursor and set a preference to confirm nothing is disturbed.
+    ctrl.handle(Intent::GrowTree);
+    let split_before = ctrl.split_pct();
+    ctrl.handle(Intent::NavDown);
+    let cursor_before = ctrl.tree().cursor();
+
+    // Re-root to A — the same root we're already at.
+    ctrl.re_root(a.path());
+
+    // No notice — a clean no-op emits nothing.
+    assert!(
+        ctrl.action_notice().is_none(),
+        "re_root to the current root must not set a notice; got: {:?}",
+        ctrl.action_notice()
+    );
+
+    // The tree is still at A (cursor unchanged — nav state was not reset).
+    assert_eq!(
+        ctrl.tree().cursor(),
+        cursor_before,
+        "cursor must be undisturbed by a no-op re_root"
+    );
+    assert_eq!(
+        ctrl.split_pct(),
+        split_before,
+        "split_pct must be unchanged by a no-op re_root"
+    );
+}
+
+#[test]
 fn re_root_render_resolves_through_the_respawned_worker() {
     // After a re-root, selecting a file dispatches a render that must resolve through the
     // worker respawned for B — drained by `poll`, the content shows the (B) factory's marker.
