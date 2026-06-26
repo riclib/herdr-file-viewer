@@ -11,6 +11,7 @@ pub mod fuzzy;
 pub mod git;
 pub mod herdr;
 pub mod host;
+pub mod index;
 pub mod input;
 pub mod intent;
 pub mod launch;
