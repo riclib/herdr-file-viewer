@@ -2852,6 +2852,51 @@ fn finder_matches_empty_before_any_keystroke() {
 }
 
 #[test]
+fn finder_confirm_zooms_the_file_when_only_the_tree_is_visible() {
+    // Live-test fix: in the narrow, tree-only layout the Presenter draws no content column, so the
+    // controller's last-observed content viewport is (0, 0). Confirming a finder jump there must
+    // open the file in ZOOM mode so the user actually sees the file they jumped to — instead of
+    // landing on a tree row with the file hidden off-screen. Mirrors the tree's Enter/activate on a
+    // file (content full-screen).
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.set_content_viewport(0, 0); // the Presenter drew no content column (tree-only layout)
+    assert!(!ctrl.zoomed(), "precondition: not zoomed");
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // 'a' matches alpha.txt / beta.rs / gamma.rs
+    assert!(
+        !ctrl.finder_matches().is_empty(),
+        "query 'a' matches at least one file"
+    );
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    assert!(!ctrl.finder_open(), "finder closed on confirm");
+    assert!(
+        ctrl.zoomed(),
+        "content was hidden (tree-only) → the jumped-to file opens in zoom mode"
+    );
+}
+
+#[test]
+fn finder_confirm_does_not_force_zoom_when_content_is_visible() {
+    // The complement: when a content column IS on screen (wide two-column layout, content_width > 0),
+    // a finder confirm renders the file in place and must NOT force zoom — the user keeps the layout
+    // they were in.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.set_content_viewport(60, 20); // the Presenter drew a content column last frame
+    assert!(!ctrl.zoomed(), "precondition: not zoomed");
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(!ctrl.finder_matches().is_empty());
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    assert!(!ctrl.finder_open(), "finder closed on confirm");
+    assert!(
+        !ctrl.zoomed(),
+        "content already visible → finder confirm must not force zoom"
+    );
+}
+
+#[test]
 fn typing_a_char_updates_query_and_matches_and_resets_cursor() {
     // AC-7: a Char keystroke pushes the character, re-runs fuzzy::match_and_rank, and resets
     // the selection to 0 (so a mid-list cursor from a prior query doesn't carry over).

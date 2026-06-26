@@ -1652,6 +1652,16 @@ impl Controller {
             // (T-4 review note: the mirrors at controller.rs:166-168 drive those toggles).
             self.changed_only = self.tree.changed_only();
             self.hide_hidden = self.tree.hide_hidden();
+            // If the content pane isn't currently visible — the narrow, tree-only layout where the
+            // last frame drew no content column (`content_width == 0`) — open the jumped-to file in
+            // zoom mode so the user actually SEES the file they jumped to, instead of landing on a
+            // tree row with the file hidden off-screen. This mirrors the tree's Enter/activate on a
+            // file (content full-screen). When the content is already visible (the wide two-column
+            // layout, or already zoomed), the layout is left untouched and the file just renders.
+            if self.content_width == 0 {
+                self.zoomed = true;
+                self.focus = Focus::Content;
+            }
             self.dispatch_render();
             Effects::redraw()
         } else {
