@@ -26,7 +26,7 @@ use crate::root::Resolved;
 use crate::tree::{Node, NodeKind, TreeModel};
 use crate::update::{self, UpdateState, Version};
 use crate::view_policy::{FileDescriptor, ViewMode, applicable_modes, default_mode};
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 use ratatui::text::Text;
 use std::collections::{BTreeMap, HashMap};
@@ -1552,6 +1552,55 @@ impl Controller {
     /// empty. Exposed for tests (T-5); the Presenter/T-8 reads via `finder()`.
     pub fn finder_query(&self) -> &str {
         self.finder.as_ref().map(|f| f.query()).unwrap_or("")
+    }
+
+    /// The current ranked match indices (into `finder_candidates()`), or `&[]` when the finder
+    /// is closed or the query is empty. Exposed for tests (T-6) and the Presenter (T-8).
+    pub fn finder_matches(&self) -> &[usize] {
+        self.finder.as_ref().map(|f| f.matches()).unwrap_or(&[])
+    }
+
+    /// The cursor position within the match list, or `0` when the finder is closed or the
+    /// list is empty. Exposed for tests (T-6) and confirm (T-7).
+    pub fn finder_cursor(&self) -> usize {
+        self.finder.as_ref().map(|f| f.cursor()).unwrap_or(0)
+    }
+
+    /// Route a key event while the finder overlay is open.
+    ///
+    /// - A printable `Char(c)` with no modifier other than `SHIFT` pushes the character,
+    ///   re-runs [`fuzzy::match_and_rank`] over the candidates, and resets the selection
+    ///   to 0 (AC-7).
+    /// - `Backspace` deletes the last character and re-matches (AC-7).
+    /// - `Up`/`Down` move the selection within the current match list, clamped at both ends
+    ///   (AC-8).
+    /// - `Enter`/`Esc` (confirm/cancel) are not yet handled — they fall through to the
+    ///   `_ => Effects::noop()` arm and will be wired in T-7.
+    ///
+    /// When the finder is not open, all keys are a no-op (defensive guard).
+    pub fn handle_finder_key(&mut self, key: KeyEvent) -> Effects {
+        let Some(finder) = self.finder.as_mut() else {
+            return Effects::noop();
+        };
+        match key.code {
+            KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                finder.push(c);
+                Effects::redraw()
+            }
+            KeyCode::Backspace => {
+                finder.backspace();
+                Effects::redraw()
+            }
+            KeyCode::Up => {
+                finder.move_selection(-1);
+                Effects::redraw()
+            }
+            KeyCode::Down => {
+                finder.move_selection(1);
+                Effects::redraw()
+            }
+            _ => Effects::noop(), // Enter/Esc handled in T-7
+        }
     }
 
     /// Fetch the herdr agent overlay — the `worktree list` + `agent list` JSON — with exactly the

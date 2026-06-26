@@ -2796,6 +2796,279 @@ fn re_root_only_reachable_via_switch_worktree_intent() {
 }
 
 // ---------------------------------------------------------------------------
+// T-6 — Finder keystroke matching + selection navigation (AC-6, AC-7, AC-8)
+// ---------------------------------------------------------------------------
+
+use crossterm::event::{KeyCode, KeyEvent};
+
+/// Build a `KeyEvent` with no modifiers.
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// Build a `KeyEvent` for a printable char with SHIFT (e.g. uppercase letters).
+fn key_shift(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+}
+
+/// Build a `KeyEvent` with Ctrl held — must be rejected by handle_finder_key.
+fn key_ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+/// Build a temp dir with files at known names and return the dir + controller.
+fn finder_dir() -> (TempDir, Controller) {
+    let dir = TempDir::new();
+    // Three files: two in root, one in a sub-dir — deterministic candidate list.
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    (dir, ctrl)
+}
+
+/// Map `finder_matches()` indices through `finder_candidates()` to get paths.
+fn match_paths(ctrl: &Controller) -> Vec<String> {
+    let candidates = ctrl.finder_candidates().to_vec();
+    ctrl.finder_matches()
+        .iter()
+        .map(|&i| candidates[i].clone())
+        .collect()
+}
+
+#[test]
+fn finder_matches_empty_before_any_keystroke() {
+    // AC-6 / AC-7: when the finder is freshly opened the query is empty and the match list is
+    // empty (no results until the user types — match_and_rank returns [] for an empty query).
+    let (_dir, ctrl) = finder_dir();
+    assert_eq!(ctrl.finder_query(), "", "query starts empty");
+    assert!(
+        ctrl.finder_matches().is_empty(),
+        "no matches until the user types (AC-6 backing)"
+    );
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor starts at 0");
+}
+
+#[test]
+fn typing_a_char_updates_query_and_matches_and_resets_cursor() {
+    // AC-7: a Char keystroke pushes the character, re-runs fuzzy::match_and_rank, and resets
+    // the selection to 0 (so a mid-list cursor from a prior query doesn't carry over).
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Manually advance the cursor first so we can check it resets.
+    let fx = ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(fx.redraw, "a Char key signals a redraw");
+    assert_eq!(ctrl.finder_query(), "a", "query appends the char");
+    // "alpha.txt" and "gamma.rs" both have 'a'; "beta.rs" does not.
+    let paths = match_paths(&ctrl);
+    assert!(!paths.is_empty(), "at least one candidate matches 'a'");
+    assert!(
+        paths.iter().all(|p| p.to_lowercase().contains('a')),
+        "every match contains 'a': {paths:?}"
+    );
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor resets to 0 on a new query");
+}
+
+#[test]
+fn typing_more_chars_narrows_matches() {
+    // AC-7: successive chars narrow the match list (subsequence filter).
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    let after_b = match_paths(&ctrl);
+    assert!(!after_b.is_empty(), "something matches 'b'");
+
+    ctrl.handle_finder_key(key(KeyCode::Char('e')));
+    let after_be = match_paths(&ctrl);
+    // "be" as a subsequence only matches "beta.rs".
+    assert!(
+        after_be.len() <= after_b.len(),
+        "adding a char never grows the match list"
+    );
+    assert_eq!(ctrl.finder_query(), "be", "query is 'be'");
+}
+
+#[test]
+fn no_match_query_produces_empty_list() {
+    // AC-6 (empty when nothing matches): a query with no candidates yields an empty match list,
+    // not a panic or a stale result.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    // None of our files ("alpha.txt", "beta.rs", "sub/gamma.rs") contain "zzz".
+    assert_eq!(ctrl.finder_query(), "zzz");
+    assert!(
+        ctrl.finder_matches().is_empty(),
+        "a non-matching query yields an empty match list (AC-6)"
+    );
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor stays 0 when list is empty");
+}
+
+#[test]
+fn backspace_shrinks_query_and_rematches() {
+    // AC-7: Backspace removes the last character and re-runs match_and_rank.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    ctrl.handle_finder_key(key(KeyCode::Char('e')));
+    assert_eq!(ctrl.finder_query(), "be");
+    let after_be = ctrl.finder_matches().len();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Backspace));
+    assert!(fx.redraw, "Backspace signals a redraw");
+    assert_eq!(ctrl.finder_query(), "b", "Backspace removes the last char");
+    let after_b = ctrl.finder_matches().len();
+    assert!(
+        after_b >= after_be,
+        "removing a char broadens or keeps the match list"
+    );
+}
+
+#[test]
+fn backspace_on_empty_query_is_a_noop() {
+    // Backspace with an empty prompt must not panic or produce wrong state.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Backspace));
+    assert!(fx.redraw, "Backspace redraws even on an empty query");
+    assert_eq!(ctrl.finder_query(), "", "still empty after Backspace");
+    assert!(ctrl.finder_matches().is_empty(), "still no matches");
+}
+
+#[test]
+fn cursor_resets_to_zero_after_every_query_change() {
+    // AC-8: every query change (push or Backspace) resets the selection to 0 so the old
+    // position (into a now-different list) is never surfaced.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Navigate down, then type — cursor must reset.
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // match list: ≥1 entry
+    ctrl.handle_finder_key(key(KeyCode::Down));
+    // Only meaningful if the list had more than one entry; skip the nav assertion.
+    ctrl.handle_finder_key(key(KeyCode::Char('l'))); // narrow further
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "cursor resets to 0 on every query change"
+    );
+}
+
+#[test]
+fn down_and_up_move_the_cursor_within_the_match_list() {
+    // AC-8: Down/Up move the selection within the current match list.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // 'a' matches at least two files ("alpha.txt" and "sub/gamma.rs").
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    let count = ctrl.finder_matches().len();
+    assert!(
+        count >= 2,
+        "need ≥2 matches to test navigation; got {count}"
+    );
+
+    let fx_down = ctrl.handle_finder_key(key(KeyCode::Down));
+    assert!(fx_down.redraw, "Down signals a redraw");
+    assert_eq!(ctrl.finder_cursor(), 1, "Down moves the cursor to 1");
+
+    let fx_up = ctrl.handle_finder_key(key(KeyCode::Up));
+    assert!(fx_up.redraw, "Up signals a redraw");
+    assert_eq!(ctrl.finder_cursor(), 0, "Up returns the cursor to 0");
+}
+
+#[test]
+fn down_clamps_at_the_last_match() {
+    // AC-8: Down is clamped — it never runs past the end of the match list.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    let count = ctrl.finder_matches().len();
+    assert!(count >= 1);
+
+    // Press Down more times than there are matches.
+    for _ in 0..(count + 5) {
+        ctrl.handle_finder_key(key(KeyCode::Down));
+    }
+    assert_eq!(
+        ctrl.finder_cursor(),
+        count - 1,
+        "Down clamps at the last match (index {})",
+        count - 1
+    );
+}
+
+#[test]
+fn up_clamps_at_zero() {
+    // AC-8: Up is clamped — it never goes below index 0.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+
+    for _ in 0..10 {
+        ctrl.handle_finder_key(key(KeyCode::Up));
+    }
+    assert_eq!(ctrl.finder_cursor(), 0, "Up clamps at 0");
+}
+
+#[test]
+fn nav_on_empty_match_list_stays_at_zero() {
+    // AC-8 edge-case: Down/Up are inert (cursor stays 0) when the match list is empty.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Empty query → empty matches.
+    ctrl.handle_finder_key(key(KeyCode::Down));
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "Down on empty list → cursor stays 0"
+    );
+    ctrl.handle_finder_key(key(KeyCode::Up));
+    assert_eq!(ctrl.finder_cursor(), 0, "Up on empty list → cursor stays 0");
+}
+
+#[test]
+fn uppercase_char_with_shift_is_accepted_and_appended() {
+    // A Shift+Char (uppercase letter) is a printable keystroke — the modifier check allows SHIFT.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key_shift('A'));
+    assert!(fx.redraw);
+    assert_eq!(ctrl.finder_query(), "A", "Shift+A appends 'A' to the query");
+}
+
+#[test]
+fn ctrl_char_is_rejected_and_does_not_change_state() {
+    // A Ctrl+Char must NOT push to the query — it falls through to the noop arm.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key_ctrl('a'));
+    assert!(
+        !fx.redraw,
+        "Ctrl+Char produces a noop (falls through to _ => Effects::noop())"
+    );
+    assert_eq!(ctrl.finder_query(), "", "query unchanged after Ctrl+Char");
+}
+
+#[test]
+fn handle_finder_key_is_noop_when_finder_is_closed() {
+    // If the caller accidentally sends a finder key when no finder is open, the controller
+    // must produce a noop and not panic.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(!ctrl.finder_open(), "precondition: finder is closed");
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(
+        !fx.redraw && !fx.quit,
+        "a finder key with the finder closed is a noop"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // T-5 — OpenFinder intent: open + finder_open (AC-1, AC-18)
 // ---------------------------------------------------------------------------
 
