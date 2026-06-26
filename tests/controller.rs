@@ -3602,3 +3602,289 @@ fn finder_works_fully_in_a_non_git_directory() {
         "the tree cursor points to the jumped-to file in a non-git root (AC-19)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-12 — Negative criteria & conformance (AC-N1, AC-N2, AC-N4, AC-N5, AC-N6)
+// ---------------------------------------------------------------------------
+
+/// Snapshot every non-.git file under `root` as (relative path, contents).
+/// Excludes the .git directory so git-internal ref changes do not interfere
+/// with the read-only assertion (AC-N2 uses `git status --porcelain` for that).
+fn snapshot_no_git(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            // Skip the .git directory — git internals change on every query.
+            if p.file_name().map(|n| n == ".git").unwrap_or(false) {
+                continue;
+            }
+            let rel = p.strip_prefix(root).unwrap().to_path_buf();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
+fn ac_n1_finder_enter_journey_leaves_filesystem_unchanged() {
+    // AC-N1: the viewer is read-only — a full finder exercise (open → type → Enter-jump)
+    // must not create, rename, move, or delete any file.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    let before = snapshot_no_git(dir.path());
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    // Open the finder.
+    ctrl.handle(Intent::OpenFinder);
+    // Type a query ('b' matches "beta.rs").
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    // Confirm with Enter (reveal + render).
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    let after = snapshot_no_git(dir.path());
+    assert_eq!(
+        after, before,
+        "AC-N1: the filesystem must be unchanged after open→type→Enter-jump"
+    );
+}
+
+#[test]
+fn ac_n1_finder_esc_journey_leaves_filesystem_unchanged() {
+    // AC-N1: Esc-cancel must also leave the filesystem completely unchanged.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    let before = snapshot_no_git(dir.path());
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    ctrl.handle_finder_key(key(KeyCode::Esc));
+
+    let after = snapshot_no_git(dir.path());
+    assert_eq!(
+        after, before,
+        "AC-N1: the filesystem must be unchanged after open→type→Esc-cancel"
+    );
+}
+
+#[test]
+fn ac_n2_finder_exercise_does_not_mutate_git_state() {
+    // AC-N2: no git mutation — git status --porcelain and HEAD must be unchanged after a full
+    // finder exercise (open → type → Enter-jump) in a git repository.
+    let dir = TempDir::new();
+    common::init_repo_with_commit(dir.path());
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn lib() {}").unwrap();
+
+    let status_before = common::git(dir.path(), &["status", "--porcelain"]);
+    let head_before = common::git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let (mut ctrl, _, _) = controller(dir.path(), true, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('m'))); // matches "main.rs"
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    let status_after = common::git(dir.path(), &["status", "--porcelain"]);
+    let head_after = common::git(dir.path(), &["rev-parse", "HEAD"]);
+
+    assert_eq!(
+        status_after, status_before,
+        "AC-N2: git status --porcelain must be unchanged after the finder exercise"
+    );
+    assert_eq!(
+        head_after, head_before,
+        "AC-N2: HEAD commit must be unchanged after the finder exercise"
+    );
+}
+
+#[test]
+fn ac_n4_fresh_controller_rebuilds_candidates_from_disk_with_no_persistent_state() {
+    // AC-N4: the finder writes no state to disk. A second, fresh Controller over the same root
+    // must produce the same candidate set as index::build(root), and the filesystem must be
+    // unchanged (no cache file created by the first controller's use of the finder).
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    // First controller: open finder, type, confirm.
+    {
+        let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+        ctrl.handle(Intent::OpenFinder);
+        ctrl.handle_finder_key(key(KeyCode::Char('b')));
+        ctrl.handle_finder_key(key(KeyCode::Enter));
+        assert!(!ctrl.finder_open(), "finder closed after Enter");
+    }
+
+    // No new file must have appeared under root from the first session.
+    let files_after: Vec<_> = snapshot_no_git(dir.path())
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    let expected_files: Vec<PathBuf> = {
+        let mut v = vec![
+            PathBuf::from("alpha.txt"),
+            PathBuf::from("beta.rs"),
+            PathBuf::from("sub/gamma.rs"),
+        ];
+        v.sort();
+        v
+    };
+    let mut actual_sorted = files_after.clone();
+    actual_sorted.sort();
+    assert_eq!(
+        actual_sorted, expected_files,
+        "AC-N4: no new file must appear under root from using the finder"
+    );
+
+    // Second, fresh controller: candidates must match index::build(root).
+    let (mut ctrl2, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl2.handle(Intent::OpenFinder);
+    assert!(ctrl2.finder_open(), "fresh controller opened the finder");
+
+    let mut got = ctrl2.finder_candidates().to_vec();
+    got.sort();
+    let mut expected_candidates = herdr_file_viewer::index::build(dir.path());
+    expected_candidates.sort();
+
+    assert_eq!(
+        got, expected_candidates,
+        "AC-N4: a fresh Controller must rebuild candidates from disk (no persisted state)"
+    );
+}
+
+#[test]
+fn ac_n5_every_candidate_is_relative_and_under_root() {
+    // AC-N5: every path returned by finder_candidates() is a root-relative string —
+    // no leading `/`, no `..`, and every absolute resolution lands under root.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub").join("deep")).unwrap();
+    std::fs::write(dir.path().join("sub").join("deep").join("gamma.rs"), "c").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open());
+
+    let root = ctrl.root().to_path_buf();
+    let candidates = ctrl.finder_candidates().to_vec();
+    assert!(
+        !candidates.is_empty(),
+        "precondition: at least one candidate"
+    );
+
+    for candidate in &candidates {
+        // Must not be absolute (no leading /).
+        assert!(
+            !candidate.starts_with('/'),
+            "AC-N5: candidate must not be absolute: {candidate:?}"
+        );
+        // Must not traverse out of root with '..'.
+        assert!(
+            !candidate.contains(".."),
+            "AC-N5: candidate must not contain '..': {candidate:?}"
+        );
+        // Absolute resolution must land under root.
+        let abs = root.join(candidate);
+        assert!(
+            abs.starts_with(&root),
+            "AC-N5: absolute resolution of {candidate:?} must be under root {root:?}"
+        );
+        assert!(
+            abs.exists(),
+            "AC-N5: resolved path must exist on disk: {abs:?}"
+        );
+    }
+}
+
+#[test]
+fn ac_n5_reveal_target_resolves_under_root() {
+    // AC-N5 (controller-level): after Enter-confirm, the tree's selected node path is under root.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("beta.rs"), "b").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let root = ctrl.root().to_path_buf();
+
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('b'))); // matches "sub/beta.rs"
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(!ctrl.finder_open(), "finder closed after Enter");
+
+    let selected = ctrl
+        .tree()
+        .selected()
+        .expect("a node is selected after reveal");
+    assert!(
+        selected.path.starts_with(&root),
+        "AC-N5: reveal target {:?} must be under root {:?}",
+        selected.path,
+        root
+    );
+}
+
+#[test]
+fn ac_n6_only_open_finder_intent_opens_the_finder() {
+    // AC-N6: the finder opens ONLY via Intent::OpenFinder. No other intent in Intent::ALL
+    // opens the finder overlay when it is called on a controller where the finder is closed.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("b.txt"), "x").unwrap();
+
+    for intent in Intent::ALL {
+        if intent == Intent::OpenFinder || intent == Intent::Close {
+            continue; // OpenFinder is the one that should open it; Close ends the session
+        }
+        // Fresh controller for each intent to avoid accumulated state.
+        let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+        assert!(!ctrl.finder_open(), "precondition: finder starts closed");
+
+        let _ = ctrl.handle(intent);
+
+        assert!(
+            !ctrl.finder_open(),
+            "AC-N6: handling {:?} must NOT open the finder (only Intent::OpenFinder may)",
+            intent
+        );
+    }
+}
+
+#[test]
+fn ac_n6_open_finder_intent_does_open_the_finder() {
+    // AC-N6 (positive side): Intent::OpenFinder is the one and only intent that opens the finder.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    assert!(!ctrl.finder_open(), "finder starts closed");
+    ctrl.handle(Intent::OpenFinder);
+    assert!(
+        ctrl.finder_open(),
+        "AC-N6: Intent::OpenFinder must open the finder"
+    );
+}
