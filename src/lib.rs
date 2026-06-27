@@ -22,6 +22,7 @@ pub mod presenter;
 pub mod prompt;
 pub mod render;
 pub mod root;
+pub mod search;
 pub mod tree;
 pub mod update;
 pub mod view_policy;
