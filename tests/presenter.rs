@@ -2228,3 +2228,42 @@ fn finder_geometry_agrees_with_draw_for_mouse_click_hit_testing() {
         "a position inside finder_rows at the drawn row must be contained in the rect"
     );
 }
+
+#[test]
+fn finder_geometry_exposes_the_scrollbar_track_only_when_rows_overflow() {
+    // The finder's vertical scrollbar track is fed back via geometry().finder_vbar so the controller
+    // can map a press/drag on it to a selection (click-drag scroll). It is Some exactly when the
+    // match rows overflow the visible height, and is the gutter column right of the rows
+    // (x == rows.x + rows.width) — the SAME rect draw_finder_overlay renders the scrollbar into.
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 16,
+    };
+
+    // Overflow: 30 matches in a height-16 terminal → the bar is present and aligned to the rows.
+    let overflow = finder_state_overflow();
+    let g = geometry(area, &overflow);
+    let rows = g.finder_rows.expect("rows present with matches");
+    let vbar = g
+        .finder_vbar
+        .expect("geometry().finder_vbar must be Some when the rows overflow");
+    assert_eq!(
+        vbar.x,
+        rows.x + rows.width,
+        "the bar sits in the gutter column right of the rows"
+    );
+    assert_eq!(vbar.y, rows.y, "the bar aligns with the rows top");
+    assert_eq!(vbar.height, rows.height, "the bar spans the rows height");
+    assert_eq!(vbar.width, 1, "the bar is one column wide");
+
+    // No overflow: a few matches that fit → no bar.
+    let small = finder_state_with_matches();
+    assert!(
+        geometry(area, &small).finder_vbar.is_none(),
+        "geometry().finder_vbar must be None when every match row fits"
+    );
+}

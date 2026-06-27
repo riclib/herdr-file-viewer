@@ -563,6 +563,10 @@ pub struct PaneGeometry {
     /// right parks the offset past the real maximum and the first few left presses appear to do
     /// nothing while it burns back down.
     pub finder_max_hscroll: u16,
+    /// The finder's vertical scrollbar track rect (1-cell gutter right of the rows), present only
+    /// when the match rows overflow. `None` when the finder is closed or every row fits. Lets the
+    /// controller map a press/drag on the bar to a selection position (click-drag scroll).
+    pub finder_vbar: Option<Rect>,
 }
 
 /// Compute the [`PaneGeometry`] for hit-testing the current frame — the same layout [`draw`]
@@ -618,16 +622,17 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     // Finder: if the finder overlay is open, compute its layout with the same helper
     // `draw_finder_overlay` uses (same `area` = `frame.area()` = the full terminal rect),
     // so the hit-test geometry agrees with what is drawn.
-    let (finder_rows, finder_scroll, finder_max_hscroll) = match &state.finder {
+    let (finder_rows, finder_scroll, finder_max_hscroll, finder_vbar) = match &state.finder {
         Some(finder) => {
             let fl = finder_overlay_layout(area, finder);
             (
                 fl.rows_area,
                 fl.offset.min(u16::MAX as usize) as u16,
                 fl.max_hscroll,
+                fl.vbar,
             )
         }
-        None => (None, 0, 0),
+        None => (None, 0, 0, None),
     };
 
     PaneGeometry {
@@ -645,6 +650,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         finder_rows,
         finder_scroll,
         finder_max_hscroll,
+        finder_vbar,
     }
 }
 
@@ -951,6 +957,10 @@ struct FinderLayout {
     /// feeds it back so the controller clamps the *stored* offset to the same value, so the two can
     /// never disagree (which is what made an over-scroll-right need several left presses to undo).
     max_hscroll: u16,
+    /// The vertical scrollbar track rect (the 1-cell gutter column right of the rows), present only
+    /// when the match rows overflow the visible height. The SAME rect `draw_finder_overlay` renders
+    /// the scrollbar into and `geometry` feeds back, so a press/drag on it hit-tests where it's drawn.
+    vbar: Option<Rect>,
 }
 
 /// Compute the finder overlay's layout geometry for the given frame `area` and `finder` draw
@@ -1049,12 +1059,25 @@ fn finder_overlay_layout(area: Rect, finder: &FinderView) -> FinderLayout {
         None => 0,
     };
 
+    // Vertical scrollbar track (the gutter column right of the rows), present only when the match
+    // rows overflow the visible height — the SAME rect draw renders into and geometry feeds back.
+    let vbar = match rows_area {
+        Some(ra) if match_lines.len() > ra.height as usize => Some(Rect {
+            x: ra.x + ra.width,
+            y: ra.y,
+            width: 1,
+            height: ra.height,
+        }),
+        _ => None,
+    };
+
     FinderLayout {
         popup,
         query_area,
         rows_area,
         offset,
         max_hscroll,
+        vbar,
     }
 }
 
@@ -1140,18 +1163,11 @@ fn draw_finder_overlay(frame: &mut Frame, area: Rect, finder: &FinderView) {
         let hscroll = finder.hscroll.min(layout.max_hscroll);
         frame.render_widget(Paragraph::new(window).scroll((0, hscroll)), rows_area);
 
-        // Vertical scrollbar when match rows overflow.
-        let total = finder.matches.len();
-        if total > visible {
-            // The scrollbar tracks the cursor position (not the viewport offset) so it follows the
-            // selection — same idiom as the tree's vertical scrollbar.
-            let sb_state = scrollbar_state(total, finder.cursor, visible);
-            let sb_area = Rect {
-                x: rows_area.x + rows_area.width,
-                y: rows_area.y,
-                width: 1,
-                height: rows_area.height,
-            };
+        // Vertical scrollbar when match rows overflow. The track rect is `layout.vbar` — the same
+        // rect `geometry` feeds back so a press/drag on it hit-tests where it is drawn. It tracks the
+        // cursor position (not the viewport offset) so it follows the selection, like the tree bar.
+        if let Some(sb_area) = layout.vbar {
+            let sb_state = scrollbar_state(finder.matches.len(), finder.cursor, visible);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .thumb_symbol("▐")

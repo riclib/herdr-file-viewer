@@ -922,6 +922,9 @@ impl Controller {
                 Some(Drag::ContentH) => self.scroll_content_h_to_col(col),
                 Some(Drag::TreeV) => self.scroll_tree_to_row(row),
                 Some(Drag::TreeH) => self.scroll_tree_h_to_col(col),
+                // The finder is modal: its scrollbar drag is handled in handle_finder_mouse and
+                // never reaches this (non-finder) path. Covered here only for exhaustiveness.
+                Some(Drag::FinderV) => Effects::noop(),
                 None => Effects::noop(),
             },
             MouseEventKind::Up(MouseButton::Left) => {
@@ -947,6 +950,7 @@ impl Controller {
     /// - `Down`/`Drag`/other → inert no-op (no drag in the finder).
     /// - `Shift`+mouse → inert (terminal selection, same as the main gate).
     fn handle_finder_mouse(&mut self, ev: MouseEvent) -> Effects {
+        use ratatui::layout::Position;
         // Shift+mouse: terminal selection — inert, same as the main mouse gate.
         if ev.modifiers.contains(KeyModifiers::SHIFT) {
             return Effects::noop();
@@ -972,10 +976,65 @@ impl Controller {
                     Effects::noop()
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.handle_finder_click(ev.column, ev.row),
-            // Down / Drag / other: inert (no drag in the finder).
+            // A press on the finder's vertical scrollbar starts a scroll-drag AND jumps the
+            // selection to the pressed position (click-to-scroll), mirroring the content/tree bars.
+            // Any other press waits for the release (a click on a result row). Always (re)set `drag`
+            // from the press so a stale drag can't keep acting on later moves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = if self.geom.finder_vbar.is_some_and(|t| {
+                    t.contains(Position {
+                        x: ev.column,
+                        y: ev.row,
+                    })
+                }) {
+                    Some(Drag::FinderV)
+                } else {
+                    None
+                };
+                if matches!(self.drag, Some(Drag::FinderV)) {
+                    self.finder_scroll_to_row(ev.row)
+                } else {
+                    Effects::noop()
+                }
+            }
+            // Continue a scrollbar drag: map the row to a selection position.
+            MouseEventKind::Drag(MouseButton::Left) if matches!(self.drag, Some(Drag::FinderV)) => {
+                self.finder_scroll_to_row(ev.row)
+            }
+            // A release ends a scrollbar drag (not a row click); otherwise it is a click on a row.
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    self.last_click = None; // a drag-release is not a click; break double-click pairing
+                    Effects::noop()
+                } else {
+                    self.handle_finder_click(ev.column, ev.row)
+                }
+            }
+            // Other events (right/middle button, Moved, a Drag with no active finder drag): inert.
             _ => Effects::noop(),
         }
+    }
+
+    /// Map a vertical press/drag on the finder's scrollbar track (`geom.finder_vbar`) to a
+    /// selection position: the fraction along the track maps linearly onto the match list and moves
+    /// the cursor (the finder window follows the cursor, and the scrollbar thumb tracks it). No-op
+    /// without a drawn bar or any matches.
+    fn finder_scroll_to_row(&mut self, row: u16) -> Effects {
+        let Some(track) = self.geom.finder_vbar else {
+            return Effects::noop();
+        };
+        let (rel, span) = Self::track_fraction(row, track.y, track.height);
+        let Some(finder) = self.finder.as_mut() else {
+            return Effects::noop();
+        };
+        let total = finder.matches().len();
+        if span == 0 || total == 0 {
+            return Effects::noop();
+        }
+        let max = (total - 1) as u32;
+        let idx = ((rel * max + span / 2) / span) as usize;
+        finder.set_cursor(idx);
+        Effects::redraw()
     }
 
     /// Move the finder selection by `delta` rows (positive = down, negative = up), clamped. A
@@ -2046,6 +2105,8 @@ enum Drag {
     ContentH,
     TreeV,
     TreeH,
+    /// Dragging the finder overlay's vertical scrollbar (handled in `handle_finder_mouse`).
+    FinderV,
 }
 
 /// Two left-clicks on the same **row** within [`DOUBLE_CLICK`] are a double-click. The column

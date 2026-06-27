@@ -984,6 +984,7 @@ fn wide_geometry() -> PaneGeometry {
         finder_rows: None,
         finder_scroll: 0,
         finder_max_hscroll: 0,
+        finder_vbar: None,
     }
 }
 
@@ -3937,6 +3938,63 @@ fn finder_hscroll_does_not_overshoot_past_the_measured_max() {
     assert!(
         ctrl.finder_hscroll() < 8,
         "one Left press moves immediately after the clamp (the bug was: it needed several)"
+    );
+}
+
+#[test]
+fn finder_scrollbar_is_click_draggable() {
+    // Live-test fix: the finder's vertical scrollbar must be click-draggable like the tree/content
+    // bars. A press on the track jumps the selection to that fractional position, a drag continues
+    // it (the window follows the cursor, so the list scrolls), and the release ends the drag —
+    // it must NOT be treated as a row click / confirm.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // matches alpha.txt, beta.rs, sub/gamma.rs
+    let total = ctrl.finder_matches().len();
+    assert!(
+        total >= 3,
+        "need >=3 matches for a meaningful scrollbar range; got {total}"
+    );
+
+    // A geometry whose finder vbar track spans rows 12..=21 (height 10) — as the Presenter would
+    // feed back when the rows overflow.
+    let geom = PaneGeometry {
+        finder_vbar: Some(Rect {
+            x: 40,
+            y: 12,
+            width: 1,
+            height: 10,
+        }),
+        ..finder_geometry_with_rows()
+    };
+    ctrl.set_pane_geometry(geom);
+
+    // Press at the BOTTOM of the track → selection jumps to the last match.
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 21));
+    assert!(fx.redraw, "a scrollbar press redraws");
+    assert_eq!(
+        ctrl.finder_cursor(),
+        total - 1,
+        "press at the track bottom selects the last match"
+    );
+    assert!(
+        ctrl.finder_open(),
+        "the finder stays open — a scrollbar press is not a confirm"
+    );
+
+    // Drag to the TOP of the track → selection jumps to the first match.
+    ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 12));
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "dragging to the track top selects the first match"
+    );
+
+    // Release ends the drag without confirming.
+    let up = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 40, 12));
+    assert!(!up.redraw, "the drag-release is inert (not a row click)");
+    assert!(
+        ctrl.finder_open(),
+        "release ends the drag; the finder stays open"
     );
 }
 
