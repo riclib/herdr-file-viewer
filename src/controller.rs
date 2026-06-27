@@ -2146,7 +2146,17 @@ impl Controller {
             // Commit — retain the SearchState; Esc-cancel (T-11) is the path that clears it.
             // Close the prompt but leave self.search intact so n/N can navigate the committed
             // matches (AC-14). The query, matches, and current index persist.
+            // Exception: an empty query commits nothing — clear search so no phantom
+            // "Search: (no matches)" state persists after the prompt closes.
             KeyCode::Enter => {
+                let empty = self
+                    .prompt
+                    .as_ref()
+                    .map(|p| p.input.query().is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    self.search = None;
+                }
                 self.prompt = None;
                 Effects::redraw()
             }
@@ -2169,10 +2179,8 @@ impl Controller {
     /// (AC-19). Scrolls the new current match into view.
     fn next_match(&mut self) -> Effects {
         // A committed search exists iff self.search is Some, non-empty, AND the prompt is closed.
-        let (len, current, line) = match self.search.as_ref() {
-            Some(s) if !s.matches.is_empty() && !self.prompt_open() => {
-                (s.matches.len(), s.current, s.matches[s.current].line)
-            }
+        let (len, current) = match self.search.as_ref() {
+            Some(s) if !s.matches.is_empty() && !self.prompt_open() => (s.matches.len(), s.current),
             _ => return Effects::noop(),
         };
         // Copy the fields we need before taking &mut self — borrow checker.
@@ -2180,7 +2188,6 @@ impl Controller {
         let next_current = (current + 1) % len;
         // Compute the next match's line before mutating self.search.
         let next_line = self.search.as_ref().unwrap().matches[next_current].line;
-        let _ = line; // suppress unused warning; we use next_line instead
         if let Some(s) = self.search.as_mut() {
             s.current = next_current;
         }
@@ -2527,6 +2534,15 @@ impl Controller {
                 {
                     self.scroll_to_line(line);
                     self.pending_goto = None;
+                }
+                // A render that was in flight when a search was opened/committed lands here and
+                // swaps self.content; matches computed against the OLD content are now stale.
+                // Mirror dispatch_render's AC-20 clear: recompute an open Search prompt against
+                // the new content, else drop a committed search.
+                if self.prompt.as_ref().map(|p| p.mode) == Some(crate::infile::PromptMode::Search) {
+                    self.refresh_search();
+                } else {
+                    self.search = None;
                 }
             }
             // else: a superseded selection's render — drop it.

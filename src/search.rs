@@ -1,7 +1,7 @@
 //! Search Matcher — pure substring search over a slice of lines.
 //!
-//! Implements smartcase: a query that contains no uppercase letters is matched
-//! case-insensitively (ASCII case folding); a query containing any uppercase letter
+//! Implements smartcase: a query that contains no uppercase ASCII letters is matched
+//! case-insensitively (ASCII case folding); a query containing any uppercase ASCII letter
 //! is matched case-sensitively. Regex metacharacters are not interpreted — the query
 //! is always treated as a literal substring.
 //!
@@ -9,8 +9,9 @@
 //! `Match::start` and `Match::end` are **byte offsets** into the original (un-folded) line
 //! string such that `&lines[m.line][m.start..m.end]` is a valid UTF-8 slice equal to the
 //! matched text. ASCII case folding is used for the case-insensitive path so byte offsets
-//! stay aligned with the original line; non-ASCII letters compare case-sensitively, which is
-//! acceptable for a code/diff viewer whose content is overwhelmingly ASCII.
+//! stay aligned with the original line; non-ASCII uppercase letters trigger the case-sensitive
+//! path (the check is `is_ascii_uppercase`), so non-ASCII uppercase queries are matched
+//! case-sensitively (byte offsets remain valid into the original line).
 
 /// A single non-overlapping substring match.
 ///
@@ -37,60 +38,33 @@ pub fn find_matches(query: &str, lines: &[String]) -> Vec<Match> {
 
     // Determine case-sensitivity once for the whole call.
     let case_sensitive = query.chars().any(|c| c.is_ascii_uppercase());
-
-    if case_sensitive {
-        find_matches_case_sensitive(query, lines)
+    // In the case-insensitive path fold the needle once; ASCII fold is byte-length-preserving,
+    // so match_indices offsets into the folded line stay valid into the original line.
+    let needle = if case_sensitive {
+        query.to_string()
     } else {
-        find_matches_case_insensitive(query, lines)
-    }
-}
+        query.to_ascii_lowercase()
+    };
 
-fn find_matches_case_sensitive(query: &str, lines: &[String]) -> Vec<Match> {
     let mut matches = Vec::new();
     for (line_idx, line) in lines.iter().enumerate() {
-        // `str::match_indices` yields byte offsets directly.
-        let mut search_start = 0usize;
-        while search_start <= line.len().saturating_sub(query.len()) {
-            match line[search_start..].find(query) {
-                Some(offset) => {
-                    let start = search_start + offset;
-                    let end = start + query.len();
-                    matches.push(Match {
-                        line: line_idx,
-                        start,
-                        end,
-                    });
-                    search_start = end; // non-overlapping: resume after this match
-                }
-                None => break,
+        // Avoid allocating in the case-sensitive path; fold only when needed.
+        if case_sensitive {
+            for (start, m) in line.match_indices(needle.as_str()) {
+                matches.push(Match {
+                    line: line_idx,
+                    start,
+                    end: start + m.len(),
+                });
             }
-        }
-    }
-    matches
-}
-
-fn find_matches_case_insensitive(query: &str, lines: &[String]) -> Vec<Match> {
-    // Fold the query once.
-    let query_folded = query.to_ascii_lowercase();
-    let mut matches = Vec::new();
-
-    for (line_idx, line) in lines.iter().enumerate() {
-        // Fold the line for matching; offsets align because ASCII fold is byte-length-preserving.
-        let line_folded = line.to_ascii_lowercase();
-        let mut search_start = 0usize;
-        while search_start <= line_folded.len().saturating_sub(query_folded.len()) {
-            match line_folded[search_start..].find(query_folded.as_str()) {
-                Some(offset) => {
-                    let start = search_start + offset;
-                    let end = start + query_folded.len();
-                    matches.push(Match {
-                        line: line_idx,
-                        start,
-                        end,
-                    });
-                    search_start = end;
-                }
-                None => break,
+        } else {
+            let folded = line.to_ascii_lowercase();
+            for (start, m) in folded.match_indices(needle.as_str()) {
+                matches.push(Match {
+                    line: line_idx,
+                    start,
+                    end: start + m.len(),
+                });
             }
         }
     }

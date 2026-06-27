@@ -58,9 +58,9 @@ pub fn apply(lines: &[Line<'static>], matches: &[Match], current: usize) -> Vec<
             }
 
             // Reconstruct the plain text ONCE per line for boundary validation.
-            let line_text_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
             let plain: String = {
-                let mut s = String::with_capacity(line_text_len);
+                let cap: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                let mut s = String::with_capacity(cap);
                 for span in &line.spans {
                     s.push_str(&span.content);
                 }
@@ -72,7 +72,7 @@ pub fn apply(lines: &[Line<'static>], matches: &[Match], current: usize) -> Vec<
             let validated: Vec<(usize, usize, bool)> = line_matches
                 .iter()
                 .filter_map(|&(global_idx, m)| {
-                    validate_match_plain(&plain, line_text_len, m).map(|(s, e)| {
+                    validate_match_plain(&plain, m).map(|(s, e)| {
                         let is_current = global_idx == current;
                         (s, e, is_current)
                     })
@@ -101,8 +101,8 @@ pub fn apply(lines: &[Line<'static>], matches: &[Match], current: usize) -> Vec<
 /// Accepts the line's already-concatenated plain text (built once per line in
 /// `apply`) so validation costs O(1) per match instead of O(spans) per match.
 /// Returns `Some((start, end))` if the match is usable, `None` to skip.
-fn validate_match_plain(plain: &str, line_text_len: usize, m: &Match) -> Option<(usize, usize)> {
-    if m.start > m.end || m.end > line_text_len {
+fn validate_match_plain(plain: &str, m: &Match) -> Option<(usize, usize)> {
+    if m.start > m.end || m.end > plain.len() {
         return None;
     }
     if m.start == m.end {

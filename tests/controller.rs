@@ -6094,6 +6094,177 @@ fn incremental_search_typing_does_not_clear_search_via_dispatch_render() {
     );
 }
 
+// ── FIX 1 regression: poll() must clear a stale committed search when content swaps ────────
+
+/// A content provider that returns different text for each file path:
+///   - "a.txt" → lines with "needle"
+///   - anything else → lines with "different" but no "needle"
+///
+/// This lets us prove that poll() clearing search on content swap is file-dependent
+/// (i.e., stale matches from "needle" content are gone after the swap to non-needle content).
+struct SwitchingContent;
+impl ContentProvider for SwitchingContent {
+    fn render(&self, path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let lines: Vec<String> = if name == "a.txt" {
+            (0..10)
+                .map(|i| {
+                    if i == 2 {
+                        "needle here".to_string()
+                    } else {
+                        format!("line{i}")
+                    }
+                })
+                .collect()
+        } else {
+            (0..10).map(|i| format!("other{i}")).collect()
+        };
+        RenderResult {
+            content: Text::raw(lines.join("\n")),
+            notices: Vec::new(),
+        }
+    }
+}
+
+#[test]
+fn poll_clears_stale_committed_search_after_content_swap() {
+    // FIX 1 / AC-20 race: poll() must clear a committed search when content swaps.
+    //
+    // Race window: dispatch_render fires (clears self.search, bumps latest_seq, enqueues job),
+    // then the user opens search + commits before poll() brings in the new content. The
+    // committed search has matches against the OLD content; poll() must clear it so stale
+    // highlights are not overlaid on the NEW content.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap(); // file A → "needle" content
+    std::fs::write(dir.path().join("b.txt"), "y\n").unwrap(); // file B → "other" content
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(StubGit::default()),
+            content: Box::new(SwitchingContent),
+        }),
+        editor: Box::new(StubEditor {
+            fail: false,
+            opened: Arc::new(Mutex::new(Vec::new())),
+        }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    // Step 1: land the initial render for a.txt (contains "needle").
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 20);
+
+    // Step 2: NavDown → selects b.txt, dispatch_render fires:
+    //   - self.search is cleared (None) by dispatch_render
+    //   - latest_seq is bumped; the b.txt render job is in flight
+    //   - We do NOT poll here — b.txt content has NOT arrived yet.
+    ctrl.handle(Intent::NavDown);
+    // dispatch_render already cleared search; a.txt content is still displayed.
+
+    // Step 3: Open search and commit a search against the currently-displayed (stale) content.
+    //   This is the race window: user opens `/` and hits Enter before poll() fires.
+    ctrl.handle(Intent::OpenSearch);
+    assert!(ctrl.prompt_open(), "precondition: prompt is open");
+    for c in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    // search is Some with matches against stale a.txt content.
+    assert!(
+        ctrl.search().is_some(),
+        "precondition: search is Some with stale matches after typing"
+    );
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    // Commit: prompt closed, search.Some persists with stale matches.
+    assert!(
+        ctrl.search().is_some(),
+        "precondition: committed search is Some (stale matches against a.txt content)"
+    );
+
+    // Step 4: poll() — the b.txt render lands, content swaps.
+    // Without FIX 1 this leaves self.search = Some (stale matches overlaid on b.txt content).
+    // With FIX 1 poll() must clear self.search because the prompt is closed (committed search).
+    await_marker(&mut ctrl, "other"); // spin until b.txt content arrives
+
+    // Step 5: assert stale search was cleared by poll().
+    assert!(
+        ctrl.search().is_none(),
+        "FIX 1 / AC-20: poll() must clear a committed search when content swaps (stale matches must not persist)"
+    );
+}
+
+// ── FIX 3: empty-query Enter must not commit a phantom search ───────────────────────────────
+
+#[test]
+fn empty_query_enter_clears_search_not_phantom() {
+    // FIX 3: pressing Enter on an empty query must clear self.search (not leave a phantom
+    // "Search: (no matches)" state). A subsequent Close must quit, not absorb the phantom.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5);
+
+    // Open search, type one character, then backspace to empty the query.
+    ctrl.handle(Intent::OpenSearch);
+    ctrl.handle_prompt_key(key(KeyCode::Char('n')));
+    assert!(
+        ctrl.search().is_some(),
+        "precondition: search is Some after typing 'n'"
+    );
+    ctrl.handle_prompt_key(key(KeyCode::Backspace));
+    // Query is now empty; search should still be Some (no-match state from refresh_search).
+
+    // Press Enter with empty query.
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+
+    // After Enter on empty query: search must be None (not a phantom committed state).
+    assert!(
+        ctrl.search().is_none(),
+        "FIX 3: Enter on empty query must clear search, not commit a phantom"
+    );
+    assert!(!ctrl.prompt_open(), "prompt is closed after Enter");
+}
+
+// ── FIX 7: AC-20 baseline-toggle clears committed search ───────────────────────────────────
+
+#[test]
+fn content_change_clears_committed_search_baseline_toggle() {
+    // AC-20 (content change clears committed search): toggling the baseline calls
+    // dispatch_render which must clear a committed SearchState.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    // Use a git-backed controller so ToggleBaseline is not inert.
+    let (mut ctrl, _, _) = controller(dir.path(), true, StubGit::default(), false);
+    // Land the initial render using SearchContent (we need "needle" in the content).
+    // Use controller_with_search_content instead so we can commit a meaningful search.
+    // Actually: reuse the simpler path — StubContent renders "stub-content", search for "stub".
+    await_marker(&mut ctrl, "stub-content");
+    ctrl.set_content_viewport(40, 5);
+
+    // Commit a search for "stub".
+    ctrl.handle(Intent::OpenSearch);
+    for c in "stub".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(
+        ctrl.search().is_some(),
+        "precondition: search is Some after commit"
+    );
+
+    // Toggle baseline — this calls dispatch_render which clears search (AC-20).
+    ctrl.handle(Intent::ToggleBaseline);
+
+    // AC-20: the committed search must be cleared synchronously by dispatch_render.
+    assert!(
+        ctrl.search().is_none(),
+        "AC-20: ToggleBaseline clears the committed search via dispatch_render"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-15 — Negative criteria & conformance (AC-N1, AC-N2, AC-N3, AC-N4, AC-N6)
 // ---------------------------------------------------------------------------
