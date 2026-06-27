@@ -5630,3 +5630,272 @@ fn search_enter_closes_prompt() {
     ctrl.handle_prompt_key(key(KeyCode::Enter));
     assert!(!ctrl.prompt_open(), "Enter closes the search prompt");
 }
+
+// ── T-10: Search commit + n/N + wrap ─────────────────────────────────────────
+
+#[test]
+fn search_enter_commits_retaining_search_state() {
+    // AC-14: Enter closes the prompt but retains the SearchState (query + matches + current).
+    // The committed SearchState must be non-None with the same matches as before Enter.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5);
+
+    // Open search and type "needle" → 4 matches.
+    ctrl.handle(Intent::OpenSearch);
+    for c in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    let matches_before = ctrl
+        .search()
+        .expect("SearchState after typing")
+        .matches
+        .len();
+    assert_eq!(matches_before, 4, "precondition: 4 'needle' matches");
+
+    // Press Enter to commit.
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+
+    // Prompt must be closed.
+    assert!(!ctrl.prompt_open(), "AC-14: Enter closes the prompt");
+    // SearchState must be retained (not cleared).
+    let s = ctrl
+        .search()
+        .expect("AC-14: SearchState retained after Enter");
+    assert_eq!(
+        s.matches.len(),
+        4,
+        "AC-14: all 4 matches are retained after commit"
+    );
+    assert_eq!(s.current, 0, "AC-14: current stays at 0 after commit");
+}
+
+#[test]
+fn next_match_advances_current_and_scrolls() {
+    // AC-15: after a committed search, n advances current (document order) and scrolls.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5); // 20 lines; needle at 0-based 1,4,9,14
+
+    // Commit a search for "needle".
+    ctrl.handle(Intent::OpenSearch);
+    for c in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(!ctrl.prompt_open(), "precondition: prompt closed");
+    assert_eq!(ctrl.search().unwrap().current, 0, "precondition: current=0");
+
+    // First NextMatch: 0 → 1 (match at line 4, 0-based).
+    let fx = ctrl.handle(Intent::NextMatch);
+    assert!(fx.redraw, "AC-15: NextMatch returns redraw");
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        1,
+        "AC-15: n advances current 0→1"
+    );
+    // scroll_to_line(5) → offset 4 (line 4, 0-based, → 1-based = 5, offset = 5-1 = 4).
+    assert_eq!(
+        ctrl.content_scroll(),
+        4,
+        "AC-15: scrolled to match at line 4"
+    );
+
+    // Second NextMatch: 1 → 2 (match at line 9, 0-based).
+    ctrl.handle(Intent::NextMatch);
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        2,
+        "AC-15: n advances current 1→2"
+    );
+    assert_eq!(
+        ctrl.content_scroll(),
+        9,
+        "AC-15: scrolled to match at line 9"
+    );
+}
+
+#[test]
+fn prev_match_retreats_current_and_scrolls() {
+    // AC-15: PrevMatch retreats current (document order) and scrolls.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5);
+
+    // Commit search, advance to match 2.
+    ctrl.handle(Intent::OpenSearch);
+    for c in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle(Intent::NextMatch); // → 1
+    ctrl.handle(Intent::NextMatch); // → 2
+    assert_eq!(ctrl.search().unwrap().current, 2, "precondition: current=2");
+
+    // PrevMatch: 2 → 1.
+    let fx = ctrl.handle(Intent::PrevMatch);
+    assert!(fx.redraw, "AC-15: PrevMatch returns redraw");
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        1,
+        "AC-15: N retreats current 2→1"
+    );
+    assert_eq!(ctrl.content_scroll(), 4, "AC-15: scrolled to line 4");
+
+    // PrevMatch again: 1 → 0.
+    ctrl.handle(Intent::PrevMatch);
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        0,
+        "AC-15: N retreats current 1→0"
+    );
+    assert_eq!(ctrl.content_scroll(), 1, "AC-15: scrolled to line 1");
+}
+
+#[test]
+fn next_match_wraps_past_last_with_notice() {
+    // AC-16: advancing past the last match wraps to the first and sets a wrap notice.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5);
+
+    // Commit search for "needle" (4 matches; current=0).
+    ctrl.handle(Intent::OpenSearch);
+    for c in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+
+    // Advance to the last match (index 3).
+    ctrl.handle(Intent::NextMatch); // → 1
+    ctrl.handle(Intent::NextMatch); // → 2
+    ctrl.handle(Intent::NextMatch); // → 3
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        3,
+        "precondition: at last match"
+    );
+    // Clear notice (NextMatch at non-wrapping positions may have set none, but advance_search
+    // sets action_notice only on wrap — ensure we don't carry a stale one).
+
+    // NextMatch past the last → wraps to 0, notice set.
+    let fx = ctrl.handle(Intent::NextMatch);
+    assert!(fx.redraw, "AC-16: wrap still returns redraw");
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        0,
+        "AC-16: wrapped to first match (index 0)"
+    );
+    let notice = ctrl.action_notice().expect("AC-16: wrap notice is set");
+    assert!(
+        notice.contains("wrap") || notice.contains("first"),
+        "AC-16: wrap notice mentions wrap/first: {notice}"
+    );
+}
+
+#[test]
+fn prev_match_wraps_before_first_with_notice() {
+    // AC-16: going before the first match wraps to the last and sets a wrap notice.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5);
+
+    // Commit search for "needle"; current=0.
+    ctrl.handle(Intent::OpenSearch);
+    for c in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        0,
+        "precondition: at first match"
+    );
+
+    // PrevMatch from first → wraps to last (index 3), notice set.
+    let fx = ctrl.handle(Intent::PrevMatch);
+    assert!(fx.redraw, "AC-16: wrap still returns redraw");
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        3,
+        "AC-16: wrapped to last match (index 3)"
+    );
+    let notice = ctrl.action_notice().expect("AC-16: wrap notice is set");
+    assert!(
+        notice.contains("wrap") || notice.contains("last"),
+        "AC-16: wrap notice mentions wrap/last: {notice}"
+    );
+}
+
+#[test]
+fn next_match_prev_match_inert_with_zero_match_committed_search() {
+    // AC-19: n/N have no effect when a search is committed but has zero matches.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_search_content(dir.path());
+    await_marker(&mut ctrl, "needle");
+    ctrl.set_content_viewport(40, 5);
+
+    // Open search and type a query that matches nothing, then commit (Enter).
+    ctrl.handle(Intent::OpenSearch);
+    for c in "xyzzy_absent".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    // Verify zero matches before committing.
+    assert!(
+        ctrl.search().is_some_and(|s| s.matches.is_empty()),
+        "precondition: zero matches for absent query"
+    );
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(
+        !ctrl.prompt_open(),
+        "precondition: prompt closed after Enter"
+    );
+    // SearchState is Some but has zero matches (committed zero-match search).
+    let s = ctrl.search().expect("SearchState retained after Enter");
+    assert!(
+        s.matches.is_empty(),
+        "precondition: committed search has zero matches"
+    );
+
+    let scroll_before = ctrl.content_scroll();
+
+    // n → no-op.
+    let fx_next = ctrl.handle(Intent::NextMatch);
+    assert!(
+        !fx_next.redraw,
+        "AC-19: NextMatch is a no-op with zero matches: no redraw"
+    );
+    assert_eq!(
+        ctrl.content_scroll(),
+        scroll_before,
+        "AC-19: NextMatch must not scroll with zero matches"
+    );
+    assert_eq!(
+        ctrl.search().unwrap().current,
+        0,
+        "AC-19: current unchanged after no-op NextMatch"
+    );
+
+    // N → no-op.
+    let fx_prev = ctrl.handle(Intent::PrevMatch);
+    assert!(
+        !fx_prev.redraw,
+        "AC-19: PrevMatch is a no-op with zero matches: no redraw"
+    );
+    assert_eq!(
+        ctrl.content_scroll(),
+        scroll_before,
+        "AC-19: PrevMatch must not scroll with zero matches"
+    );
+}

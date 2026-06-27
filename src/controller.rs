@@ -867,8 +867,8 @@ impl Controller {
             Intent::OpenFinder => self.open_finder(),
             Intent::OpenGoToLine => self.open_go_to_line(),
             Intent::OpenSearch => self.open_search(),
-            Intent::NextMatch => Effects::noop(),
-            Intent::PrevMatch => Effects::noop(),
+            Intent::NextMatch => self.next_match(),
+            Intent::PrevMatch => self.prev_match(),
             Intent::Close => self.close_or_unzoom(),
         }
     }
@@ -2026,10 +2026,11 @@ impl Controller {
         }
     }
 
-    /// Search prompt key handling (T-9). Incremental: every printable char or Backspace re-runs
+    /// Search prompt key handling (T-9/T-10). Incremental: every printable char or Backspace re-runs
     /// `find_matches` over the displayed content's plain text and scrolls the first match into
-    /// view. Esc and Enter close the prompt (minimal for T-9; commit semantics are T-10 and
-    /// cancel-restore semantics are T-11). All other keys are ignored.
+    /// view. Enter commits — closes the prompt and retains the SearchState so n/N can navigate
+    /// the committed matches (AC-14). Esc closes the prompt (cancel-restore semantics are T-11).
+    /// All other keys are ignored.
     fn search_prompt_key(&mut self, key: KeyEvent) -> Effects {
         match key.code {
             // Accept any printable char (no modifier beyond SHIFT — consistent with the finder's
@@ -2048,8 +2049,9 @@ impl Controller {
                 self.refresh_search();
                 Effects::redraw()
             }
-            // Minimal Enter: close the prompt. Commit semantics (keep search state, n/N
-            // navigation) are T-10 — do NOT clear self.search here so T-10 can refine.
+            // Commit — retain the SearchState; Esc-cancel (T-11) is the path that clears it.
+            // Close the prompt but leave self.search intact so n/N can navigate the committed
+            // matches (AC-14). The query, matches, and current index persist.
             KeyCode::Enter => {
                 self.prompt = None;
                 Effects::redraw()
@@ -2061,6 +2063,58 @@ impl Controller {
             }
             _ => Effects::noop(),
         }
+    }
+
+    /// Advance to the next match in document order (the `n` key, AC-15). Wraps from the last
+    /// match back to the first with a notice (AC-16). Inert when there is no committed search
+    /// with ≥1 match: no search, a committed search with zero matches, or the prompt still open
+    /// (AC-19). Scrolls the new current match into view.
+    fn next_match(&mut self) -> Effects {
+        // A committed search exists iff self.search is Some, non-empty, AND the prompt is closed.
+        let (len, current, line) = match self.search.as_ref() {
+            Some(s) if !s.matches.is_empty() && !self.prompt_open() => {
+                (s.matches.len(), s.current, s.matches[s.current].line)
+            }
+            _ => return Effects::noop(),
+        };
+        // Copy the fields we need before taking &mut self — borrow checker.
+        let wrapped = current + 1 >= len;
+        let next_current = (current + 1) % len;
+        // Compute the next match's line before mutating self.search.
+        let next_line = self.search.as_ref().unwrap().matches[next_current].line;
+        let _ = line; // suppress unused warning; we use next_line instead
+        if let Some(s) = self.search.as_mut() {
+            s.current = next_current;
+        }
+        if wrapped {
+            self.action_notice = Some("Search: wrapped to first match".into());
+        }
+        self.scroll_to_line(next_line + 1);
+        Effects::redraw()
+    }
+
+    /// Retreat to the previous match in document order (the `N` key, AC-15). Wraps from the
+    /// first match back to the last with a notice (AC-16). Inert when there is no committed
+    /// search with ≥1 match (AC-19). Scrolls the new current match into view.
+    fn prev_match(&mut self) -> Effects {
+        // A committed search exists iff self.search is Some, non-empty, AND the prompt is closed.
+        let (len, current) = match self.search.as_ref() {
+            Some(s) if !s.matches.is_empty() && !self.prompt_open() => (s.matches.len(), s.current),
+            _ => return Effects::noop(),
+        };
+        // Copy the fields we need before taking &mut self — borrow checker.
+        let wrapped = current == 0;
+        let prev_current = (current + len - 1) % len;
+        // Compute the previous match's line before mutating self.search.
+        let prev_line = self.search.as_ref().unwrap().matches[prev_current].line;
+        if let Some(s) = self.search.as_mut() {
+            s.current = prev_current;
+        }
+        if wrapped {
+            self.action_notice = Some("Search: wrapped to last match".into());
+        }
+        self.scroll_to_line(prev_line + 1);
+        Effects::redraw()
     }
 
     /// Incremental search core: read the current prompt query, run `find_matches` over the
