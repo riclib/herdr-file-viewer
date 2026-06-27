@@ -724,6 +724,9 @@ impl Controller {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             branch: self.current_branch.clone(),
+            prompt: self.prompt.as_ref().map(|p| match p.mode {
+                crate::infile::PromptMode::GoToLine => format!(":{}", p.input.query()),
+            }),
         }
     }
 
