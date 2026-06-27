@@ -38,29 +38,42 @@ pub const CURRENT_HIGHLIGHT: Style = Style::new().fg(Color::Black).bg(Color::Cya
 /// line's plain-text length, or a range not on a UTF-8 char boundary) are
 /// silently skipped.
 pub fn apply(lines: &[Line<'static>], matches: &[Match], current: usize) -> Vec<Line<'static>> {
+    // Group matches by line in a single O(total_matches) pass, recording each
+    // match's global index so we can identify the current match in O(1).
+    let mut by_line: Vec<Vec<(usize, &Match)>> = vec![Vec::new(); lines.len()];
+    for (global_idx, m) in matches.iter().enumerate() {
+        if m.line < lines.len() {
+            by_line[m.line].push((global_idx, m));
+        }
+    }
+
     lines
         .iter()
         .enumerate()
         .map(|(line_idx, line)| {
-            // Collect only the matches that target this line.
-            let line_matches: Vec<&Match> = matches.iter().filter(|m| m.line == line_idx).collect();
+            let line_matches = &by_line[line_idx];
 
             if line_matches.is_empty() {
                 return line.clone();
             }
 
-            // Compute the total plain-text byte length for this line once so we
-            // can validate match bounds cheaply.
+            // Reconstruct the plain text ONCE per line for boundary validation.
             let line_text_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            let plain: String = {
+                let mut s = String::with_capacity(line_text_len);
+                for span in &line.spans {
+                    s.push_str(&span.content);
+                }
+                s
+            };
 
-            // Validate each match; drop silently if it is out of range or not on
-            // a char boundary (we reconstruct the plain text on demand below).
+            // Validate each match using the pre-built plain text; drop silently
+            // if out-of-range or not on a UTF-8 char boundary.
             let validated: Vec<(usize, usize, bool)> = line_matches
                 .iter()
-                .filter_map(|m| {
-                    let match_idx = matches.iter().position(|x| std::ptr::eq(x, *m))?;
-                    validate_match(line, line_text_len, m).map(|(s, e)| {
-                        let is_current = match_idx == current;
+                .filter_map(|&(global_idx, m)| {
+                    validate_match_plain(&plain, line_text_len, m).map(|(s, e)| {
+                        let is_current = global_idx == current;
                         (s, e, is_current)
                     })
                 })
@@ -83,22 +96,18 @@ pub fn apply(lines: &[Line<'static>], matches: &[Match], current: usize) -> Vec<
 
 // ── internals ─────────────────────────────────────────────────────────────────
 
-/// Validate a match against the line's plain-text length and char boundaries.
+/// Validate a match against the pre-built plain text of a line.
+///
+/// Accepts the line's already-concatenated plain text (built once per line in
+/// `apply`) so validation costs O(1) per match instead of O(spans) per match.
 /// Returns `Some((start, end))` if the match is usable, `None` to skip.
-fn validate_match(line: &Line<'static>, line_text_len: usize, m: &Match) -> Option<(usize, usize)> {
+fn validate_match_plain(plain: &str, line_text_len: usize, m: &Match) -> Option<(usize, usize)> {
     if m.start > m.end || m.end > line_text_len {
         return None;
     }
     if m.start == m.end {
         // Zero-length match — nothing to highlight, skip.
         return None;
-    }
-    // Verify that start and end are on UTF-8 char boundaries by reconstructing
-    // the relevant portion of the plain text and checking boundary validity.
-    // We walk the spans to collect just enough text to verify.
-    let mut plain = String::with_capacity(line_text_len);
-    for span in &line.spans {
-        plain.push_str(&span.content);
     }
     if !plain.is_char_boundary(m.start) || !plain.is_char_boundary(m.end) {
         return None;
