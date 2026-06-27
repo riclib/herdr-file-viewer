@@ -756,10 +756,7 @@ impl Controller {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             branch: self.current_branch.clone(),
-            prompt: self.prompt.as_ref().map(|p| match p.mode {
-                crate::infile::PromptMode::GoToLine => format!("Go to line: {}", p.input.query()),
-                crate::infile::PromptMode::Search => format!("/{}", p.input.query()),
-            }),
+            prompt: self.bottom_line(),
             // Populate the highlight overlay from the committed/live search state so the Presenter
             // overlays matches via highlight::apply. `None` when no search is active → draw_content
             // falls through to `state.content.clone()`, byte-identical to the pre-T-12 path.
@@ -768,6 +765,68 @@ impl Controller {
                 current: s.current,
             }),
         }
+    }
+
+    /// Build the bottom-line string shown in `ViewState.prompt`. Single source of truth for all
+    /// three cases: an open prompt (go-to-line or search while typing), a committed search (prompt
+    /// closed but `self.search` is Some), and nothing active (returns `None`).
+    ///
+    /// Priority:
+    ///   1. Open prompt → label + query + (for Search) live match count.
+    ///   2. Committed search (no open prompt) → query + count + n/N/Esc hint.
+    ///   3. Neither → `None` (Presenter draws nothing on the bottom row).
+    fn bottom_line(&self) -> Option<String> {
+        if let Some(p) = &self.prompt {
+            match p.mode {
+                crate::infile::PromptMode::GoToLine => {
+                    Some(format!("Go to line: {}", p.input.query()))
+                }
+                crate::infile::PromptMode::Search => {
+                    let q = p.input.query();
+                    let count = self.search_count_fragment(q);
+                    Some(format!("Search: {q}{count}"))
+                }
+            }
+        } else {
+            self.search_status_line()
+        }
+    }
+
+    /// The count/hint fragment appended after the query while a search is active.
+    ///
+    /// - Empty query → empty string (nothing appended; label reads `Search: `).
+    /// - Non-empty, 0 matches → ` (no matches)`.
+    /// - Non-empty, ≥1 match → ` ({current+1}/{total})`.
+    fn search_count_fragment(&self, query: &str) -> String {
+        if query.is_empty() {
+            return String::new();
+        }
+        match &self.search {
+            None => String::new(),
+            Some(s) if s.matches.is_empty() => " (no matches)".to_owned(),
+            Some(s) => format!(" ({}/{})", s.current + 1, s.matches.len()),
+        }
+    }
+
+    /// Build the committed-search status + hint bar shown while a search is committed (prompt
+    /// closed, `self.search` is `Some`). Returns `None` when no committed search is active.
+    ///
+    /// Format:
+    /// - ≥1 match: `Search: {query} ({current+1}/{total}) · n next · N prev · Esc clear`
+    /// - 0 matches: `Search: {query} (no matches) · Esc clear`
+    fn search_status_line(&self) -> Option<String> {
+        let s = self.search.as_ref()?;
+        let q = &s.query;
+        let line = if s.matches.is_empty() {
+            format!("Search: {q} (no matches) · Esc clear")
+        } else {
+            format!(
+                "Search: {q} ({}/{}) · n next · N prev · Esc clear",
+                s.current + 1,
+                s.matches.len()
+            )
+        };
+        Some(line)
     }
 
     /// The owned picker draw model for the Presenter (AC-1, AC-5), or `None` when the picker is
@@ -1755,10 +1814,16 @@ impl Controller {
         Effects::redraw()
     }
 
-    /// The close key (`q`/`Esc`): when zoomed, back out of zoom first (the instinctive "escape
-    /// the full-screen view") and stay in the viewer; otherwise quit (AC-20). So from a zoomed
-    /// file it takes two presses to leave — one to un-zoom, one to close.
+    /// The close key (`q`/`Esc`): layered dismissal in order — clear a committed search first,
+    /// then un-zoom if zoomed, then quit. So from a committed search the sequence is:
+    /// Esc → clears the search; Esc again → un-zooms (if zoomed) or quits. (AC-20, owner UX.)
     fn close_or_unzoom(&mut self) -> Effects {
+        // A committed search (prompt closed, highlights persisting) is dismissed first — Esc/q
+        // "come out of the search" before they unzoom or close (layered like unzoom). (owner UX)
+        if self.search.is_some() && !self.prompt_open() {
+            self.search = None;
+            return Effects::redraw();
+        }
         if self.zoomed {
             self.zoomed = false;
             self.focus = Focus::Tree;
@@ -1904,9 +1969,10 @@ impl Controller {
         Effects::redraw()
     }
 
-    /// Open the search prompt (AC-8). Unlike go-to-line there is no view-gate — the search prompt
-    /// opens in every view mode (RenderedMarkdown, Diff, FullDiff, SyntaxContent). Like other modal
-    /// openers, it is a no-op while the picker or finder is already open (mutually exclusive modals).
+    /// Open the search prompt (AC-8). Search works in every view mode (RenderedMarkdown, Diff,
+    /// FullDiff, SyntaxContent) but requires a file to be selected — a directory selection or
+    /// nothing selected shows a notice instead (mirrors go-to-line's file-gate, owner UX).
+    /// Like other modal openers, it is a no-op while the picker or finder is already open.
     /// Snapshots the current content scroll into the prompt state (for Esc-restore).
     fn open_search(&mut self) -> Effects {
         // Modal mutual-exclusion: the picker and finder guards in handle() already prevent this
@@ -1914,6 +1980,18 @@ impl Controller {
         // future direct callers.
         if self.picker.is_some() || self.finder.is_some() {
             return Effects::noop();
+        }
+        // File-gate: search requires a file to be selected (not a directory / nothing).
+        // selected_view_mode() returns Some(mode) iff a file node is currently selected.
+        if self.selected_view_mode().is_none() {
+            self.action_notice = Some("Search: select a file first".into());
+            return Effects::redraw();
+        }
+        // Zoom-on-open (7b): if the content pane isn't visible (narrow tree-only layout), zoom the
+        // file so the user sees the content they're about to search. Mirrors the go-to-file finder.
+        if self.content_width == 0 {
+            self.zoomed = true;
+            self.focus = Focus::Content;
         }
         // AC-20: opening a new search clears any prior committed SearchState so highlights from
         // the old query are gone before the new prompt opens. Clear first, then snapshot scroll.

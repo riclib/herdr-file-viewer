@@ -16,12 +16,12 @@ use crate::search::Match;
 
 // ── public style constants ────────────────────────────────────────────────────
 
-/// Style applied to every non-current highlighted match (black text on yellow).
-pub const HIGHLIGHT: Style = Style::new().fg(Color::Black).bg(Color::Yellow);
+/// Style applied to every non-current highlighted match (black text on cyan).
+pub const HIGHLIGHT: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
 
 /// Style applied to the **current** match — visually distinct from `HIGHLIGHT`
-/// (black text on cyan).
-pub const CURRENT_HIGHLIGHT: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
+/// (black text on yellow; yellow is more prominent so the active position stands out).
+pub const CURRENT_HIGHLIGHT: Style = Style::new().fg(Color::Black).bg(Color::Yellow);
 
 // ── public API ────────────────────────────────────────────────────────────────
 

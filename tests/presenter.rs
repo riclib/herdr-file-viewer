@@ -2447,8 +2447,8 @@ fn search_state() -> ViewState {
 
 #[test]
 fn search_highlight_colors_match_cells_with_highlight_style() {
-    // AC-9: every non-current match is highlighted with HIGHLIGHT (black on yellow).
-    // AC-11: the current match is highlighted with CURRENT_HIGHLIGHT (black on cyan), distinct from the non-current ones.
+    // AC-9: every non-current match is highlighted with HIGHLIGHT (black on cyan).
+    // AC-11: the current match is highlighted with CURRENT_HIGHLIGHT (black on yellow), distinct from the non-current ones.
     use herdr_file_viewer::highlight::{CURRENT_HIGHLIGHT, HIGHLIGHT};
     use herdr_file_viewer::presenter::geometry;
     use ratatui::layout::Rect;
@@ -2493,7 +2493,7 @@ fn search_highlight_colors_match_cells_with_highlight_style() {
     assert_eq!(
         main_bg,
         HIGHLIGHT.bg.unwrap(),
-        "AC-9: the non-current match 'main' must have the HIGHLIGHT background (yellow), got {main_bg:?}"
+        "AC-9: the non-current match 'main' must have the HIGHLIGHT background (cyan), got {main_bg:?}"
     );
     let main_fg = buf.cell((mx, my)).unwrap().fg;
     assert_eq!(
@@ -2508,7 +2508,7 @@ fn search_highlight_colors_match_cells_with_highlight_style() {
     assert_eq!(
         cur_bg,
         CURRENT_HIGHLIGHT.bg.unwrap(),
-        "AC-11: the current match '}}' must have the CURRENT_HIGHLIGHT background (cyan), got {cur_bg:?}"
+        "AC-11: the current match '}}' must have the CURRENT_HIGHLIGHT background (yellow), got {cur_bg:?}"
     );
     let cur_fg = buf.cell((cx2, cy2)).unwrap().fg;
     assert_eq!(
@@ -2542,16 +2542,18 @@ fn search_none_keeps_draw_content_byte_identical() {
 }
 
 #[test]
-fn search_prompt_renders_slash_term_on_bottom_row() {
-    // AC-8: while a search prompt is open, the `/term` string appears on the bottom row.
+fn search_prompt_renders_labelled_term_on_bottom_row() {
+    // AC-8: while a search prompt is open, the `Search: foo (1/3)`-style string appears on the
+    // bottom row. The presenter renders whatever string is in ViewState.prompt; this test checks
+    // that the Presenter draws the bottom row correctly (it does not build the string itself).
     let mut st = sample_state();
-    st.prompt = Some("/foo".into());
+    st.prompt = Some("Search: foo (1/3)".into());
     let (w, h) = (100u16, 24u16);
     let out = render(&st, w, h);
     let last_row = out.lines().last().expect("at least one row");
     assert!(
-        last_row.contains("/foo"),
-        "AC-8: the bottom row must show '/foo' when a search prompt is open\n{out}"
+        last_row.contains("Search: foo (1/3)"),
+        "AC-8: the bottom row must show the labelled search prompt string\n{out}"
     );
     // Content still visible above the prompt.
     assert!(
