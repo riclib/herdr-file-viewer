@@ -746,6 +746,7 @@ impl Controller {
             branch: self.current_branch.clone(),
             prompt: self.prompt.as_ref().map(|p| match p.mode {
                 crate::infile::PromptMode::GoToLine => format!("Go to line: {}", p.input.query()),
+                crate::infile::PromptMode::Search => format!("/{}", p.input.query()),
             }),
         }
     }
@@ -859,6 +860,9 @@ impl Controller {
             Intent::SwitchWorktree => self.open_worktree_picker(),
             Intent::OpenFinder => self.open_finder(),
             Intent::OpenGoToLine => self.open_go_to_line(),
+            Intent::OpenSearch => self.open_search(),
+            Intent::NextMatch => Effects::noop(),
+            Intent::PrevMatch => Effects::noop(),
             Intent::Close => self.close_or_unzoom(),
         }
     }
@@ -1869,9 +1873,34 @@ impl Controller {
         Effects::redraw()
     }
 
+    /// Open the search prompt (AC-8). Unlike go-to-line there is no view-gate — the search prompt
+    /// opens in every view mode (RenderedMarkdown, Diff, FullDiff, SyntaxContent). Like other modal
+    /// openers, it is a no-op while the picker or finder is already open (mutually exclusive modals).
+    /// Snapshots the current content scroll into the prompt state (for Esc-restore).
+    fn open_search(&mut self) -> Effects {
+        // Modal mutual-exclusion: the picker and finder guards in handle() already prevent this
+        // from being reached while those modals are open, but be explicit for clarity and for
+        // future direct callers.
+        if self.picker.is_some() || self.finder.is_some() {
+            return Effects::noop();
+        }
+        self.prompt = Some(PromptState {
+            mode: PromptMode::Search,
+            input: crate::prompt::PromptInput::new(),
+            saved_scroll: self.content_scroll,
+        });
+        Effects::redraw()
+    }
+
     /// Whether an in-file-nav bottom prompt is currently open.
     pub fn prompt_open(&self) -> bool {
         self.prompt.is_some()
+    }
+
+    /// The mode of the currently-open bottom-prompt, or `None` when no prompt is open.
+    /// Exposed for tests that need to assert which prompt variant was opened.
+    pub fn prompt_mode(&self) -> Option<PromptMode> {
+        self.prompt.as_ref().map(|p| p.mode)
     }
 
     /// The pending auto-switch go-to-line target (1-based source line), or `None`. Set when `:`
@@ -1897,6 +1926,10 @@ impl Controller {
         };
         match mode {
             PromptMode::GoToLine => self.go_to_line_key(key),
+            // Search key handling lands in T-9 (incremental search); for now the prompt opens
+            // but all keystrokes are no-ops (the prompt is closed by Esc → the go-to-line Esc
+            // arm, reused, will work since the mode is matched by the per-mode handler).
+            PromptMode::Search => self.search_prompt_key(key),
         }
     }
 
@@ -1969,6 +2002,19 @@ impl Controller {
             }
             KeyCode::Esc => {
                 self.prompt = None; // cancel: close, scroll unchanged (AC-6)
+                Effects::redraw()
+            }
+            _ => Effects::noop(),
+        }
+    }
+
+    /// Search prompt key handling stub (T-8). Full incremental-search key handling lands in T-9;
+    /// for this task the prompt opens via `open_search()` and Esc closes it. Any other key is a
+    /// no-op so the prompt can be dismissed without crashing — the real handler replaces this in T-9.
+    fn search_prompt_key(&mut self, key: KeyEvent) -> Effects {
+        match key.code {
+            KeyCode::Esc => {
+                self.prompt = None;
                 Effects::redraw()
             }
             _ => Effects::noop(),

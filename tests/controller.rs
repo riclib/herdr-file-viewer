@@ -2884,6 +2884,11 @@ fn re_root_only_reachable_via_switch_worktree_intent() {
         if ctrl.finder_open() {
             ctrl.handle_finder_key(key(KeyCode::Esc));
         }
+        // OpenSearch (in Intent::ALL since T-8) opens the search prompt; close it symmetrically
+        // so the prompt modal guard cannot block SwitchWorktree in Part 2.
+        if ctrl.prompt_open() {
+            ctrl.handle_prompt_key(key(KeyCode::Esc));
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -5252,5 +5257,138 @@ fn go_to_line_second_confirm_supersedes_an_in_flight_auto_switch_jump() {
         ctrl.content_scroll(),
         29,
         "lands on line 30 (offset 29) — the LAST confirm wins, not line 10"
+    );
+}
+
+// ── T-8: OpenSearch / NextMatch / PrevMatch ─────────────────────────────────
+
+#[test]
+fn open_search_opens_a_search_prompt_in_any_view() {
+    // AC-8: pressing `/` opens a one-line search prompt at the bottom, in ANY view mode —
+    // including RenderedMarkdown (unlike `:` which is view-gated on a file selection).
+
+    // --- SyntaxContent view (an unchanged .rs file) ---
+    {
+        let dir = TempDir::new();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+        assert!(!ctrl.prompt_open(), "precondition: prompt starts closed");
+        let fx = ctrl.handle(Intent::OpenSearch);
+        assert!(
+            ctrl.prompt_open(),
+            "AC-8: OpenSearch opens the prompt in SyntaxContent"
+        );
+        assert!(fx.redraw, "opening the prompt signals a redraw");
+        assert!(
+            ctrl.action_notice().is_none(),
+            "no action notice on success"
+        );
+        assert_eq!(ctrl.prompt_query(), "", "prompt buffer starts empty");
+    }
+
+    // --- RenderedMarkdown view (a .md file) — lock AC-8's "any view" contract ---
+    {
+        let dir = TempDir::new();
+        std::fs::write(dir.path().join("notes.md"), "# Hello\n").unwrap();
+        let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+        assert_eq!(
+            ctrl.selected_view_mode(),
+            Some(ViewMode::RenderedMarkdown),
+            "precondition: .md file is in RenderedMarkdown"
+        );
+        ctrl.handle(Intent::OpenSearch);
+        assert!(
+            ctrl.prompt_open(),
+            "AC-8: OpenSearch opens the prompt in RenderedMarkdown (no view-gate)"
+        );
+    }
+}
+
+#[test]
+fn open_search_opens_prompt_with_search_mode() {
+    // AC-8: the opened prompt must be in Search mode, not GoToLine mode.
+    use herdr_file_viewer::infile::PromptMode;
+
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::OpenSearch);
+    assert!(ctrl.prompt_open(), "prompt is open");
+    assert_eq!(
+        ctrl.prompt_mode(),
+        Some(PromptMode::Search),
+        "AC-8: prompt mode is Search"
+    );
+    assert_eq!(ctrl.prompt_query(), "", "buffer starts empty");
+}
+
+#[test]
+fn open_search_is_noop_while_picker_is_open() {
+    // Modal mutual-exclusion: OpenSearch is inert while the worktree picker is open.
+    // Need a real git repo so SwitchWorktree can open the picker.
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+    let (mut ctrl, _, _) = controller(repo.path(), true, StubGit::default(), false);
+
+    ctrl.handle(Intent::SwitchWorktree); // open the picker
+    assert!(ctrl.picker().is_some(), "precondition: picker is open");
+
+    let fx = ctrl.handle(Intent::OpenSearch);
+    assert!(!fx.redraw, "OpenSearch is a no-op while the picker is open");
+    assert!(
+        !ctrl.prompt_open(),
+        "prompt must not open while the picker is modal"
+    );
+}
+
+#[test]
+fn open_search_is_noop_while_finder_is_open() {
+    // Modal mutual-exclusion: OpenSearch is inert while the go-to-file finder is open.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::OpenFinder); // open the finder
+    assert!(ctrl.finder_open(), "precondition: finder is open");
+
+    // While the finder is open handle() is inert for ALL non-picker intents — the
+    // structural guard returns noop(). The prompt must not open.
+    let fx = ctrl.handle(Intent::OpenSearch);
+    assert!(!fx.redraw, "inert while finder is modal");
+    assert!(
+        !ctrl.prompt_open(),
+        "prompt stays closed while finder is open"
+    );
+}
+
+#[test]
+fn next_match_and_prev_match_are_noops_with_no_committed_search() {
+    // AC-19: n/N have no effect when there is no committed search with ≥1 match.
+    // At this task stage no committed search ever exists, so both are always no-ops.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    let scroll_before = ctrl.content_scroll();
+
+    let fx_next = ctrl.handle(Intent::NextMatch);
+    assert!(!fx_next.redraw, "NextMatch is a no-op: no redraw");
+    assert!(!ctrl.prompt_open(), "NextMatch must not open a prompt");
+    assert_eq!(
+        ctrl.content_scroll(),
+        scroll_before,
+        "NextMatch must not scroll the content pane"
+    );
+
+    let fx_prev = ctrl.handle(Intent::PrevMatch);
+    assert!(!fx_prev.redraw, "PrevMatch is a no-op: no redraw");
+    assert!(!ctrl.prompt_open(), "PrevMatch must not open a prompt");
+    assert_eq!(
+        ctrl.content_scroll(),
+        scroll_before,
+        "PrevMatch must not scroll the content pane"
     );
 }
