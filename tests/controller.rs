@@ -2330,6 +2330,30 @@ fn view_state_titles_the_tree_with_root_basename_and_branch() {
 }
 
 #[test]
+fn refresh_updates_the_cached_branch_after_an_external_checkout() {
+    // review-gate R1 (SMA-249): the tree's bottom-border branch is cached on the controller, so it
+    // must be refreshed by refresh_git_state (the `r` key / editor-return / focus-gain), not only at
+    // (re-)root — otherwise an external `git checkout` while the viewer is open leaves it stale.
+    let repo = TempDir::new();
+    init_repo_with_commit(repo.path());
+    let (mut ctrl, _, _) = controller(repo.path(), true, StubGit::default(), false);
+    assert!(
+        ctrl.view_state().branch.is_some(),
+        "precondition: on a branch in a real repo, branch is Some"
+    );
+
+    // Check out a new branch externally (as another pane / tool would), then refresh.
+    git(repo.path(), &["checkout", "-b", "zz-refresh-branch"]);
+    ctrl.handle(Intent::Refresh);
+
+    assert_eq!(
+        ctrl.view_state().branch.as_deref(),
+        Some("zz-refresh-branch"),
+        "refresh picks up the externally-changed branch (was stale before the fix)"
+    );
+}
+
+#[test]
 fn picker_activate_reroots_to_selected_and_closes_picker() {
     // AC-7 + AC-5: Activate confirms — re-roots to the selected (non-current) worktree and
     // closes the picker.

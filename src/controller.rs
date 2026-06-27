@@ -1965,6 +1965,12 @@ impl Controller {
         self.tree.set_status(&status);
         self.changed = self.git.changed_set(self.baseline);
         self.tree.set_changed_only(self.changed_only, &self.changed);
+        // Refresh the cached branch too (review-gate R1, SMA-249): `refresh_git_state` runs on `r`,
+        // editor-return, and focus-gain to pick up EXTERNAL git changes — so an external
+        // `git checkout` must update the tree's bottom-border branch, not just status/changed-set.
+        // Without this the label went stale. `git rev-parse` from the tree root resolves the repo
+        // even when the root is a subdir; `None` on a detached HEAD (border omits the branch).
+        self.current_branch = crate::git::current_branch(&self.root);
         // Drop any pending re-root async status fetch (review-gate R1, G + R2): this sync
         // refresh has just produced the authoritative status/changed-set, so an older in-flight
         // async result must not later clobber it in `poll`. Invariant: every synchronous
