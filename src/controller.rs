@@ -1826,6 +1826,75 @@ impl Controller {
         self.prompt.is_some()
     }
 
+    /// The current go-to-line prompt buffer, or `""` when no prompt is open. Exposed for tests
+    /// (AC-2) and the Presenter's bottom prompt line (T-4). Mirrors `finder_query()`.
+    pub fn prompt_query(&self) -> &str {
+        self.prompt.as_ref().map(|p| p.input.query()).unwrap_or("")
+    }
+
+    /// Route a key event while a bottom-prompt modal is open. The run loop (T-4) calls this
+    /// instead of the normal key→intent map while `prompt_open()`. Dispatches by the prompt's
+    /// mode. (AC-2…AC-6)
+    pub fn handle_prompt_key(&mut self, key: KeyEvent) -> Effects {
+        // `PromptMode` is `Copy`; read it and drop the borrow before the per-mode handler runs.
+        let Some(mode) = self.prompt.as_ref().map(|p| p.mode) else {
+            return Effects::noop();
+        };
+        match mode {
+            PromptMode::GoToLine => self.go_to_line_key(key),
+        }
+    }
+
+    /// Go-to-line prompt key handling: digits build the line number, non-digit printables are
+    /// ignored (AC-2); Backspace deletes; Enter jumps (clamped, AC-3/AC-4) or — when empty —
+    /// just closes with no jump (AC-5); Esc closes leaving the scroll unchanged (AC-6). Confirm
+    /// and cancel both close the prompt. Go-to-line is not incremental, so the content scroll
+    /// only ever moves on a non-empty Enter.
+    fn go_to_line_key(&mut self, key: KeyEvent) -> Effects {
+        match key.code {
+            // Only accept ASCII digits with no modifier other than SHIFT (consistent with the
+            // finder's printable-char gate).
+            KeyCode::Char(c)
+                if c.is_ascii_digit()
+                    && key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.input.push(c);
+                }
+                Effects::redraw()
+            }
+            // A non-digit printable is ignored — the buffer is unchanged, no repaint. (AC-2)
+            KeyCode::Char(_) => Effects::noop(),
+            KeyCode::Backspace => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.input.backspace();
+                }
+                Effects::redraw()
+            }
+            KeyCode::Enter => {
+                let q = self
+                    .prompt
+                    .as_ref()
+                    .map(|p| p.input.query().to_string())
+                    .unwrap_or_default();
+                self.prompt = None; // confirm always closes (AC-5 empty also closes)
+                if !q.is_empty() {
+                    // The buffer holds only ASCII digits (non-digits are rejected above), so a
+                    // parse failure can only be an overflow → treat as "beyond the last line";
+                    // scroll_to_line clamps usize::MAX to the last line (AC-4).
+                    let n = q.parse::<usize>().unwrap_or(usize::MAX);
+                    self.scroll_to_line(n); // AC-3 / AC-4
+                }
+                Effects::redraw()
+            }
+            KeyCode::Esc => {
+                self.prompt = None; // cancel: close, scroll unchanged (AC-6)
+                Effects::redraw()
+            }
+            _ => Effects::noop(),
+        }
+    }
+
     /// The full candidate list loaded when the finder was opened, or an empty slice when
     /// the finder is closed. Exposed for tests (T-5); the Presenter/T-8 read via `finder()`.
     pub fn finder_candidates(&self) -> &[String] {

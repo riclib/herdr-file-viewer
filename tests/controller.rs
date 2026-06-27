@@ -4798,3 +4798,162 @@ fn open_go_to_line_is_unavailable_in_transformed_views() {
         assert_eq!(ctrl.content_scroll(), 0, "scroll unchanged");
     }
 }
+
+// T-3 — Go-to-line keystroke + confirm + cancel (AC-2..AC-6, AC-7 edge)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn go_to_line_builds_the_number_from_digits_and_ignores_non_digits() {
+    // AC-2: digit keys push to the buffer; non-digit printables are silently ignored.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_lines(dir.path(), 50);
+    await_marker(&mut ctrl, "L0");
+    ctrl.set_content_viewport(40, 10);
+    ctrl.handle(Intent::OpenGoToLine);
+    assert!(ctrl.prompt_open());
+
+    ctrl.handle_prompt_key(key(KeyCode::Char('4')));
+    ctrl.handle_prompt_key(key(KeyCode::Char('a'))); // non-digit: ignored
+    ctrl.handle_prompt_key(key(KeyCode::Char('2')));
+    assert_eq!(
+        ctrl.prompt_query(),
+        "42",
+        "digits build the number, non-digits ignored"
+    );
+    // Backspace deletes the last digit
+    ctrl.handle_prompt_key(key(KeyCode::Backspace));
+    assert_eq!(ctrl.prompt_query(), "4");
+}
+
+#[test]
+fn go_to_line_enter_jumps_to_the_line_and_clamps_out_of_range() {
+    // AC-3: Enter with a valid line number scrolls the content to that line (near the top).
+    // AC-4: a line number beyond the last line is clamped to the last screenful.
+    // 50 lines, viewport 10 → max_content_scroll = 40.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_lines(dir.path(), 50);
+    await_marker(&mut ctrl, "L0");
+    ctrl.set_content_viewport(40, 10);
+
+    // Jump to line 25 (1-based): content_scroll should be 24 (line 25 near top).
+    ctrl.handle(Intent::OpenGoToLine);
+    assert!(ctrl.prompt_open());
+    ctrl.handle_prompt_key(key(KeyCode::Char('2')));
+    ctrl.handle_prompt_key(key(KeyCode::Char('5')));
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(!ctrl.prompt_open(), "Enter closes the prompt");
+    assert_eq!(
+        ctrl.content_scroll(),
+        24,
+        "line 25 lands at offset 24 (near top, AC-3)"
+    );
+
+    // Re-open and type "1000" — beyond the last line → clamped to max_content_scroll (40, AC-4).
+    ctrl.handle(Intent::OpenGoToLine);
+    assert!(ctrl.prompt_open());
+    for c in "1000".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(
+        !ctrl.prompt_open(),
+        "Enter closes the prompt after out-of-range"
+    );
+    assert_eq!(
+        ctrl.content_scroll(),
+        40,
+        "out-of-range clamps to last screenful (AC-4)"
+    );
+}
+
+#[test]
+fn go_to_line_empty_enter_closes_without_jumping() {
+    // AC-5: Enter with an empty buffer closes the prompt and leaves the scroll unchanged.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_lines(dir.path(), 50);
+    await_marker(&mut ctrl, "L0");
+    ctrl.set_content_viewport(40, 10);
+
+    ctrl.handle(Intent::OpenGoToLine);
+    assert!(ctrl.prompt_open());
+    assert_eq!(ctrl.content_scroll(), 0, "scroll starts at 0");
+
+    // Enter with no digits typed: close, no scroll.
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(!ctrl.prompt_open(), "empty Enter closes the prompt (AC-5)");
+    assert_eq!(
+        ctrl.content_scroll(),
+        0,
+        "scroll unchanged on empty Enter (AC-5)"
+    );
+}
+
+#[test]
+fn go_to_line_esc_closes_without_jumping() {
+    // AC-6: Esc closes the prompt and leaves content_scroll unchanged.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_lines(dir.path(), 50);
+    await_marker(&mut ctrl, "L0");
+    ctrl.set_content_viewport(40, 10);
+
+    ctrl.handle(Intent::OpenGoToLine);
+    assert!(ctrl.prompt_open());
+    // Type some digits to prove Esc discards them.
+    ctrl.handle_prompt_key(key(KeyCode::Char('3')));
+    ctrl.handle_prompt_key(key(KeyCode::Char('7')));
+    assert_eq!(ctrl.prompt_query(), "37");
+    ctrl.handle_prompt_key(key(KeyCode::Esc));
+    assert!(!ctrl.prompt_open(), "Esc closes the prompt (AC-6)");
+    assert_eq!(ctrl.content_scroll(), 0, "scroll unchanged on Esc (AC-6)");
+}
+
+#[test]
+fn open_go_to_line_is_unavailable_when_no_file_is_selected() {
+    // AC-7 edge: when the cursor sits on a directory, selected_view_mode() is None →
+    // open_go_to_line fires the unavailable notice and leaves the prompt closed.
+    // Build a tree whose first (and only non-hidden) node is a subdirectory.
+    // The tree lists alphabetically: "adir/" sorts before any file we might add,
+    // and since the cursor starts at index 0, the first node (the directory) is selected.
+    let dir = TempDir::new();
+    std::fs::create_dir(dir.path().join("adir")).unwrap();
+    // Add a file so the controller_with_lines render worker has something to render,
+    // but the tree cursor starts at "adir/" (index 0, a directory).
+    std::fs::write(dir.path().join("z.txt"), "content\n").unwrap();
+
+    // Use the plain `controller()` helper (not controller_with_lines) — we only need
+    // the directory-selection behaviour, not a specific rendered line count.
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // Confirm the first visible node is a directory (precondition).
+    let nodes = ctrl.tree().visible_nodes();
+    assert!(
+        !nodes.is_empty(),
+        "tree must have at least one visible node"
+    );
+    let first = &nodes[0];
+    assert_eq!(
+        first.path.file_name().unwrap().to_str().unwrap(),
+        "adir",
+        "precondition: first node is the subdirectory"
+    );
+    // Cursor starts at 0 → the directory is selected → selected_view_mode() is None.
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        None,
+        "precondition: directory has no view mode"
+    );
+
+    ctrl.handle(Intent::OpenGoToLine);
+    assert!(
+        !ctrl.prompt_open(),
+        "AC-7 edge: prompt must NOT open when a directory is selected"
+    );
+    assert!(
+        ctrl.action_notice().is_some(),
+        "AC-7 edge: an unavailable notice is set when a directory is selected"
+    );
+}
