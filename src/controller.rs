@@ -16,16 +16,17 @@
 //! monotonic sequence so a slow render for a file the user has since left is dropped rather
 //! than clobbering the current selection.
 
+use crate::finder::FinderState;
 use crate::git::{Baseline, Status};
 use crate::herdr::HerdrCli;
 use crate::intent::Intent;
 use crate::picker::PickerState;
-use crate::presenter::{Focus, PaneGeometry, PickerRowView, PickerView, ViewState};
+use crate::presenter::{FinderView, Focus, PaneGeometry, PickerRowView, PickerView, ViewState};
 use crate::root::Resolved;
 use crate::tree::{Node, NodeKind, TreeModel};
 use crate::update::{self, UpdateState, Version};
 use crate::view_policy::{FileDescriptor, ViewMode, applicable_modes, default_mode};
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 use ratatui::text::Text;
 use std::collections::{BTreeMap, HashMap};
@@ -235,6 +236,10 @@ pub struct Controller {
     /// The open worktree picker's state, or `None` when closed (AC-1). A re-root closes it
     /// (AC-13); the switch itself is wired in later tasks.
     picker: Option<PickerState>,
+    /// The open go-to-file finder's state, or `None` when closed (AC-1). Opened by the `f` key
+    /// (OpenFinder intent); closed by confirm/cancel (T-7) and by [`re_root`](Self::re_root) (a
+    /// re-root invalidates the old-root candidate list).
+    finder: Option<FinderState>,
     /// The herdr query channel for the agent-active overlay (AC-3), injected post-construction
     /// via [`set_host`](Self::set_host). `None` until then ⇒ a git-only picker (AC-15).
     /// Session-level — survives a re-root unchanged.
@@ -312,6 +317,7 @@ impl Controller {
             update_rx: None,
             status_rx: None,
             picker: None,
+            finder: None,
             herdr: None,
             our_workspace_id: None,
             base_branch,
@@ -440,6 +446,13 @@ impl Controller {
         self.action_notice = None;
         self.changed = BTreeMap::new();
         self.picker = None;
+        // Close the finder too (symmetric teardown). A re-root invalidates its candidate list,
+        // which is rooted at the OLD root — a stale `confirm_finder` would then `root.join(old_rel)`
+        // against the NEW root and reveal nothing. Unreachable today (finder/picker are mutually
+        // exclusive and re_root only fires via picker-confirm), but kept structural so a future
+        // re-root trigger can't strand a finder. (review-gate R1: G2)
+        self.finder = None;
+        self.last_click = None;
 
         // PREFERENCES ARE CARRIED (AC-12) — deliberately NOT reset: show_ignored, hide_hidden,
         // changed_only, split_pct, wrap_override, baseline keep their current values. The fresh
@@ -616,8 +629,18 @@ impl Controller {
 
     /// Receive the hit-test geometry the Presenter drew this frame (fed back from the draw
     /// closure), so the next mouse event is mapped against the live layout.
+    ///
+    /// Also re-clamps the finder's stored horizontal scroll to the maximum the Presenter just
+    /// measured (`finder_max_hscroll`) — mirroring how [`set_content_viewport`](Self::set_content_viewport)
+    /// re-clamps `content_hscroll`. `scroll_right` is monotonic, so over-scrolling right would
+    /// otherwise leave the offset parked past the widest row, making the first few left presses
+    /// appear to do nothing until the overshoot burned down.
     pub fn set_pane_geometry(&mut self, geom: PaneGeometry) {
+        let finder_max_hscroll = geom.finder_max_hscroll;
         self.geom = geom;
+        if let Some(finder) = self.finder.as_mut() {
+            finder.clamp_hscroll(finder_max_hscroll);
+        }
     }
 
     /// The content scroll offset (lines). Exposed for the Presenter wiring and tests.
@@ -659,6 +682,7 @@ impl Controller {
             zoomed: self.zoomed,
             update_banner: self.update_banner(),
             picker: self.picker_view(),
+            finder: self.finder_view(),
         }
     }
 
@@ -685,6 +709,24 @@ impl Controller {
                 .collect(),
             cursor: picker.cursor,
             hscroll: picker.hscroll,
+        })
+    }
+
+    /// The owned finder draw model for the Presenter (AC-1, AC-2, AC-5), or `None` when the finder
+    /// is closed. Resolves the ranked match indices into owned root-relative path strings so the
+    /// Presenter is borrow-free; carries the current query and cursor. The Presenter sanitizes the
+    /// path strings (AC-27) and renders the query-input line + placeholder + match rows.
+    fn finder_view(&self) -> Option<FinderView> {
+        let f = self.finder.as_ref()?;
+        Some(FinderView {
+            query: f.query().to_string(),
+            matches: f
+                .matches()
+                .iter()
+                .map(|&i| f.candidates()[i].clone())
+                .collect(),
+            cursor: f.cursor(),
+            hscroll: f.hscroll(),
         })
     }
 
@@ -717,6 +759,13 @@ impl Controller {
         if self.picker.is_some() {
             return self.handle_picker_intent(intent);
         }
+        // The finder is modal too: while it is open the run loop (app.rs) routes raw keys to
+        // `handle_finder_key`, so `handle` should not be reached. Guard structurally anyway —
+        // symmetric with the picker guard above — so a future or test caller can't leak an intent
+        // to the tree or open a second modal beneath the finder overlay. (review-gate R1: O2)
+        if self.finder.is_some() {
+            return Effects::noop();
+        }
         match intent {
             Intent::NavUp => self.navigate(-1),
             Intent::NavDown => self.navigate(1),
@@ -739,6 +788,7 @@ impl Controller {
             Intent::Refresh => self.refresh(),
             Intent::DismissUpdate => self.dismiss_update(),
             Intent::SwitchWorktree => self.open_worktree_picker(),
+            Intent::OpenFinder => self.open_finder(),
             Intent::Close => self.close_or_unzoom(),
         }
     }
@@ -824,11 +874,16 @@ impl Controller {
     /// still works (herdr reserves Shift+mouse for exactly that). Selection/activation happen
     /// on button *release*, so a divider drag is never mistaken for a click.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> Effects {
-        // Modal: while the picker is open it is keyboard-only, so the mouse is inert — a click /
-        // wheel / drag behind the overlay must not drive the tree or content underneath. This
-        // mirrors the keyboard modal gate in `handle`. (review-gate R1, E)
+        // Modal: while the picker is open the mouse is fully inert — the picker is
+        // keyboard-only. This mirrors the keyboard modal gate in `handle`. (review-gate R1, E)
         if self.picker.is_some() {
             return Effects::noop();
+        }
+        // The finder is also a modal overlay, but it IS mouse-interactive: wheel scrolls the
+        // selection, click selects a result row, double-click confirms. Route to the finder's
+        // own handler; it never leaks to the tree/content beneath.
+        if self.finder.is_some() {
+            return self.handle_finder_mouse(ev);
         }
         if ev.modifiers.contains(KeyModifiers::SHIFT) {
             return Effects::noop();
@@ -867,6 +922,9 @@ impl Controller {
                 Some(Drag::ContentH) => self.scroll_content_h_to_col(col),
                 Some(Drag::TreeV) => self.scroll_tree_to_row(row),
                 Some(Drag::TreeH) => self.scroll_tree_h_to_col(col),
+                // The finder is modal: its scrollbar drag is handled in handle_finder_mouse and
+                // never reaches this (non-finder) path. Covered here only for exhaustiveness.
+                Some(Drag::FinderV) => Effects::noop(),
                 None => Effects::noop(),
             },
             MouseEventKind::Up(MouseButton::Left) => {
@@ -883,6 +941,153 @@ impl Controller {
         }
     }
 
+    /// Handle a mouse event while the go-to-file finder is open (the finder is mouse-interactive;
+    /// it owns all mouse while open and never leaks events to the tree/content beneath).
+    ///
+    /// - `ScrollDown`/`ScrollUp` → move the finder selection by `WHEEL_STEP`, clamped.
+    ///   Position-independent (the finder is the active modal).
+    /// - `Up(Left)` → click on a result row (select; double-click confirms).
+    /// - `Down`/`Drag`/other → inert no-op (no drag in the finder).
+    /// - `Shift`+mouse → inert (terminal selection, same as the main gate).
+    fn handle_finder_mouse(&mut self, ev: MouseEvent) -> Effects {
+        use ratatui::layout::Position;
+        // Shift+mouse: terminal selection — inert, same as the main mouse gate.
+        if ev.modifiers.contains(KeyModifiers::SHIFT) {
+            return Effects::noop();
+        }
+        match ev.kind {
+            MouseEventKind::ScrollDown => self.finder_move_selection(WHEEL_STEP),
+            MouseEventKind::ScrollUp => self.finder_move_selection(-WHEEL_STEP),
+            // Horizontal wheel: scroll the result rows sideways, mirroring the vertical-wheel
+            // handling above. Additive to the keyboard ←/→ scroll (AC-18 keyboard-first).
+            MouseEventKind::ScrollRight => {
+                if let Some(f) = self.finder.as_mut() {
+                    f.scroll_right();
+                    Effects::redraw()
+                } else {
+                    Effects::noop()
+                }
+            }
+            MouseEventKind::ScrollLeft => {
+                if let Some(f) = self.finder.as_mut() {
+                    f.scroll_left();
+                    Effects::redraw()
+                } else {
+                    Effects::noop()
+                }
+            }
+            // A press on the finder's vertical scrollbar starts a scroll-drag AND jumps the
+            // selection to the pressed position (click-to-scroll), mirroring the content/tree bars.
+            // Any other press waits for the release (a click on a result row). Always (re)set `drag`
+            // from the press so a stale drag can't keep acting on later moves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = if self.geom.finder_vbar.is_some_and(|t| {
+                    t.contains(Position {
+                        x: ev.column,
+                        y: ev.row,
+                    })
+                }) {
+                    Some(Drag::FinderV)
+                } else {
+                    None
+                };
+                if matches!(self.drag, Some(Drag::FinderV)) {
+                    self.finder_scroll_to_row(ev.row)
+                } else {
+                    Effects::noop()
+                }
+            }
+            // Continue a scrollbar drag: map the row to a selection position.
+            MouseEventKind::Drag(MouseButton::Left) if matches!(self.drag, Some(Drag::FinderV)) => {
+                self.finder_scroll_to_row(ev.row)
+            }
+            // A release ends a scrollbar drag (not a row click); otherwise it is a click on a row.
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    self.last_click = None; // a drag-release is not a click; break double-click pairing
+                    Effects::noop()
+                } else {
+                    self.handle_finder_click(ev.column, ev.row)
+                }
+            }
+            // Other events (right/middle button, Moved, a Drag with no active finder drag): inert.
+            _ => Effects::noop(),
+        }
+    }
+
+    /// Map a vertical press/drag on the finder's scrollbar track (`geom.finder_vbar`) to a
+    /// selection position: the fraction along the track maps linearly onto the match list and moves
+    /// the cursor (the finder window follows the cursor, and the scrollbar thumb tracks it). No-op
+    /// without a drawn bar or any matches.
+    fn finder_scroll_to_row(&mut self, row: u16) -> Effects {
+        let Some(track) = self.geom.finder_vbar else {
+            return Effects::noop();
+        };
+        let (rel, span) = Self::track_fraction(row, track.y, track.height);
+        let Some(finder) = self.finder.as_mut() else {
+            return Effects::noop();
+        };
+        let total = finder.matches().len();
+        if span == 0 || total == 0 {
+            return Effects::noop();
+        }
+        let max = (total - 1) as u32;
+        let idx = ((rel * max + span / 2) / span) as usize;
+        finder.set_cursor(idx);
+        Effects::redraw()
+    }
+
+    /// Move the finder selection by `delta` rows (positive = down, negative = up), clamped. A
+    /// no-op when the finder is closed or the match list is empty.
+    fn finder_move_selection(&mut self, delta: isize) -> Effects {
+        if let Some(f) = self.finder.as_mut() {
+            f.move_selection(delta);
+            Effects::redraw()
+        } else {
+            Effects::noop()
+        }
+    }
+
+    /// Handle a left-button release while the finder is open. Maps the screen cell `(col, row)`
+    /// to a result-row index via `self.geom.finder_rows` + `self.geom.finder_scroll`. A click
+    /// inside the rows area selects that row (double-click confirms); a click anywhere else is a
+    /// modal no-op (the finder stays open — Esc cancels, not an outside click).
+    fn handle_finder_click(&mut self, col: u16, row: u16) -> Effects {
+        use ratatui::layout::Position;
+        let Some(rows_rect) = self.geom.finder_rows else {
+            // No rows area (empty query or zero matches) — click is inert but modal.
+            self.last_click = None;
+            return Effects::noop();
+        };
+        if !rows_rect.contains(Position { x: col, y: row }) {
+            // Click outside the rows area (on the border, query line, etc.) — inert, modal.
+            self.last_click = None;
+            return Effects::noop();
+        }
+        // Map screen row → absolute match-list index.
+        let idx = self.geom.finder_scroll as usize + (row - rows_rect.y) as usize;
+        let Some(finder) = self.finder.as_ref() else {
+            return Effects::noop();
+        };
+        if idx >= finder.matches().len() {
+            // Click landed in the empty area below the last result row — inert.
+            self.last_click = None;
+            return Effects::noop();
+        }
+        let now = Instant::now();
+        let double = is_double_click(self.last_click, (col, row), now);
+        self.last_click = Some((col, row, now));
+        // Set the finder cursor to the clicked row.
+        if let Some(f) = self.finder.as_mut() {
+            f.set_cursor(idx);
+        }
+        if double {
+            // Double-click: confirm (same as Enter — reveal + render + close).
+            return self.confirm_finder();
+        }
+        Effects::redraw()
+    }
+
     /// A completed left-click: select the tree row it landed on (or focus the content pane). A
     /// double-click [`activate`](Self::activate)s the row — a directory toggles expand/collapse,
     /// a file opens in zoom mode (the editor hand-off is the `e` key, not the mouse).
@@ -896,9 +1101,10 @@ impl Controller {
                     return Effects::noop(); // pending double-click sequence
                 }
                 // A double-click is two clicks on the SAME tree row within the window. Because
-                // every non-tree-row click clears `last_click` (below), it only ever holds prior
-                // tree-row clicks — so the column-agnostic same-row match in `is_double_click`
-                // can never be tripped by a click in another pane that happens to share a row.
+                // every non-tree-row click clears `last_click` (below), AND the finder's
+                // open/confirm/Esc paths also clear it, `last_click` only ever holds a prior
+                // tree-row click — the column-agnostic same-row match in `is_double_click`
+                // cannot be tripped by a click in a different context (another pane or the finder).
                 let double = is_double_click(self.last_click, (col, row), now);
                 self.last_click = Some((col, row, now));
                 self.action_notice = None;
@@ -1518,6 +1724,165 @@ impl Controller {
         Effects::redraw()
     }
 
+    /// Open the go-to-file finder (AC-1). Builds the file index for the current root, then
+    /// installs a fresh `FinderState` with an empty query and the full candidate list.
+    /// Returns [`Effects::redraw`] so the run loop paints the overlay on the next tick (T-8).
+    ///
+    /// Modal mutual-exclusion (finder inert while the picker is open) holds BY CONSTRUCTION:
+    /// `handle()` routes to `handle_picker_intent()` while `self.picker.is_some()`, and its
+    /// catch-all `_ => Effects::noop()` swallows `OpenFinder`. No extra guard is needed here.
+    fn open_finder(&mut self) -> Effects {
+        let candidates = crate::index::build(&self.root);
+        self.finder = Some(FinderState::new(candidates));
+        self.last_click = None; // opening the finder resets double-click state so a prior tree
+        // click cannot pair with the first finder click as a double-click
+        Effects::redraw()
+    }
+
+    /// Whether the go-to-file finder overlay is currently open.
+    pub fn finder_open(&self) -> bool {
+        self.finder.is_some()
+    }
+
+    /// The full candidate list loaded when the finder was opened, or an empty slice when
+    /// the finder is closed. Exposed for tests (T-5); the Presenter/T-8 read via `finder()`.
+    pub fn finder_candidates(&self) -> &[String] {
+        self.finder.as_ref().map(|f| f.candidates()).unwrap_or(&[])
+    }
+
+    /// The current finder query string, or `""` when the finder is closed or the query is
+    /// empty. Exposed for tests (T-5); the Presenter/T-8 reads via `finder()`.
+    pub fn finder_query(&self) -> &str {
+        self.finder.as_ref().map(|f| f.query()).unwrap_or("")
+    }
+
+    /// The current ranked match indices (into `finder_candidates()`), or `&[]` when the finder
+    /// is closed or the query is empty. Exposed for tests (T-6) and the Presenter (T-8).
+    pub fn finder_matches(&self) -> &[usize] {
+        self.finder.as_ref().map(|f| f.matches()).unwrap_or(&[])
+    }
+
+    /// The cursor position within the match list, or `0` when the finder is closed or the
+    /// list is empty. Exposed for tests (T-6) and confirm (T-7).
+    pub fn finder_cursor(&self) -> usize {
+        self.finder.as_ref().map(|f| f.cursor()).unwrap_or(0)
+    }
+
+    /// The horizontal scroll offset for the result rows, or `0` when the finder is closed.
+    /// Exposed for tests that verify Left/Right keys and horizontal wheel move hscroll.
+    pub fn finder_hscroll(&self) -> u16 {
+        self.finder.as_ref().map(|f| f.hscroll()).unwrap_or(0)
+    }
+
+    /// Route a key event while the finder overlay is open.
+    ///
+    /// - A printable `Char(c)` with no modifier other than `SHIFT` pushes the character,
+    ///   re-runs [`fuzzy::match_and_rank`] over the candidates, and resets the selection
+    ///   to 0 (AC-7).
+    /// - `Backspace` deletes the last character and re-matches (AC-7).
+    /// - `Up`/`Down` move the selection within the current match list, clamped at both ends
+    ///   (AC-8).
+    /// - `Enter` confirms the selection — reveal + render, or a non-fatal notice on a vanished
+    ///   target, or a no-op that keeps the finder open when there are no matches (AC-6, AC-10,
+    ///   AC-11, AC-20). `Esc` discards the finder, leaving the prior state intact (AC-9).
+    ///
+    /// When the finder is not open, all keys are a no-op (defensive guard).
+    pub fn handle_finder_key(&mut self, key: KeyEvent) -> Effects {
+        let Some(finder) = self.finder.as_mut() else {
+            return Effects::noop();
+        };
+        let effects = match key.code {
+            KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                finder.push(c);
+                Effects::redraw()
+            }
+            KeyCode::Backspace => {
+                finder.backspace();
+                Effects::redraw()
+            }
+            KeyCode::Up => {
+                finder.move_selection(-1);
+                Effects::redraw()
+            }
+            KeyCode::Down => {
+                finder.move_selection(1);
+                Effects::redraw()
+            }
+            // Left/Right: horizontal scroll of the result rows. The prompt is append-only so the
+            // arrow keys are free — exactly as the picker uses ←/→ for hscroll. The Presenter
+            // clamps to `max_row_width − inner_width` at draw, so over-scrolling is harmless here.
+            KeyCode::Left => {
+                finder.scroll_left();
+                Effects::redraw()
+            }
+            KeyCode::Right => {
+                finder.scroll_right();
+                Effects::redraw()
+            }
+            // Enter/Esc dismiss or confirm; both already reset `last_click` (confirm_finder, and
+            // the Esc arm) and return early, so they never reach the reset below.
+            KeyCode::Enter => return self.confirm_finder(),
+            KeyCode::Esc => {
+                self.finder = None;
+                self.last_click = None; // closing the finder resets double-click state so a
+                // finder click cannot pair with the next tree click
+                return Effects::redraw();
+            }
+            _ => Effects::noop(),
+        };
+        // review-gate R1 (O1): a query edit, selection move, or scroll resets a PENDING mouse
+        // double-click. Without this, a finder click → keystroke/nav → click on the SAME screen
+        // row within the double-click window would be misread as a double-click (confirm), opening
+        // a file the user only single-clicked — often a different one, since typing changed the
+        // match list. Mirrors the open/Esc/confirm `last_click` clears for the keystroke/nav vector.
+        self.last_click = None;
+        effects
+    }
+
+    /// Confirm the current finder selection: take the selected candidate's root-relative path,
+    /// join with the root, and call [`TreeModel::reveal`]. On success re-sync the controller's
+    /// filter mirrors (reveal may have relaxed `changed_only`/`hide_hidden` in the tree),
+    /// dispatch a render for the newly-selected file, close the finder, and return a redraw.
+    ///
+    /// - Zero matches (empty list) → no-op; finder stays open (AC-6).
+    /// - Reveal returns `false` (target missing/removed since open) → close the finder, set a
+    ///   non-fatal `action_notice`, leave the tree selection unchanged (AC-20).
+    fn confirm_finder(&mut self) -> Effects {
+        let Some(finder) = self.finder.as_ref() else {
+            return Effects::noop();
+        };
+        let Some(cand_idx) = finder.selected_candidate_index() else {
+            return Effects::noop(); // zero matches → no-op, finder stays open (AC-6)
+        };
+        let rel = finder.candidates()[cand_idx].clone();
+        let abs = self.root.join(&rel);
+        self.finder = None; // confirm dismisses the modal regardless of reveal outcome
+        self.last_click = None; // closing the finder resets double-click state
+        if self.tree.reveal(&abs) {
+            // reveal() may have relaxed the tree's changed_only/hide_hidden fields — re-sync
+            // the controller's mirror fields so a later `c`/`.` toggle stays consistent
+            // (T-4 review note: the mirrors at controller.rs:166-168 drive those toggles).
+            self.changed_only = self.tree.changed_only();
+            self.hide_hidden = self.tree.hide_hidden();
+            // If the content pane isn't currently visible — the narrow, tree-only layout where the
+            // last frame drew no content column (`content_width == 0`) — open the jumped-to file in
+            // zoom mode so the user actually SEES the file they jumped to, instead of landing on a
+            // tree row with the file hidden off-screen. This mirrors the tree's Enter/activate on a
+            // file (content full-screen). When the content is already visible (the wide two-column
+            // layout, or already zoomed), the layout is left untouched and the file just renders.
+            if self.content_width == 0 {
+                self.zoomed = true;
+                self.focus = Focus::Content;
+            }
+            self.dispatch_render();
+            Effects::redraw()
+        } else {
+            // Target has disappeared since the finder was opened — non-fatal notice (AC-20).
+            self.action_notice = Some(format!("Could not open {rel}"));
+            Effects::redraw()
+        }
+    }
+
     /// Fetch the herdr agent overlay — the `worktree list` + `agent list` JSON — with exactly the
     /// two read-only queries (AC-20), or `None` when herdr is absent or either query fails (a
     /// git-only picker, AC-15). herdr's `worktree list` and `agent list` BOTH print JSON by
@@ -1740,6 +2105,8 @@ enum Drag {
     ContentH,
     TreeV,
     TreeH,
+    /// Dragging the finder overlay's vertical scrollbar (handled in `handle_finder_mouse`).
+    FinderV,
 }
 
 /// Two left-clicks on the same **row** within [`DOUBLE_CLICK`] are a double-click. The column

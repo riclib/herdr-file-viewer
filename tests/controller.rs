@@ -981,6 +981,10 @@ fn wide_geometry() -> PaneGeometry {
         content_vbar: None,
         content_hbar: None,
         divider_x: Some(40),
+        finder_rows: None,
+        finder_scroll: 0,
+        finder_max_hscroll: 0,
+        finder_vbar: None,
     }
 }
 
@@ -2560,11 +2564,14 @@ fn picker_other_intents_are_inert() {
     let cursor_before = ctrl.picker().unwrap().cursor;
 
     // These should all be no-ops (picker stays open, root unchanged, cursor unchanged).
+    // OpenFinder included: the finder must NOT open while the picker is the active modal
+    // (modal mutual-exclusion, gate L-3) — handle() routes to handle_picker_intent first.
     for intent in [
         Intent::ToggleIgnore,
         Intent::ToggleChangedOnly,
         Intent::CycleView,
         Intent::ToggleFocus,
+        Intent::OpenFinder,
     ] {
         ctrl.handle(intent);
     }
@@ -2572,6 +2579,10 @@ fn picker_other_intents_are_inert() {
     assert!(
         ctrl.picker().is_some(),
         "picker stays open for inert intents"
+    );
+    assert!(
+        !ctrl.finder_open(),
+        "OpenFinder is inert while the picker is open — finder must not open (modal mutual-exclusion)"
     );
     assert_eq!(
         ctrl.picker().unwrap().cursor,
@@ -2746,6 +2757,12 @@ fn re_root_only_reachable_via_switch_worktree_intent() {
             ctrl.picker().is_none(),
             "AC-N5: intent {intent:?} must not open the picker (and leave it auto-confirmed)"
         );
+        // OpenFinder (in Intent::ALL) opens the finder; close it so each intent is exercised from a
+        // clean no-modal state — and so it is not left open for Part 2, where the finder's modal
+        // guard would otherwise make SwitchWorktree inert. (review-gate R1: O2)
+        if ctrl.finder_open() {
+            ctrl.handle_finder_key(key(KeyCode::Esc));
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -2785,5 +2802,1755 @@ fn re_root_only_reachable_via_switch_worktree_intent() {
         common::canon(ctrl.root()),
         common::canon(&root_before),
         "AC-N5: root MUST change after SwitchWorktree → NavDown → Activate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-6 — Finder keystroke matching + selection navigation (AC-6, AC-7, AC-8)
+// ---------------------------------------------------------------------------
+
+use crossterm::event::{KeyCode, KeyEvent};
+
+/// Build a `KeyEvent` with no modifiers.
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// Build a `KeyEvent` for a printable char with SHIFT (e.g. uppercase letters).
+fn key_shift(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+}
+
+/// Build a `KeyEvent` with Ctrl held — must be rejected by handle_finder_key.
+fn key_ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+/// Build a temp dir with files at known names and return the dir + controller.
+fn finder_dir() -> (TempDir, Controller) {
+    let dir = TempDir::new();
+    // Three files: two in root, one in a sub-dir — deterministic candidate list.
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    (dir, ctrl)
+}
+
+/// Map `finder_matches()` indices through `finder_candidates()` to get paths.
+fn match_paths(ctrl: &Controller) -> Vec<String> {
+    let candidates = ctrl.finder_candidates().to_vec();
+    ctrl.finder_matches()
+        .iter()
+        .map(|&i| candidates[i].clone())
+        .collect()
+}
+
+#[test]
+fn finder_matches_empty_before_any_keystroke() {
+    // AC-6 / AC-7: when the finder is freshly opened the query is empty and the match list is
+    // empty (no results until the user types — match_and_rank returns [] for an empty query).
+    let (_dir, ctrl) = finder_dir();
+    assert_eq!(ctrl.finder_query(), "", "query starts empty");
+    assert!(
+        ctrl.finder_matches().is_empty(),
+        "no matches until the user types (AC-6 backing)"
+    );
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor starts at 0");
+}
+
+#[test]
+fn finder_confirm_zooms_the_file_when_only_the_tree_is_visible() {
+    // Live-test fix: in the narrow, tree-only layout the Presenter draws no content column, so the
+    // controller's last-observed content viewport is (0, 0). Confirming a finder jump there must
+    // open the file in ZOOM mode so the user actually sees the file they jumped to — instead of
+    // landing on a tree row with the file hidden off-screen. Mirrors the tree's Enter/activate on a
+    // file (content full-screen).
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.set_content_viewport(0, 0); // the Presenter drew no content column (tree-only layout)
+    assert!(!ctrl.zoomed(), "precondition: not zoomed");
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // 'a' matches alpha.txt / beta.rs / gamma.rs
+    assert!(
+        !ctrl.finder_matches().is_empty(),
+        "query 'a' matches at least one file"
+    );
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    assert!(!ctrl.finder_open(), "finder closed on confirm");
+    assert!(
+        ctrl.zoomed(),
+        "content was hidden (tree-only) → the jumped-to file opens in zoom mode"
+    );
+}
+
+#[test]
+fn finder_confirm_does_not_force_zoom_when_content_is_visible() {
+    // The complement: when a content column IS on screen (wide two-column layout, content_width > 0),
+    // a finder confirm renders the file in place and must NOT force zoom — the user keeps the layout
+    // they were in.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.set_content_viewport(60, 20); // the Presenter drew a content column last frame
+    assert!(!ctrl.zoomed(), "precondition: not zoomed");
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(!ctrl.finder_matches().is_empty());
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    assert!(!ctrl.finder_open(), "finder closed on confirm");
+    assert!(
+        !ctrl.zoomed(),
+        "content already visible → finder confirm must not force zoom"
+    );
+}
+
+#[test]
+fn typing_a_char_updates_query_and_matches_and_resets_cursor() {
+    // AC-7: a Char keystroke pushes the character, re-runs fuzzy::match_and_rank, and resets
+    // the selection to 0 (so a mid-list cursor from a prior query doesn't carry over).
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Manually advance the cursor first so we can check it resets.
+    let fx = ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(fx.redraw, "a Char key signals a redraw");
+    assert_eq!(ctrl.finder_query(), "a", "query appends the char");
+    // "alpha.txt" and "gamma.rs" both have 'a'; "beta.rs" does not.
+    let paths = match_paths(&ctrl);
+    assert!(!paths.is_empty(), "at least one candidate matches 'a'");
+    assert!(
+        paths.iter().all(|p| p.to_lowercase().contains('a')),
+        "every match contains 'a': {paths:?}"
+    );
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor resets to 0 on a new query");
+}
+
+#[test]
+fn typing_more_chars_narrows_matches() {
+    // AC-7: successive chars narrow the match list (subsequence filter).
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    let after_b = match_paths(&ctrl);
+    assert!(!after_b.is_empty(), "something matches 'b'");
+
+    ctrl.handle_finder_key(key(KeyCode::Char('e')));
+    let after_be = match_paths(&ctrl);
+    // "be" as a subsequence only matches "beta.rs".
+    assert!(
+        after_be.len() <= after_b.len(),
+        "adding a char never grows the match list"
+    );
+    assert_eq!(ctrl.finder_query(), "be", "query is 'be'");
+}
+
+#[test]
+fn no_match_query_produces_empty_list() {
+    // AC-6 (empty when nothing matches): a query with no candidates yields an empty match list,
+    // not a panic or a stale result.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    // None of our files ("alpha.txt", "beta.rs", "sub/gamma.rs") contain "zzz".
+    assert_eq!(ctrl.finder_query(), "zzz");
+    assert!(
+        ctrl.finder_matches().is_empty(),
+        "a non-matching query yields an empty match list (AC-6)"
+    );
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor stays 0 when list is empty");
+}
+
+#[test]
+fn backspace_shrinks_query_and_rematches() {
+    // AC-7: Backspace removes the last character and re-runs match_and_rank.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    ctrl.handle_finder_key(key(KeyCode::Char('e')));
+    assert_eq!(ctrl.finder_query(), "be");
+    let after_be = ctrl.finder_matches().len();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Backspace));
+    assert!(fx.redraw, "Backspace signals a redraw");
+    assert_eq!(ctrl.finder_query(), "b", "Backspace removes the last char");
+    let after_b = ctrl.finder_matches().len();
+    assert!(
+        after_b >= after_be,
+        "removing a char broadens or keeps the match list"
+    );
+}
+
+#[test]
+fn backspace_on_empty_query_is_a_noop() {
+    // Backspace with an empty prompt must not panic or produce wrong state.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Backspace));
+    assert!(fx.redraw, "Backspace redraws even on an empty query");
+    assert_eq!(ctrl.finder_query(), "", "still empty after Backspace");
+    assert!(ctrl.finder_matches().is_empty(), "still no matches");
+}
+
+#[test]
+fn cursor_resets_to_zero_after_every_query_change() {
+    // AC-8: every query change (push or Backspace) resets the selection to 0 so the old
+    // position (into a now-different list) is never surfaced.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Navigate down, then type — cursor must reset.
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // match list: ≥1 entry
+    ctrl.handle_finder_key(key(KeyCode::Down));
+    // Only meaningful if the list had more than one entry; skip the nav assertion.
+    ctrl.handle_finder_key(key(KeyCode::Char('l'))); // narrow further
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "cursor resets to 0 on every query change"
+    );
+}
+
+#[test]
+fn down_and_up_move_the_cursor_within_the_match_list() {
+    // AC-8: Down/Up move the selection within the current match list.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // 'a' matches at least two files ("alpha.txt" and "sub/gamma.rs").
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    let count = ctrl.finder_matches().len();
+    assert!(
+        count >= 2,
+        "need ≥2 matches to test navigation; got {count}"
+    );
+
+    let fx_down = ctrl.handle_finder_key(key(KeyCode::Down));
+    assert!(fx_down.redraw, "Down signals a redraw");
+    assert_eq!(ctrl.finder_cursor(), 1, "Down moves the cursor to 1");
+
+    let fx_up = ctrl.handle_finder_key(key(KeyCode::Up));
+    assert!(fx_up.redraw, "Up signals a redraw");
+    assert_eq!(ctrl.finder_cursor(), 0, "Up returns the cursor to 0");
+}
+
+#[test]
+fn down_clamps_at_the_last_match() {
+    // AC-8: Down is clamped — it never runs past the end of the match list.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    let count = ctrl.finder_matches().len();
+    assert!(count >= 1);
+
+    // Press Down more times than there are matches.
+    for _ in 0..(count + 5) {
+        ctrl.handle_finder_key(key(KeyCode::Down));
+    }
+    assert_eq!(
+        ctrl.finder_cursor(),
+        count - 1,
+        "Down clamps at the last match (index {})",
+        count - 1
+    );
+}
+
+#[test]
+fn up_clamps_at_zero() {
+    // AC-8: Up is clamped — it never goes below index 0.
+    let (_dir, mut ctrl) = finder_dir();
+
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+
+    for _ in 0..10 {
+        ctrl.handle_finder_key(key(KeyCode::Up));
+    }
+    assert_eq!(ctrl.finder_cursor(), 0, "Up clamps at 0");
+}
+
+#[test]
+fn nav_on_empty_match_list_stays_at_zero() {
+    // AC-8 edge-case: Down/Up are inert (cursor stays 0) when the match list is empty.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Empty query → empty matches.
+    ctrl.handle_finder_key(key(KeyCode::Down));
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "Down on empty list → cursor stays 0"
+    );
+    ctrl.handle_finder_key(key(KeyCode::Up));
+    assert_eq!(ctrl.finder_cursor(), 0, "Up on empty list → cursor stays 0");
+}
+
+#[test]
+fn uppercase_char_with_shift_is_accepted_and_appended() {
+    // A Shift+Char (uppercase letter) is a printable keystroke — the modifier check allows SHIFT.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key_shift('A'));
+    assert!(fx.redraw);
+    assert_eq!(ctrl.finder_query(), "A", "Shift+A appends 'A' to the query");
+}
+
+#[test]
+fn ctrl_char_is_rejected_and_does_not_change_state() {
+    // A Ctrl+Char must NOT push to the query — it falls through to the noop arm.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key_ctrl('a'));
+    assert!(
+        !fx.redraw,
+        "Ctrl+Char produces a noop (falls through to _ => Effects::noop())"
+    );
+    assert_eq!(ctrl.finder_query(), "", "query unchanged after Ctrl+Char");
+}
+
+#[test]
+fn handle_finder_key_is_noop_when_finder_is_closed() {
+    // If the caller accidentally sends a finder key when no finder is open, the controller
+    // must produce a noop and not panic.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(!ctrl.finder_open(), "precondition: finder is closed");
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(
+        !fx.redraw && !fx.quit,
+        "a finder key with the finder closed is a noop"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-5 — OpenFinder intent: open + finder_open (AC-1, AC-18)
+// ---------------------------------------------------------------------------
+
+/// AC-1 / AC-18: handle(OpenFinder) opens the finder (finder_open() → true), populates it
+/// with the candidates that index::build returns for the root, and leaves the query empty.
+#[test]
+fn open_finder_opens_finder_with_full_candidate_list_and_empty_query() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(!ctrl.finder_open(), "finder starts closed");
+
+    let fx = ctrl.handle(Intent::OpenFinder);
+    assert!(fx.redraw, "OpenFinder triggers a redraw");
+    assert!(ctrl.finder_open(), "finder_open() is true after OpenFinder");
+
+    // Candidates must equal index::build(root) — same set, order may differ.
+    let mut expected = herdr_file_viewer::index::build(dir.path());
+    expected.sort();
+    let mut got = ctrl.finder_candidates().to_vec();
+    got.sort();
+    assert_eq!(got, expected, "candidates must equal index::build(root)");
+
+    assert_eq!(
+        ctrl.finder_query(),
+        "",
+        "query is empty when the finder is first opened"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-7 — Confirm (reveal + render) · cancel · no-match no-op
+// ---------------------------------------------------------------------------
+
+/// Build a temp dir with files and an open finder (git repo variant so changed_only works).
+fn finder_dir_git() -> (TempDir, Controller) {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+    // Only beta.rs is in the changed-set.
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("beta.rs"), Status::Modified);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+    ctrl.handle(Intent::OpenFinder);
+    (dir, ctrl)
+}
+
+#[test]
+fn enter_with_match_closes_finder_and_reveals_file_and_redraws() {
+    // AC-10, AC-11: Enter on a matched candidate closes the finder, moves the tree cursor to
+    // that file, and triggers a redraw (content is dispatched for the new selection).
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Type 'b' to match "beta.rs".
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    let matches = ctrl.finder_matches().to_vec();
+    assert!(
+        !matches.is_empty(),
+        "precondition: at least one match for 'b'"
+    );
+
+    let candidates = ctrl.finder_candidates().to_vec();
+    let selected_path = candidates[matches[0]].clone();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(fx.redraw, "Enter with a match signals a redraw");
+    assert!(!ctrl.finder_open(), "finder is closed after Enter (AC-10)");
+
+    // The tree's selected node must be the confirmed file.
+    let selected = ctrl
+        .tree()
+        .selected()
+        .expect("a node is selected after reveal");
+    let selected_rel = selected
+        .path
+        .strip_prefix(ctrl.root())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        selected_rel, selected_path,
+        "tree cursor points to the confirmed file (AC-11)"
+    );
+}
+
+#[test]
+fn enter_with_zero_matches_keeps_finder_open_and_is_noop() {
+    // AC-6: Enter with zero matches must be a no-op — the finder stays open so the user can
+    // refine their query rather than being unexpectedly dismissed.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Type a non-matching query.
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    ctrl.handle_finder_key(key(KeyCode::Char('z')));
+    assert!(
+        ctrl.finder_matches().is_empty(),
+        "precondition: no matches for 'zzz'"
+    );
+
+    let cursor_before = ctrl.tree().cursor();
+    let fx = ctrl.handle_finder_key(key(KeyCode::Enter));
+    // Not a redraw: the no-op is completely inert (no state change).
+    assert!(!fx.redraw, "Enter with zero matches is a noop (no redraw)");
+    assert!(
+        ctrl.finder_open(),
+        "finder stays open when there are no matches (AC-6)"
+    );
+    assert_eq!(
+        ctrl.tree().cursor(),
+        cursor_before,
+        "tree cursor is unchanged"
+    );
+}
+
+#[test]
+fn enter_on_missing_target_sets_notice_and_closes_finder() {
+    // AC-20: if the selected candidate has been removed from disk since the finder was opened,
+    // Enter must close the finder, set a non-fatal notice, and leave the tree selection unchanged.
+    let (dir, mut ctrl) = finder_dir();
+
+    // Match "beta.rs", then delete it before confirming.
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    let matches = ctrl.finder_matches().to_vec();
+    assert!(!matches.is_empty(), "precondition: 'b' matches beta.rs");
+    // Verify we're going to try to reveal beta.rs.
+    let candidate = &ctrl.finder_candidates()[matches[0]];
+    assert!(
+        candidate.contains("beta"),
+        "expect beta.rs to be the match: {candidate}"
+    );
+
+    let cursor_before = ctrl.tree().cursor();
+    // Delete the file so reveal() returns false.
+    std::fs::remove_file(dir.path().join("beta.rs")).unwrap();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(
+        fx.redraw,
+        "Enter on a missing target still redraws (notice)"
+    );
+    assert!(
+        !ctrl.finder_open(),
+        "finder is closed even on a failed reveal (AC-20)"
+    );
+    assert!(
+        ctrl.action_notice().is_some(),
+        "a non-fatal notice is set when the target is missing (AC-20)"
+    );
+    assert!(
+        ctrl.action_notice().unwrap().contains("beta"),
+        "notice names the missing file: {:?}",
+        ctrl.action_notice()
+    );
+    assert_eq!(
+        ctrl.tree().cursor(),
+        cursor_before,
+        "tree selection unchanged when reveal fails"
+    );
+}
+
+#[test]
+fn esc_closes_finder_and_leaves_tree_unchanged() {
+    // AC-9: Esc discards the finder without touching the tree selection, root, or content.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Navigate the tree to a known position.
+    ctrl.handle(Intent::NavDown);
+    let cursor_before = ctrl.tree().cursor();
+    // Type something to prove the query is also discarded.
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(!ctrl.finder_matches().is_empty(), "precondition");
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Esc));
+    assert!(fx.redraw, "Esc signals a redraw");
+    assert!(!ctrl.finder_open(), "finder is closed after Esc (AC-9)");
+    assert_eq!(
+        ctrl.tree().cursor(),
+        cursor_before,
+        "tree cursor unchanged after Esc (AC-9)"
+    );
+}
+
+#[test]
+fn enter_with_match_resyncs_changed_only_mirror_after_reveal() {
+    // Mirror-resync guard (T-4 review note): when changed_only is ON and the finder navigates
+    // to a file that is NOT in the changed-set, reveal() relaxes the tree's changed_only field
+    // to false. The controller's mirror must be re-synced — otherwise the next `c` toggle
+    // would read the stale mirror and re-apply the wrong filter.
+    let (_dir, mut ctrl) = finder_dir_git();
+    // finder_dir_git() opens the finder; close it so the changed-only toggle below isn't swallowed
+    // by the finder's modal guard (handle() is inert while the finder is open). (review-gate R1: O2)
+    ctrl.handle_finder_key(key(KeyCode::Esc));
+    assert!(
+        !ctrl.finder_open(),
+        "finder closed before toggling the filter"
+    );
+
+    // Turn on changed-only filter (only beta.rs is in the changed-set).
+    ctrl.handle(Intent::ToggleChangedOnly);
+    assert!(ctrl.changed_only(), "precondition: changed_only is ON");
+
+    // Open the finder and jump to alpha.txt (not in the changed-set).
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    // alpha.txt should match.
+    let matches = ctrl.finder_matches().to_vec();
+    let candidates = ctrl.finder_candidates().to_vec();
+    let alpha_idx = matches
+        .iter()
+        .position(|&i| candidates[i].contains("alpha"))
+        .expect("alpha.txt must match 'a'");
+    // Navigate to alpha.txt's position in the list.
+    for _ in 0..alpha_idx {
+        ctrl.handle_finder_key(key(KeyCode::Down));
+    }
+    // Confirm: reveal() must relax changed_only in the tree AND the controller re-syncs its mirror.
+    let fx = ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(fx.redraw, "Enter redraws");
+    assert!(!ctrl.finder_open(), "finder closed");
+
+    // The controller mirror must be false (synced from the tree after reveal relaxed it).
+    assert!(
+        !ctrl.changed_only(),
+        "controller changed_only() mirror is false after reveal relaxed the filter (desync guard)"
+    );
+
+    // The tree must actually show alpha.txt (visible in the now-relaxed tree).
+    let nodes = ctrl.tree().visible_nodes();
+    let has_alpha = nodes
+        .iter()
+        .any(|n| n.path.file_name().unwrap_or_default() == "alpha.txt");
+    assert!(
+        has_alpha,
+        "alpha.txt is visible in the tree after the filter was relaxed"
+    );
+}
+
+#[test]
+fn enter_with_match_resyncs_hide_hidden_mirror_after_reveal() {
+    // Mirror-resync guard (T-4 review note), hide_hidden variant — symmetric to the changed_only
+    // case above. When hide_hidden is ON and the finder jumps to a NON-ignored dotfile, reveal()
+    // relaxes the tree's hide_hidden field; the controller's mirror must re-sync so the next `.`
+    // toggle does not read a stale value. Guards lines 1633-1634 (the hide_hidden re-sync).
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join(".envrc"), "x").unwrap();
+    std::fs::write(dir.path().join("main.rs"), "y").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), true, StubGit::default(), false);
+
+    // Turn on hide-hidden (the tree would hide the dotfile; the finder index still surfaces it).
+    ctrl.handle(Intent::ToggleHidden);
+    assert!(ctrl.hide_hidden(), "precondition: hide_hidden is ON");
+
+    // Open the finder and jump to the dotfile (query "env" matches ".envrc").
+    ctrl.handle(Intent::OpenFinder);
+    for c in "env".chars() {
+        ctrl.handle_finder_key(key(KeyCode::Char(c)));
+    }
+    let matches = ctrl.finder_matches().to_vec();
+    let candidates = ctrl.finder_candidates().to_vec();
+    let envrc_idx = matches
+        .iter()
+        .position(|&i| candidates[i].contains(".envrc"))
+        .expect(".envrc must match 'env'");
+    for _ in 0..envrc_idx {
+        ctrl.handle_finder_key(key(KeyCode::Down));
+    }
+    let fx = ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(fx.redraw, "Enter redraws");
+    assert!(!ctrl.finder_open(), "finder closed");
+
+    // The controller mirror must be false (synced from the tree after reveal relaxed it).
+    assert!(
+        !ctrl.hide_hidden(),
+        "controller hide_hidden() mirror is false after reveal relaxed the filter (desync guard)"
+    );
+
+    // The tree must actually show .envrc (visible in the now-relaxed tree).
+    let nodes = ctrl.tree().visible_nodes();
+    let has_envrc = nodes
+        .iter()
+        .any(|n| n.path.file_name().unwrap_or_default() == ".envrc");
+    assert!(
+        has_envrc,
+        ".envrc is visible in the tree after hide_hidden was relaxed"
+    );
+}
+
+/// Build a `PaneGeometry` that reflects an open finder with three result rows starting at screen
+/// row 12 (after the border + padding + query line): rows_area at x=10,y=12,w=30,h=10,
+/// finder_scroll=0. Used by the finder-mouse tests below.
+fn finder_geometry_with_rows() -> PaneGeometry {
+    PaneGeometry {
+        finder_rows: Some(Rect {
+            x: 10,
+            y: 12,
+            width: 30,
+            height: 10,
+        }),
+        finder_scroll: 0,
+        ..wide_geometry()
+    }
+}
+
+#[test]
+fn mouse_is_inert_while_the_finder_is_open_outside_overlay() {
+    // Rewritten T-9: the finder is mouse-interactive INSIDE its rows area, but clicks/scrolls
+    // OUTSIDE (on the tree or content panes beneath the overlay) must never drive those panes.
+    // This test checks the "outside/other" branch — which must stay inert — and also asserts
+    // that the finder stays open (a click outside does NOT cancel it; Esc cancels).
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Give the controller a geometry where `finder_rows` covers rows 12-21, cols 10-39.
+    // Any click at (col=6, row=3) is in the tree pane but OUTSIDE the overlay rows.
+    ctrl.set_pane_geometry(finder_geometry_with_rows());
+
+    // Precondition: the finder is open and a query is typed so matches exist.
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // produces matches
+    assert!(
+        ctrl.finder_open(),
+        "finder must be open before the mouse events"
+    );
+    let tree_cursor_before = ctrl.tree().cursor();
+
+    // A left-click on what would be a tree row (outside the overlay) must be inert.
+    let click = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 3));
+    assert!(!click.quit, "outside click must not quit");
+    assert_eq!(
+        ctrl.tree().cursor(),
+        tree_cursor_before,
+        "the tree cursor must be unchanged: clicks outside overlay must not drive the tree"
+    );
+
+    // The finder must still be open — clicking outside the rows area does NOT cancel.
+    assert!(
+        ctrl.finder_open(),
+        "the finder must still be open: outside clicks do not cancel (Esc cancels)"
+    );
+
+    // Shift+mouse is also inert (terminal selection) — same guard as the normal mouse path.
+    let shift_click = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 15,
+        row: 13,
+        modifiers: KeyModifiers::SHIFT,
+    };
+    let shift_fx = ctrl.handle_mouse(shift_click);
+    assert!(!shift_fx.quit, "Shift+click is inert (terminal selection)");
+
+    // A Down event (not Up) inside the overlay is inert (no drag in the finder).
+    let down = ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 15, 12));
+    assert!(!down.quit, "Down event inside the finder overlay is inert");
+}
+
+#[test]
+fn finder_wheel_moves_selection() {
+    // ScrollDown/ScrollUp while the finder is open moves the finder selection by WHEEL_STEP (3),
+    // clamped at both ends. Position-independent (the finder owns all wheel events while open).
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // produces ≥1 matches (alpha, beta, gamma)
+    let n = ctrl.finder_matches().len();
+    assert!(n >= 3, "need ≥3 matches for this test; got {n}");
+
+    ctrl.set_pane_geometry(finder_geometry_with_rows());
+
+    // Starting cursor is 0.
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor starts at 0");
+
+    // ScrollDown → moves down by WHEEL_STEP (3) or to the last match if fewer.
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 6, 3)); // position: tree area (irrelevant)
+    assert!(fx.redraw, "ScrollDown redraws");
+    let expected_after_down = 3_usize.min(n - 1);
+    assert_eq!(
+        ctrl.finder_cursor(),
+        expected_after_down,
+        "ScrollDown moves the finder selection down by WHEEL_STEP"
+    );
+
+    // ScrollUp → moves back up.
+    let fx2 = ctrl.handle_mouse(mouse(MouseEventKind::ScrollUp, 50, 5)); // position: content area (irrelevant)
+    assert!(fx2.redraw, "ScrollUp redraws");
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "ScrollUp moves the finder selection back up (clamped at 0)"
+    );
+
+    // ScrollUp at the top is a no-op for the cursor (stays at 0) but still redraws.
+    let fx3 = ctrl.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+    assert!(fx3.redraw, "ScrollUp at the top still redraws");
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor is clamped at 0");
+}
+
+#[test]
+fn finder_click_on_row_selects_it() {
+    // A left-button Up event on a result row (within finder_rows) sets the finder cursor to
+    // that row's index (scroll_offset + (screen_row - rows_area.y)).
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // produces matches
+    let n = ctrl.finder_matches().len();
+    assert!(n >= 2, "need ≥2 matches for this test; got {n}");
+
+    // rows_area starts at row 12, scroll=0 → screen row 12 = index 0, row 13 = index 1.
+    ctrl.set_pane_geometry(finder_geometry_with_rows());
+
+    // Click on the SECOND result row (screen row 13, col 15 — inside rows_area).
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 13));
+    assert!(fx.redraw, "a click on a result row redraws");
+    assert_eq!(
+        ctrl.finder_cursor(),
+        1,
+        "clicking the second result row sets the cursor to index 1"
+    );
+    assert!(
+        ctrl.finder_open(),
+        "a single click does not confirm: the finder stays open"
+    );
+
+    // Click on the FIRST result row (screen row 12, col 15).
+    let fx2 = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(fx2.redraw, "clicking the first row redraws");
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "clicking the first result row sets the cursor to index 0"
+    );
+    assert!(ctrl.finder_open(), "finder still open after a single click");
+
+    // Click outside the rows_area (below the last row, or to the left of the box) — inert.
+    // rows_area is x=10,y=12,w=30,h=10 → row 22 is outside.
+    let fx3 = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 22));
+    assert!(
+        ctrl.finder_open(),
+        "click below rows is inert: finder stays open"
+    );
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "cursor unchanged after outside click"
+    );
+    assert!(!fx3.quit, "outside click does not quit");
+}
+
+#[test]
+fn finder_double_click_confirms() {
+    // A double-click (two Up(Left) events on the same row within DOUBLE_CLICK ms) confirms the
+    // finder: the finder closes and the tree reveals that file. Mirrors the tree's double-click
+    // behaviour (folder expand/collapse, file zoom), sharing is_double_click and last_click.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // produces matches (alpha.txt, beta.rs, gamma.rs)
+    let n = ctrl.finder_matches().len();
+    assert!(n >= 1, "need ≥1 match for this test; got {n}");
+
+    ctrl.set_pane_geometry(finder_geometry_with_rows());
+
+    // First click on row 0 (screen row 12) → selects it, finder still open.
+    let fx1 = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(fx1.redraw, "first click redraws");
+    assert!(ctrl.finder_open(), "finder still open after first click");
+    assert_eq!(ctrl.finder_cursor(), 0, "cursor on row 0 after first click");
+
+    // Second click on the SAME row within the double-click window → confirms.
+    // (We rely on Instant::now() being within DOUBLE_CLICK=400ms between the two calls —
+    // guaranteed in a test environment without sleep.)
+    let fx2 = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(fx2.redraw, "double-click redraws");
+    assert!(
+        !ctrl.finder_open(),
+        "double-click closes the finder (confirm)"
+    );
+
+    // The tree should now have a selection pointing to the confirmed file.
+    // (We can't assert the exact path without knowing ranking order, but the tree cursor
+    // moved — it is no longer necessarily 0 depending on the file layout.)
+    // The important assertion: the finder is gone.
+    assert!(
+        ctrl.finder_cursor() == 0,
+        "finder_cursor() returns 0 because the finder is closed (None), not because the cursor was reset"
+    );
+}
+
+/// Geometry where both `tree_inner` and `finder_rows` share row 12.
+/// `tree_inner` starts at y=10 so row 12 = tree node index 2 (a valid node in a 3-node tree).
+/// `finder_rows` starts at y=12 so row 12 = finder row index 0.
+fn cross_contamination_geometry() -> PaneGeometry {
+    PaneGeometry {
+        tree_inner: Some(Rect {
+            x: 1,
+            y: 10,
+            width: 38,
+            height: 20,
+        }),
+        finder_rows: Some(Rect {
+            x: 10,
+            y: 12,
+            width: 30,
+            height: 10,
+        }),
+        finder_scroll: 0,
+        ..wide_geometry()
+    }
+}
+
+#[test]
+fn last_click_not_shared_between_finder_and_tree_scenario_a() {
+    // Scenario A: finder open → click a finder row → Esc closes finder → click tree row at
+    // the SAME screen row → must NOT spuriously double-click (no zoom).
+    // Without the fix, open_finder() and the Esc branch of handle_finder_key both leave
+    // last_click populated, so the tree click pairs with the finder click as a double-click.
+    let (_dir, mut ctrl) = finder_dir();
+    // Geometry where row 12 is finder row 0 AND tree node index 2 (third node — "sub/").
+    ctrl.set_pane_geometry(cross_contamination_geometry());
+
+    // Produce at least one match so finder_rows is non-empty.
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(ctrl.finder_open(), "precondition: finder is open");
+    assert!(
+        !ctrl.finder_matches().is_empty(),
+        "precondition: matches exist"
+    );
+
+    // Step 1: click finder row 0 at screen row 12 (sets last_click).
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(ctrl.finder_open(), "finder still open after single click");
+
+    // Step 2: Esc closes the finder. The fix clears last_click here.
+    ctrl.handle_finder_key(key(KeyCode::Esc));
+    assert!(!ctrl.finder_open(), "finder closed by Esc");
+
+    // Step 3: click the tree row at the SAME screen row 12 (= tree node index 2).
+    // Without the fix this would fire is_double_click → activate() → zoom.
+    // With the fix last_click was cleared on Esc, so this is a single click.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 12));
+    assert!(
+        !ctrl.zoomed(),
+        "tree click after Esc-close must NOT spuriously zoom (last_click cross-contamination)"
+    );
+}
+
+#[test]
+fn last_click_not_shared_between_finder_and_tree_scenario_b() {
+    // Scenario B: click a tree row → open finder → click finder row at the SAME screen row →
+    // must single-click select (finder stays open), NOT spuriously confirm (double-click).
+    // Without the fix, open_finder() leaves last_click populated from the tree click, so the
+    // finder click pairs with the tree click as a double-click and closes the finder.
+    //
+    // Use a fresh controller (not finder_dir which pre-opens the finder) so Step 1 goes through
+    // handle_click (the tree path), not handle_finder_mouse.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.set_pane_geometry(cross_contamination_geometry());
+
+    // Step 1: click tree row at screen row 12 (= tree node index 2 — "sub/").
+    // The finder is not yet open so this routes through handle_click.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 12));
+    assert!(
+        !ctrl.finder_open(),
+        "precondition: finder not open after tree click"
+    );
+
+    // Step 2: open the finder. The fix clears last_click here.
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open(), "finder is now open");
+
+    // Produce matches so finder has rows to click.
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(
+        !ctrl.finder_matches().is_empty(),
+        "precondition: matches exist"
+    );
+
+    // Step 3: click finder row 0 at the SAME screen row 12.
+    // Without the fix is_double_click fires → confirm_finder() closes the finder.
+    // With the fix last_click was cleared on open_finder(), so this is a single click.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(
+        ctrl.finder_open(),
+        "finder must stay open after single click (no spurious confirm from cross-contamination)"
+    );
+}
+
+#[test]
+fn last_click_cleared_by_a_finder_keystroke_scenario_c() {
+    // review-gate R1 (O1): a finder click → KEYSTROKE → click on the SAME screen row within the
+    // double-click window must NOT be misread as a double-click (confirm). Without the fix, the
+    // keystroke arms of handle_finder_key leave `last_click` populated, so the second click pairs
+    // with the first as a double-click and opens a file the user only single-clicked — often a
+    // DIFFERENT file, since typing changed the match list. (scenario_a/b cover the open/Esc vector;
+    // this covers the keystroke/nav vector.)
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.set_pane_geometry(finder_geometry_with_rows());
+
+    // Query "a" matches all three files; ranked by path length the row-0 match is "beta.rs".
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert!(
+        ctrl.finder_matches().len() >= 2,
+        "precondition: 'a' matches multiple files"
+    );
+
+    // Step 1: click finder row 0 (screen row 12) → selects it, finder stays open, last_click set.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(
+        ctrl.finder_open(),
+        "finder open after the first single click"
+    );
+
+    // Step 2: a keystroke that narrows the match list ("al" → only "alpha.txt"), so row 0 now maps
+    // to a DIFFERENT file than the first click selected. The fix clears last_click here.
+    ctrl.handle_finder_key(key(KeyCode::Char('l')));
+    assert!(ctrl.finder_open(), "finder still open after the keystroke");
+    assert!(
+        !ctrl.finder_matches().is_empty(),
+        "precondition: 'al' still matches a file at row 0"
+    );
+
+    // Step 3: click the SAME screen row again within the double-click window.
+    // Without the fix is_double_click fires → confirm_finder() closes the finder (opening alpha.txt
+    // even though the user only single-clicked beta.rs then alpha.txt). With the fix the keystroke
+    // cleared last_click, so this is a single click.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 12));
+    assert!(
+        ctrl.finder_open(),
+        "a keystroke between two same-row clicks clears the pending double-click: no spurious confirm"
+    );
+}
+
+#[test]
+fn intents_are_inert_while_the_finder_is_open() {
+    // review-gate R1 (O2): handle() is modal for the finder too. While the finder is open every
+    // intent is a no-op — the run loop routes keys to handle_finder_key, and this structural guard
+    // (symmetric with the picker guard) stops a future/test caller from leaking an intent to the
+    // tree beneath the overlay or opening a SECOND modal over it.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // query "a", matches present
+    assert_eq!(ctrl.finder_query(), "a", "precondition: query is 'a'");
+
+    for intent in [
+        Intent::NavDown,
+        Intent::Activate,
+        Intent::ToggleHidden,
+        Intent::SwitchWorktree, // must NOT open a second modal
+        Intent::OpenFinder,     // must NOT rebuild/reset the finder
+    ] {
+        let fx = ctrl.handle(intent);
+        assert!(
+            !fx.redraw && !fx.quit,
+            "intent {intent:?} is inert (noop) while the finder is open"
+        );
+        assert!(
+            ctrl.finder_open(),
+            "the finder stays open through intent {intent:?}"
+        );
+        assert!(
+            ctrl.picker().is_none(),
+            "no second modal (picker) opened by intent {intent:?}"
+        );
+    }
+    assert_eq!(
+        ctrl.finder_query(),
+        "a",
+        "the query is untouched — OpenFinder did not reset the finder, no intent leaked"
+    );
+}
+
+#[test]
+fn q_is_a_literal_query_char_in_the_finder_not_a_cancel_key() {
+    // AC-9: cancel is Esc ONLY — `q` is a literal query character (the resolved Esc-only decision,
+    // contrast the global `q` = Close binding). Typing `q` while the finder is open must append it
+    // to the query and leave the finder OPEN; only Esc closes it.
+    let (_dir, mut ctrl) = finder_dir();
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Char('q')));
+    assert!(fx.redraw, "typing 'q' redraws (it edited the query)");
+    assert_eq!(
+        ctrl.finder_query(),
+        "q",
+        "'q' is appended as a literal query char"
+    );
+    assert!(
+        ctrl.finder_open(),
+        "'q' must NOT close the finder — only Esc cancels (AC-9)"
+    );
+
+    // A second 'q' keeps building the query, still no cancel.
+    ctrl.handle_finder_key(key(KeyCode::Char('q')));
+    assert_eq!(ctrl.finder_query(), "qq", "'q' keeps appending");
+    assert!(ctrl.finder_open(), "still open after another 'q'");
+
+    // Esc — and only Esc — closes it.
+    ctrl.handle_finder_key(key(KeyCode::Esc));
+    assert!(!ctrl.finder_open(), "Esc closes the finder (AC-9)");
+}
+
+// ---------------------------------------------------------------------------
+// Finder hscroll — Left/Right keys + horizontal wheel + recompute reset
+// ---------------------------------------------------------------------------
+
+#[test]
+fn finder_right_key_increments_hscroll_and_left_decrements_it() {
+    // Left/Right arrow keys scroll the result rows horizontally (saturating), exactly as the
+    // worktree picker uses ←/→. The prompt is append-only so the arrows are free.
+    let (_dir, mut ctrl) = finder_dir();
+
+    assert_eq!(ctrl.finder_hscroll(), 0, "hscroll starts at 0");
+
+    let fx = ctrl.handle_finder_key(key(KeyCode::Right));
+    assert!(fx.redraw, "Right redraws");
+    let after_right = ctrl.finder_hscroll();
+    assert!(after_right > 0, "Right increments hscroll");
+
+    let fx2 = ctrl.handle_finder_key(key(KeyCode::Right));
+    assert!(fx2.redraw, "Right again redraws");
+    assert!(
+        ctrl.finder_hscroll() > after_right,
+        "Right again increments hscroll further"
+    );
+
+    let fx3 = ctrl.handle_finder_key(key(KeyCode::Left));
+    assert!(fx3.redraw, "Left redraws");
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        after_right,
+        "Left decrements hscroll back by one step"
+    );
+}
+
+#[test]
+fn finder_left_at_zero_does_not_underflow() {
+    // Left at hscroll=0 is saturating — it stays at 0, never wraps.
+    let (_dir, mut ctrl) = finder_dir();
+
+    assert_eq!(ctrl.finder_hscroll(), 0, "precondition: hscroll is 0");
+    let fx = ctrl.handle_finder_key(key(KeyCode::Left));
+    assert!(fx.redraw, "Left at 0 still redraws");
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        0,
+        "Left at 0 stays at 0 (saturating)"
+    );
+}
+
+#[test]
+fn finder_horizontal_wheel_scrolls_right_and_left() {
+    // ScrollRight/ScrollLeft (horizontal wheel) scroll the result rows sideways — additive to
+    // the keyboard ←/→ (AC-18 keyboard-first; mouse is additive).
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.set_pane_geometry(finder_geometry_with_rows());
+
+    assert_eq!(ctrl.finder_hscroll(), 0, "hscroll starts at 0");
+
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::ScrollRight, 20, 14));
+    assert!(fx.redraw, "ScrollRight redraws");
+    let after_right = ctrl.finder_hscroll();
+    assert!(after_right > 0, "ScrollRight increments hscroll");
+
+    let fx2 = ctrl.handle_mouse(mouse(MouseEventKind::ScrollLeft, 20, 14));
+    assert!(fx2.redraw, "ScrollLeft redraws");
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        0,
+        "ScrollLeft decrements hscroll back to 0"
+    );
+}
+
+#[test]
+fn finder_hscroll_does_not_overshoot_past_the_measured_max() {
+    // Live-test fix: `scroll_right` is monotonic (it can't know the row widths), so over-scrolling
+    // right used to park `hscroll` past the real maximum; the first few left presses then appeared
+    // to do nothing while the overshoot burned back down. The Presenter now feeds back
+    // `finder_max_hscroll` and `set_pane_geometry` clamps the stored offset to it each frame (the
+    // same pattern `content_hscroll` uses), so a single left press always moves the view.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // produce match rows
+    // Geometry the Presenter would feed back: the widest row needs at most 8 columns of h-scroll.
+    let geom = PaneGeometry {
+        finder_max_hscroll: 8,
+        ..finder_geometry_with_rows()
+    };
+
+    // Over-scroll right well past the max (3 monotonic steps).
+    for _ in 0..3 {
+        ctrl.handle_finder_key(key(KeyCode::Right));
+    }
+    assert!(
+        ctrl.finder_hscroll() > 8,
+        "precondition: raw scroll_right overshoots the max when unclamped in isolation"
+    );
+
+    // The run loop feeds the measured geometry back after the draw → the stored offset is clamped.
+    ctrl.set_pane_geometry(geom);
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        8,
+        "geometry feedback clamps the stored hscroll down to the measured maximum"
+    );
+
+    // A SINGLE left press now visibly moves the view — no overshoot left to burn down first.
+    ctrl.handle_finder_key(key(KeyCode::Left));
+    assert!(
+        ctrl.finder_hscroll() < 8,
+        "one Left press moves immediately after the clamp (the bug was: it needed several)"
+    );
+}
+
+#[test]
+fn finder_scrollbar_is_click_draggable() {
+    // Live-test fix: the finder's vertical scrollbar must be click-draggable like the tree/content
+    // bars. A press on the track jumps the selection to that fractional position, a drag continues
+    // it (the window follows the cursor, so the list scrolls), and the release ends the drag —
+    // it must NOT be treated as a row click / confirm.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // matches alpha.txt, beta.rs, sub/gamma.rs
+    let total = ctrl.finder_matches().len();
+    assert!(
+        total >= 3,
+        "need >=3 matches for a meaningful scrollbar range; got {total}"
+    );
+
+    // A geometry whose finder vbar track spans rows 12..=21 (height 10) — as the Presenter would
+    // feed back when the rows overflow.
+    let geom = PaneGeometry {
+        finder_vbar: Some(Rect {
+            x: 40,
+            y: 12,
+            width: 1,
+            height: 10,
+        }),
+        ..finder_geometry_with_rows()
+    };
+    ctrl.set_pane_geometry(geom);
+
+    // Press at the BOTTOM of the track → selection jumps to the last match.
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 21));
+    assert!(fx.redraw, "a scrollbar press redraws");
+    assert_eq!(
+        ctrl.finder_cursor(),
+        total - 1,
+        "press at the track bottom selects the last match"
+    );
+    assert!(
+        ctrl.finder_open(),
+        "the finder stays open — a scrollbar press is not a confirm"
+    );
+
+    // Drag to the TOP of the track → selection jumps to the first match.
+    ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 12));
+    assert_eq!(
+        ctrl.finder_cursor(),
+        0,
+        "dragging to the track top selects the first match"
+    );
+
+    // Release ends the drag without confirming.
+    let up = ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 40, 12));
+    assert!(!up.redraw, "the drag-release is inert (not a row click)");
+    assert!(
+        ctrl.finder_open(),
+        "release ends the drag; the finder stays open"
+    );
+}
+
+#[test]
+fn finder_hscroll_resets_to_zero_on_new_query() {
+    // Typing a new character (recompute) resets hscroll to 0 so the fresh result list starts
+    // unscrolled — the same pattern as cursor resetting to 0 on every query change.
+    let (_dir, mut ctrl) = finder_dir();
+
+    // Scroll right first.
+    ctrl.handle_finder_key(key(KeyCode::Right));
+    assert!(ctrl.finder_hscroll() > 0, "precondition: hscroll is set");
+
+    // Typing a character calls recompute() which resets hscroll.
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        0,
+        "hscroll resets to 0 when a new query character is typed"
+    );
+
+    // Same for Backspace.
+    ctrl.handle_finder_key(key(KeyCode::Right));
+    assert!(ctrl.finder_hscroll() > 0, "precondition: hscroll set again");
+    ctrl.handle_finder_key(key(KeyCode::Backspace));
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        0,
+        "hscroll resets to 0 on Backspace (recompute)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-10 — Scope independence + non-git (AC-16, AC-17, AC-19)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn finder_candidates_are_independent_of_changed_only_filter() {
+    // AC-16: the finder's candidate set is the full index::build walk — a separate walk from the
+    // tree (ADR-0005). Turning `changed_only` ON restricts the TREE view to the changed-set, but
+    // the finder candidates must remain the complete file index, unchanged.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    // Only beta.rs is in the changed-set; changed_only would restrict the tree to beta.rs only.
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("beta.rs"), Status::Modified);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+
+    // Enable changed_only — the tree now shows only beta.rs.
+    ctrl.handle(Intent::ToggleChangedOnly);
+    assert!(ctrl.changed_only(), "precondition: changed_only is ON");
+
+    // Open the finder — it must walk the full index regardless of the tree filter.
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open(), "finder opened");
+
+    let mut got = ctrl.finder_candidates().to_vec();
+    got.sort();
+    let mut expected = herdr_file_viewer::index::build(dir.path());
+    expected.sort();
+
+    assert_eq!(
+        got, expected,
+        "finder candidates must equal index::build(root), unaffected by changed_only (AC-16)"
+    );
+    // Sanity: there are more candidates than just the changed file.
+    assert!(
+        got.len() > 1,
+        "the full index has more entries than the changed-set alone: {got:?}"
+    );
+}
+
+#[test]
+fn finder_candidates_include_dotfiles_even_with_hide_hidden_on() {
+    // AC-17: the finder's candidate set comes from index::build, which always includes dotfiles
+    // (hidden(false) in WalkBuilder). Toggling `hide_hidden` ON hides dotfiles in the TREE
+    // view but must not affect the finder candidates. A non-ignored dotfile (e.g. `.env.example`)
+    // must still appear in finder_candidates() after ToggleHidden.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join(".env.example"), "SECRET=x").unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // Turn on hide_hidden — the tree would hide .env.example.
+    ctrl.handle(Intent::ToggleHidden);
+    assert!(ctrl.hide_hidden(), "precondition: hide_hidden is ON");
+
+    // Open the finder.
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open(), "finder opened");
+
+    let candidates = ctrl.finder_candidates().to_vec();
+
+    // The dotfile must be in the candidate list.
+    assert!(
+        candidates.iter().any(|p| p.contains(".env.example")),
+        ".env.example must be a candidate even with hide_hidden ON (AC-17): {candidates:?}"
+    );
+
+    // Cross-check against index::build — the sets must be identical.
+    let mut got = candidates.clone();
+    got.sort();
+    let mut expected = herdr_file_viewer::index::build(dir.path());
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "finder candidates must equal index::build(root), unaffected by hide_hidden (AC-17)"
+    );
+}
+
+#[test]
+fn finder_works_fully_in_a_non_git_directory() {
+    // AC-19: the finder must open, list candidates, match a typed query, and jump (Enter → reveal)
+    // in a directory that is NOT a git repository. The controller is built with is_git_repo=false
+    // (as non-git roots are constructed throughout this test file), which means index::build uses
+    // require_git(false) and all git intents are inert — but the finder must be fully operational.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("readme.txt"), "hello").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[foo]").unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}").unwrap();
+
+    // Non-git root: is_git_repo = false.
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // 1. Open the finder — must not panic or fail.
+    let fx = ctrl.handle(Intent::OpenFinder);
+    assert!(fx.redraw, "OpenFinder redraws");
+    assert!(
+        ctrl.finder_open(),
+        "finder is open in a non-git root (AC-19)"
+    );
+
+    // 2. Candidate list must be non-empty and equal to index::build(root).
+    let mut got = ctrl.finder_candidates().to_vec();
+    got.sort();
+    let mut expected = herdr_file_viewer::index::build(dir.path());
+    expected.sort();
+    assert!(!got.is_empty(), "non-git root has files to list (AC-19)");
+    assert_eq!(
+        got, expected,
+        "finder candidates match index::build in a non-git root (AC-19)"
+    );
+
+    // 3. Type a query that matches a known file — "main" matches "src/main.rs".
+    for c in "main".chars() {
+        ctrl.handle_finder_key(key(KeyCode::Char(c)));
+    }
+    let matches = ctrl.finder_matches().to_vec();
+    let candidates = ctrl.finder_candidates().to_vec();
+    assert!(
+        !matches.is_empty(),
+        "typing 'main' must produce at least one match in the non-git root: {candidates:?}"
+    );
+    let matched_path = &candidates[matches[0]];
+    assert!(
+        matched_path.contains("main"),
+        "the top match must contain 'main': {matched_path}"
+    );
+
+    // 4. Press Enter — the finder must close and the tree selection must land on the matched file
+    //    (reveal + render without git). AC-19: jump works without git.
+    let fx = ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(fx.redraw, "Enter signals a redraw (AC-19)");
+    assert!(
+        !ctrl.finder_open(),
+        "finder closed after Enter in a non-git root (AC-19)"
+    );
+
+    let selected = ctrl
+        .tree()
+        .selected()
+        .expect("a node is selected after reveal in a non-git root");
+    let selected_rel = selected
+        .path
+        .strip_prefix(ctrl.root())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        selected_rel, *matched_path,
+        "the tree cursor points to the jumped-to file in a non-git root (AC-19)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-12 — Negative criteria & conformance (AC-N1, AC-N2, AC-N4, AC-N5, AC-N6)
+// ---------------------------------------------------------------------------
+
+/// Snapshot every non-.git file under `root` as (relative path, contents).
+/// Excludes the .git directory so git-internal ref changes do not interfere
+/// with the read-only assertion (AC-N2 uses `git status --porcelain` for that).
+fn snapshot_no_git(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            // Skip the .git directory — git internals change on every query.
+            if p.file_name().map(|n| n == ".git").unwrap_or(false) {
+                continue;
+            }
+            let rel = p.strip_prefix(root).unwrap().to_path_buf();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
+fn ac_n1_finder_enter_journey_leaves_filesystem_unchanged() {
+    // AC-N1: the viewer is read-only — a full finder exercise (open → type → Enter-jump)
+    // must not create, rename, move, or delete any file.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    let before = snapshot_no_git(dir.path());
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    // Open the finder.
+    ctrl.handle(Intent::OpenFinder);
+    // Type a query ('b' matches "beta.rs").
+    ctrl.handle_finder_key(key(KeyCode::Char('b')));
+    // Confirm with Enter (reveal + render).
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    let after = snapshot_no_git(dir.path());
+    assert_eq!(
+        after, before,
+        "AC-N1: the filesystem must be unchanged after open→type→Enter-jump"
+    );
+}
+
+#[test]
+fn ac_n1_finder_esc_journey_leaves_filesystem_unchanged() {
+    // AC-N1: Esc-cancel must also leave the filesystem completely unchanged.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    let before = snapshot_no_git(dir.path());
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('a')));
+    ctrl.handle_finder_key(key(KeyCode::Esc));
+
+    let after = snapshot_no_git(dir.path());
+    assert_eq!(
+        after, before,
+        "AC-N1: the filesystem must be unchanged after open→type→Esc-cancel"
+    );
+}
+
+#[test]
+fn ac_n2_finder_exercise_does_not_mutate_git_state() {
+    // AC-N2: no git mutation — git status --porcelain and HEAD must be unchanged after a full
+    // finder exercise (open → type → Enter-jump) in a git repository.
+    let dir = TempDir::new();
+    common::init_repo_with_commit(dir.path());
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn lib() {}").unwrap();
+
+    let status_before = common::git(dir.path(), &["status", "--porcelain"]);
+    let head_before = common::git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let (mut ctrl, _, _) = controller(dir.path(), true, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('m'))); // matches "main.rs"
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+
+    let status_after = common::git(dir.path(), &["status", "--porcelain"]);
+    let head_after = common::git(dir.path(), &["rev-parse", "HEAD"]);
+
+    assert_eq!(
+        status_after, status_before,
+        "AC-N2: git status --porcelain must be unchanged after the finder exercise"
+    );
+    assert_eq!(
+        head_after, head_before,
+        "AC-N2: HEAD commit must be unchanged after the finder exercise"
+    );
+}
+
+#[test]
+fn ac_n4_fresh_controller_rebuilds_candidates_from_disk_with_no_persistent_state() {
+    // AC-N4: the finder writes no state to disk. A second, fresh Controller over the same root
+    // must produce the same candidate set as index::build(root), and the filesystem must be
+    // unchanged (no cache file created by the first controller's use of the finder).
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("gamma.rs"), "c").unwrap();
+
+    // First controller: open finder, type, confirm.
+    {
+        let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+        ctrl.handle(Intent::OpenFinder);
+        ctrl.handle_finder_key(key(KeyCode::Char('b')));
+        ctrl.handle_finder_key(key(KeyCode::Enter));
+        assert!(!ctrl.finder_open(), "finder closed after Enter");
+    }
+
+    // No new file must have appeared under root from the first session.
+    let files_after: Vec<_> = snapshot_no_git(dir.path())
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    let expected_files: Vec<PathBuf> = {
+        let mut v = vec![
+            PathBuf::from("alpha.txt"),
+            PathBuf::from("beta.rs"),
+            PathBuf::from("sub/gamma.rs"),
+        ];
+        v.sort();
+        v
+    };
+    let mut actual_sorted = files_after.clone();
+    actual_sorted.sort();
+    assert_eq!(
+        actual_sorted, expected_files,
+        "AC-N4: no new file must appear under root from using the finder"
+    );
+
+    // Second, fresh controller: candidates must match index::build(root).
+    let (mut ctrl2, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl2.handle(Intent::OpenFinder);
+    assert!(ctrl2.finder_open(), "fresh controller opened the finder");
+
+    let mut got = ctrl2.finder_candidates().to_vec();
+    got.sort();
+    let mut expected_candidates = herdr_file_viewer::index::build(dir.path());
+    expected_candidates.sort();
+
+    assert_eq!(
+        got, expected_candidates,
+        "AC-N4: a fresh Controller must rebuild candidates from disk (no persisted state)"
+    );
+}
+
+#[test]
+fn ac_18_same_controller_reopen_sees_created_and_dropped_files() {
+    // AC-18: the candidate index is rebuilt each time the finder OPENS. Existing coverage
+    // (index::build sees a new file; a fresh Controller rebuilds) left the same-controller
+    // close→mutate→reopen flow and the REMOVED-file half untested. This drives that vector:
+    // open → Esc → create one file + remove another on disk → reopen → the new file is present
+    // and the removed file is absent. (review-gate R1: LS4)
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.rs"), "b").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::OpenFinder);
+    assert!(
+        ctrl.finder_candidates().iter().any(|c| c == "alpha.txt"),
+        "first session: alpha.txt is a candidate"
+    );
+    ctrl.handle_finder_key(key(KeyCode::Esc));
+    assert!(
+        !ctrl.finder_open(),
+        "finder closed before the filesystem mutation"
+    );
+
+    // Mutate the filesystem between sessions: add one file, remove another.
+    std::fs::write(dir.path().join("delta.md"), "d").unwrap();
+    std::fs::remove_file(dir.path().join("alpha.txt")).unwrap();
+
+    // Reopen the SAME controller → the index is rebuilt from disk (AC-18).
+    ctrl.handle(Intent::OpenFinder);
+    let candidates = ctrl.finder_candidates().to_vec();
+    assert!(
+        candidates.iter().any(|c| c == "delta.md"),
+        "reopen sees the file created since the previous session"
+    );
+    assert!(
+        !candidates.iter().any(|c| c == "alpha.txt"),
+        "reopen no longer lists the file removed since the previous session"
+    );
+}
+
+#[test]
+fn ac_n3_finder_ignores_file_contents_matches_path_only() {
+    // AC-N3: the finder matches by PATH/NAME only, never file CONTENTS. A token that appears
+    // inside a file's bytes but is not a subsequence of any path must yield zero matches. The
+    // fuzzy-level test only covered a token in neither path nor content; this drives the full
+    // index→matcher pipeline to prove content is never read. (review-gate R1: LS5)
+    let dir = TempDir::new();
+    // The token "zqxhiddentoken" lives ONLY inside the file's CONTENTS — its leading 'z' is in no path.
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        "zqxhiddentoken appears only in here",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("readme.md"), "nothing special").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::OpenFinder);
+    for c in "zqxhiddentoken".chars() {
+        ctrl.handle_finder_key(key(KeyCode::Char(c)));
+    }
+    assert!(
+        ctrl.finder_matches().is_empty(),
+        "a token found only inside file contents must yield NO finder matches (AC-N3)"
+    );
+
+    // Sanity: a token that IS in a path matches — proving the empty result above was
+    // content-blindness, not a dead finder.
+    for _ in 0.."zqxhiddentoken".len() {
+        ctrl.handle_finder_key(key(KeyCode::Backspace));
+    }
+    for c in "notes".chars() {
+        ctrl.handle_finder_key(key(KeyCode::Char(c)));
+    }
+    assert!(
+        !ctrl.finder_matches().is_empty(),
+        "sanity: a path token ('notes') matches, so the empty result above was content-blindness"
+    );
+}
+
+#[test]
+fn ac_n5_every_candidate_is_relative_and_under_root() {
+    // AC-N5: every path returned by finder_candidates() is a root-relative string —
+    // no leading `/`, no `..`, and every absolute resolution lands under root.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("beta.rs"), "b").unwrap();
+    std::fs::create_dir(dir.path().join("sub").join("deep")).unwrap();
+    std::fs::write(dir.path().join("sub").join("deep").join("gamma.rs"), "c").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open());
+
+    let root = ctrl.root().to_path_buf();
+    let candidates = ctrl.finder_candidates().to_vec();
+    assert!(
+        !candidates.is_empty(),
+        "precondition: at least one candidate"
+    );
+
+    for candidate in &candidates {
+        // Must not be absolute (no leading /).
+        assert!(
+            !candidate.starts_with('/'),
+            "AC-N5: candidate must not be absolute: {candidate:?}"
+        );
+        // Must not traverse out of root with '..'.
+        assert!(
+            !candidate.contains(".."),
+            "AC-N5: candidate must not contain '..': {candidate:?}"
+        );
+        // Absolute resolution must land under root.
+        let abs = root.join(candidate);
+        assert!(
+            abs.starts_with(&root),
+            "AC-N5: absolute resolution of {candidate:?} must be under root {root:?}"
+        );
+        assert!(
+            abs.exists(),
+            "AC-N5: resolved path must exist on disk: {abs:?}"
+        );
+    }
+}
+
+#[test]
+fn ac_n5_reveal_target_resolves_under_root() {
+    // AC-N5 (controller-level): after Enter-confirm, the tree's selected node path is under root.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("beta.rs"), "b").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let root = ctrl.root().to_path_buf();
+
+    ctrl.handle(Intent::OpenFinder);
+    ctrl.handle_finder_key(key(KeyCode::Char('b'))); // matches "sub/beta.rs"
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert!(!ctrl.finder_open(), "finder closed after Enter");
+
+    let selected = ctrl
+        .tree()
+        .selected()
+        .expect("a node is selected after reveal");
+    assert!(
+        selected.path.starts_with(&root),
+        "AC-N5: reveal target {:?} must be under root {:?}",
+        selected.path,
+        root
+    );
+}
+
+#[test]
+fn ac_n6_only_open_finder_intent_opens_the_finder() {
+    // AC-N6: the finder opens ONLY via Intent::OpenFinder. No other intent in Intent::ALL
+    // opens the finder overlay when it is called on a controller where the finder is closed.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("b.txt"), "x").unwrap();
+
+    for intent in Intent::ALL {
+        if intent == Intent::OpenFinder || intent == Intent::Close {
+            continue; // OpenFinder is the one that should open it; Close ends the session
+        }
+        // Fresh controller for each intent to avoid accumulated state.
+        let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+        assert!(!ctrl.finder_open(), "precondition: finder starts closed");
+
+        let _ = ctrl.handle(intent);
+
+        assert!(
+            !ctrl.finder_open(),
+            "AC-N6: handling {:?} must NOT open the finder (only Intent::OpenFinder may)",
+            intent
+        );
+    }
+}
+
+#[test]
+fn ac_n6_open_finder_intent_does_open_the_finder() {
+    // AC-N6 (positive side): Intent::OpenFinder is the one and only intent that opens the finder.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    assert!(!ctrl.finder_open(), "finder starts closed");
+    ctrl.handle(Intent::OpenFinder);
+    assert!(
+        ctrl.finder_open(),
+        "AC-N6: Intent::OpenFinder must open the finder"
     );
 }

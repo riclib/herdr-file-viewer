@@ -99,6 +99,18 @@ impl TreeModel {
         self.cursor
     }
 
+    /// Whether the changed-only filter is currently active on the tree. Exposed so the
+    /// controller can re-sync its mirror field after `reveal` may have relaxed this flag.
+    pub fn changed_only(&self) -> bool {
+        self.changed_only
+    }
+
+    /// Whether the hide-hidden filter is currently active on the tree. Exposed so the
+    /// controller can re-sync its mirror field after `reveal` may have relaxed this flag.
+    pub fn hide_hidden(&self) -> bool {
+        self.hide_hidden
+    }
+
     /// The ordered list of currently-visible nodes. In the full tree these are root's
     /// children plus the children of every expanded directory, depth-first. In changed-only
     /// mode the tree is built from the changed-set itself (so deleted files — and files
@@ -283,6 +295,49 @@ impl TreeModel {
     /// The currently-selected node, if any.
     pub fn selected(&self) -> Option<Node> {
         self.visible_nodes().into_iter().nth(self.cursor)
+    }
+
+    /// Reveal `path` in the tree: expand every collapsed ancestor, relax `changed_only` or
+    /// `hide_hidden` if they would hide the target, then move the cursor to the target's
+    /// visible-row index. Returns `false` **without moving the cursor** when `path` is not a file
+    /// under `root` or does not exist on disk — these guards run before any mutation, so a missing
+    /// target leaves the selection untouched (AC-10, AC-20, AC-N5). (A path under `root` that the
+    /// finder's gitignore-respecting index would never surface — e.g. an ignored file with
+    /// `show_ignored` off — is not reachable through the finder flow.)
+    pub fn reveal(&mut self, path: &Path) -> bool {
+        if !path.starts_with(&self.root) {
+            return false; // above root — AC-N5
+        }
+        if !path.is_file() {
+            return false; // missing or not a regular file — AC-20
+        }
+        // Expand every ancestor directory from the file's parent up to and including root.
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(&self.root) {
+                break;
+            }
+            self.expand(d);
+            if d == self.root {
+                break;
+            }
+            dir = d.parent();
+        }
+        // Relax a filter only if it still hides the target after expansion.
+        if self.changed_only && !self.visible_nodes().iter().any(|n| n.path == path) {
+            self.changed_only = false;
+        }
+        if self.hide_hidden && !self.visible_nodes().iter().any(|n| n.path == path) {
+            self.hide_hidden = false;
+        }
+        // Move the cursor to the target's visible row.
+        match self.visible_nodes().iter().position(|n| n.path == path) {
+            Some(idx) => {
+                self.cursor = idx;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Keep the cursor within the (possibly shrunken) visible list after a structural or
