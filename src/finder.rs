@@ -127,6 +127,15 @@ impl FinderState {
         self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP);
     }
 
+    /// Clamp the stored horizontal scroll to `max` columns — the widest match row minus the visible
+    /// width, which the Presenter measures and feeds back each frame. `scroll_right` is monotonic
+    /// (it can't know the row widths), so without this the offset drifts past the real maximum on
+    /// over-scroll and a subsequent `scroll_left` has to burn the overshoot down before the view
+    /// visibly moves. Called from the controller's geometry feedback, mirroring `content_hscroll`.
+    pub fn clamp_hscroll(&mut self, max: u16) {
+        self.hscroll = self.hscroll.min(max);
+    }
+
     /// The candidate index at the current cursor position within the match list, or `None`
     /// when the match list is empty (zero matches → no selection to confirm).
     pub fn selected_candidate_index(&self) -> Option<usize> {

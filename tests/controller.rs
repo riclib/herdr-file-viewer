@@ -983,6 +983,7 @@ fn wide_geometry() -> PaneGeometry {
         divider_x: Some(40),
         finder_rows: None,
         finder_scroll: 0,
+        finder_max_hscroll: 0,
     }
 }
 
@@ -3896,6 +3897,46 @@ fn finder_horizontal_wheel_scrolls_right_and_left() {
         ctrl.finder_hscroll(),
         0,
         "ScrollLeft decrements hscroll back to 0"
+    );
+}
+
+#[test]
+fn finder_hscroll_does_not_overshoot_past_the_measured_max() {
+    // Live-test fix: `scroll_right` is monotonic (it can't know the row widths), so over-scrolling
+    // right used to park `hscroll` past the real maximum; the first few left presses then appeared
+    // to do nothing while the overshoot burned back down. The Presenter now feeds back
+    // `finder_max_hscroll` and `set_pane_geometry` clamps the stored offset to it each frame (the
+    // same pattern `content_hscroll` uses), so a single left press always moves the view.
+    let (_dir, mut ctrl) = finder_dir();
+    ctrl.handle_finder_key(key(KeyCode::Char('a'))); // produce match rows
+    // Geometry the Presenter would feed back: the widest row needs at most 8 columns of h-scroll.
+    let geom = PaneGeometry {
+        finder_max_hscroll: 8,
+        ..finder_geometry_with_rows()
+    };
+
+    // Over-scroll right well past the max (3 monotonic steps).
+    for _ in 0..3 {
+        ctrl.handle_finder_key(key(KeyCode::Right));
+    }
+    assert!(
+        ctrl.finder_hscroll() > 8,
+        "precondition: raw scroll_right overshoots the max when unclamped in isolation"
+    );
+
+    // The run loop feeds the measured geometry back after the draw → the stored offset is clamped.
+    ctrl.set_pane_geometry(geom);
+    assert_eq!(
+        ctrl.finder_hscroll(),
+        8,
+        "geometry feedback clamps the stored hscroll down to the measured maximum"
+    );
+
+    // A SINGLE left press now visibly moves the view — no overshoot left to burn down first.
+    ctrl.handle_finder_key(key(KeyCode::Left));
+    assert!(
+        ctrl.finder_hscroll() < 8,
+        "one Left press moves immediately after the clamp (the bug was: it needed several)"
     );
 }
 

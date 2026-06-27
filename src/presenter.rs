@@ -557,6 +557,12 @@ pub struct PaneGeometry {
     /// `0` when the finder is closed or when all rows fit. Added to a click's screen-row delta to
     /// produce the absolute match-list index.
     pub finder_scroll: u16,
+    /// The maximum useful HORIZONTAL scroll for the finder result rows, in columns (widest match
+    /// row minus the rows-area width; `0` when rows fit or the finder is closed). Fed back so the
+    /// controller clamps the *stored* `hscroll` in state each frame — without it, over-scrolling
+    /// right parks the offset past the real maximum and the first few left presses appear to do
+    /// nothing while it burns back down.
+    pub finder_max_hscroll: u16,
 }
 
 /// Compute the [`PaneGeometry`] for hit-testing the current frame — the same layout [`draw`]
@@ -612,12 +618,16 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     // Finder: if the finder overlay is open, compute its layout with the same helper
     // `draw_finder_overlay` uses (same `area` = `frame.area()` = the full terminal rect),
     // so the hit-test geometry agrees with what is drawn.
-    let (finder_rows, finder_scroll) = match &state.finder {
+    let (finder_rows, finder_scroll, finder_max_hscroll) = match &state.finder {
         Some(finder) => {
             let fl = finder_overlay_layout(area, finder);
-            (fl.rows_area, fl.offset.min(u16::MAX as usize) as u16)
+            (
+                fl.rows_area,
+                fl.offset.min(u16::MAX as usize) as u16,
+                fl.max_hscroll,
+            )
         }
-        None => (None, 0),
+        None => (None, 0, 0),
     };
 
     PaneGeometry {
@@ -634,6 +644,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         divider_x,
         finder_rows,
         finder_scroll,
+        finder_max_hscroll,
     }
 }
 
@@ -934,6 +945,12 @@ struct FinderLayout {
     rows_area: Option<Rect>,
     /// The scroll offset: the index of the first visible match row. `0` when all rows fit.
     offset: usize,
+    /// The maximum useful HORIZONTAL scroll for the result rows, in columns: the widest match row
+    /// minus the rows-area width (`0` when every row fits or there are none). The single source of
+    /// truth for the clamp — `draw_finder_overlay` clamps the displayed offset to it AND `geometry`
+    /// feeds it back so the controller clamps the *stored* offset to the same value, so the two can
+    /// never disagree (which is what made an over-scroll-right need several left presses to undo).
+    max_hscroll: u16,
 }
 
 /// Compute the finder overlay's layout geometry for the given frame `area` and `finder` draw
@@ -1025,11 +1042,19 @@ fn finder_overlay_layout(area: Rect, finder: &FinderView) -> FinderLayout {
         height: if inner.height > 0 { 1 } else { 0 },
     };
 
+    // Max useful horizontal scroll = widest match row (over ALL matches, `max_row_w`) minus the
+    // rows-area width. `0` when there are no rows or everything fits.
+    let max_hscroll = match rows_area {
+        Some(ra) => (max_row_w.min(u16::MAX as usize) as u16).saturating_sub(ra.width),
+        None => 0,
+    };
+
     FinderLayout {
         popup,
         query_area,
         rows_area,
         offset,
+        max_hscroll,
     }
 }
 
@@ -1107,14 +1132,12 @@ fn draw_finder_overlay(frame: &mut Frame, area: Rect, finder: &FinderView) {
         let window: Vec<Line<'static>> =
             match_lines.into_iter().skip(offset).take(visible).collect();
 
-        // Clamp hscroll to the widest ROW (not the chrome-inflated desired width) so it is a
-        // no-op when every row fits and never over-scrolls past the widest path — the same
-        // pattern the picker uses. `Paragraph::scroll((0, x))` clips the leading `x` columns
-        // off each line so long paths can be read sideways.
-        let max_row_width = window.iter().map(Line::width).max().unwrap_or(0);
-        let max_hscroll =
-            (max_row_width.min(u16::MAX as usize) as u16).saturating_sub(rows_area.width);
-        let hscroll = finder.hscroll.min(max_hscroll);
+        // Clamp the displayed hscroll to `layout.max_hscroll` — the SAME value the controller
+        // clamps the stored offset to (via geometry feedback), so display and state never disagree.
+        // A no-op when every row fits, and never scrolls past the widest match row.
+        // `Paragraph::scroll((0, x))` clips the leading `x` columns off each line so long paths
+        // can be read sideways.
+        let hscroll = finder.hscroll.min(layout.max_hscroll);
         frame.render_widget(Paragraph::new(window).scroll((0, hscroll)), rows_area);
 
         // Vertical scrollbar when match rows overflow.

@@ -629,8 +629,18 @@ impl Controller {
 
     /// Receive the hit-test geometry the Presenter drew this frame (fed back from the draw
     /// closure), so the next mouse event is mapped against the live layout.
+    ///
+    /// Also re-clamps the finder's stored horizontal scroll to the maximum the Presenter just
+    /// measured (`finder_max_hscroll`) — mirroring how [`set_content_viewport`](Self::set_content_viewport)
+    /// re-clamps `content_hscroll`. `scroll_right` is monotonic, so over-scrolling right would
+    /// otherwise leave the offset parked past the widest row, making the first few left presses
+    /// appear to do nothing until the overshoot burned down.
     pub fn set_pane_geometry(&mut self, geom: PaneGeometry) {
+        let finder_max_hscroll = geom.finder_max_hscroll;
         self.geom = geom;
+        if let Some(finder) = self.finder.as_mut() {
+            finder.clamp_hscroll(finder_max_hscroll);
+        }
     }
 
     /// The content scroll offset (lines). Exposed for the Presenter wiring and tests.
