@@ -933,16 +933,22 @@ impl Controller {
     fn help_view(&self) -> Option<HelpView> {
         let help = self.help.as_ref()?;
         let active = help.active_index();
+        let labels: Vec<String> = help
+            .section_labels()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Center the About section only; What's New stays left-aligned. About is the section whose
+        // label is `HelpSection::About::label()` ("About") — matched by label so the projection
+        // stays decoupled from the section index (the Vec is the SMA-49 seam).
+        let center = labels.get(active).map(String::as_str) == Some(HelpSection::About.label());
         Some(HelpView {
             active,
-            labels: help
-                .section_labels()
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            labels,
             body: help.active_body().clone(),
             scroll: help.sections[active].scroll,
             hint: HELP_FOOTER_HINT.to_string(),
+            center,
         })
     }
 
@@ -2102,7 +2108,9 @@ impl Controller {
     /// Sets the active section to 0 (What's New) and returns `Effects::redraw()`.
     fn open_help(&mut self) -> Effects {
         let prepared = Prepared::Full {
-            text: crate::help::CHANGELOG_MD.to_owned(),
+            // Render from the first version heading onward — the changelog's file-meta preamble
+            // (title + Keep-a-Changelog/SemVer paragraph + link refs) doesn't belong in What's New.
+            text: crate::help::changelog_display().to_owned(),
         };
         // The render is synchronous on the input thread, so bound it to the help-specific
         // `HELP_RENDER_TIMEOUT` (within the AC-22 budget) rather than the shared 5s `RENDER_TIMEOUT`

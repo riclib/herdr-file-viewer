@@ -183,6 +183,10 @@ pub struct HelpView {
     /// close (e.g. `"Tab/←→ switch · Esc/q close"`). Built by the controller so the Presenter stays
     /// mode-agnostic.
     pub hint: String,
+    /// Center-align the active body? Set by the controller's `help_view()`: `true` only for the
+    /// About section (its short identity lines read better centered), `false` for What's New (whose
+    /// rendered changelog stays left-aligned). The Presenter applies it via `Paragraph::alignment`.
+    pub center: bool,
 }
 
 /// The single-character git-status marker shown beside a tree row (AC-7).
@@ -1659,8 +1663,15 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, help: &HelpView) {
 
     if let Some(body_area) = layout.body {
         // The body wraps (prose: the rendered changelog / about text) and scrolls vertically.
+        // About is center-aligned (`help.center`); What's New stays left as today.
+        let alignment = if help.center {
+            ratatui::layout::Alignment::Center
+        } else {
+            ratatui::layout::Alignment::Left
+        };
         frame.render_widget(
             Paragraph::new(help.body.clone())
+                .alignment(alignment)
                 .wrap(Wrap { trim: false })
                 .scroll((help.scroll, 0)),
             body_area,

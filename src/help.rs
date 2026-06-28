@@ -6,6 +6,20 @@
 /// The full `CHANGELOG.md`, embedded at compile time (AC-12, AC-13).
 pub const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
 
+/// The What's New body source: `CHANGELOG_MD` with the file-meta preamble stripped.
+///
+/// The raw `CHANGELOG.md` opens with the `# Changelog` title, a "Keep a Changelog / Semantic
+/// Versioning" paragraph, and link references — file metadata an in-app "What's New" doesn't want.
+/// This returns the slice starting at the first `## [` version heading, so only the version
+/// sections (`## [..]` + their `### Added`/`### Fixed` entries) render. Falls back to the whole
+/// string if no version heading is found (the const stays whole; T-1's newest-first test reads it).
+pub fn changelog_display() -> &'static str {
+    match CHANGELOG_MD.find("## [") {
+        Some(idx) => &CHANGELOG_MD[idx..],
+        None => CHANGELOG_MD,
+    }
+}
+
 /// The two sections of the help overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpSection {
@@ -133,36 +147,47 @@ impl HelpState {
 
 // ---------------------------------------------------------------------------
 
-/// Assemble the "About" pane text.
+/// Assemble the "About" pane text. The Presenter center-aligns this section (AC-17).
 ///
 /// Lines, in order:
-/// 1. `herdr-file-viewer vX.Y.Z`
+/// 1. `herdr-file-viewer` (the name, alone)
 /// 2. package description
-/// 3. `Repository: <url>`
-/// 4. star CTA
-/// 5. `License: <spdx>`
-/// 6. update status (`Update available: vX.Y.Z` or `Up to date`)
+/// 3. *(blank)*
+/// 4. bare repo host+path (the `https://` scheme + any `Repository:` label stripped)
+/// 5. *(blank)*
+/// 6. `vX.Y.Z · <status>` (version + update status: `Up to date` or `Update available: vX.Y.Z`)
+/// 7. `<SPDX> License`
+/// 8. *(blank)*
+/// 9. GitHub-star call-to-action — the closing line (a plain `★`, U+2605, not the `⭐️` emoji,
+///    whose double-width mis-renders in the TUI)
 ///
 /// (AC-16, AC-17, AC-18, AC-19)
 pub fn about_text(update: Option<crate::update::version::Version>) -> String {
-    let update_line = match update {
+    let status = match update {
         Some(v) => format!("Update available: v{v}"),
         None => "Up to date".to_owned(),
     };
+    // Bare host+path: strip the URL scheme so it reads as a plain repo handle, no label.
+    let repository = env!("CARGO_PKG_REPOSITORY")
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
     format!(
-        "{name} v{version}\n\
+        "{name}\n\
          {description}\n\
-         Repository: {repository}\n\
-         {star_cta}\n\
-         License: {license}\n\
-         {update_line}",
+         \n\
+         {repository}\n\
+         \n\
+         v{version} · {status}\n\
+         {license} License\n\
+         \n\
+         {star_cta}",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
-        repository = env!("CARGO_PKG_REPOSITORY"),
-        star_cta = "⭐️ Your star shines on us — star us on GitHub!",
+        repository = repository,
+        status = status,
         license = env!("CARGO_PKG_LICENSE"),
-        update_line = update_line,
+        star_cta = "If you enjoy the file viewer, don't forget to give it a ★ on GitHub!",
     )
 }
 
@@ -189,51 +214,96 @@ mod tests {
         );
     }
 
-    // (b) about_text(None) contains the required identity fields.
+    // ①: changelog_display() drops the file-meta preamble (title + Keep-a-Changelog/SemVer
+    // paragraph + link refs) and starts at the first version heading — but keeps the entries.
+    #[test]
+    fn changelog_display_strips_file_preamble() {
+        let shown = changelog_display();
+        assert!(
+            !shown.contains("Keep a Changelog"),
+            "changelog_display() must not contain the 'Keep a Changelog' preamble line"
+        );
+        assert!(
+            !shown.contains("Semantic Versioning"),
+            "changelog_display() must not contain the 'Semantic Versioning' preamble line"
+        );
+        assert!(
+            shown.starts_with("## ["),
+            "changelog_display() must start at the first '## [' version heading"
+        );
+        // The const stays whole — the preamble is only sliced off for display.
+        assert!(
+            CHANGELOG_MD.contains("Keep a Changelog"),
+            "CHANGELOG_MD const must remain whole (preamble intact for T-1's newest-first test)"
+        );
+    }
+
+    // (b) about_text(None) contains the required identity fields (AC-16, AC-17). The version now
+    // lives on the status line; the repo URL is BARE (scheme stripped, no "Repository:" label);
+    // the license reads "<SPDX> License".
     #[test]
     fn about_text_contains_identity_fields() {
         let text = about_text(None);
         assert!(
             text.contains(env!("CARGO_PKG_VERSION")),
-            "about_text must contain the package version"
+            "about_text must contain the package version (AC-16)"
         );
         assert!(
             text.contains("herdr-file-viewer"),
-            "about_text must contain the package name"
+            "about_text must contain the package name (AC-17)"
         );
         assert!(
             text.contains(env!("CARGO_PKG_DESCRIPTION")),
             "about_text must contain the package description (AC-17)"
         );
+        // The repo URL is rendered BARE — host+path only, the https:// scheme stripped.
         assert!(
-            text.contains(env!("CARGO_PKG_REPOSITORY")),
-            "about_text must contain the repository URL"
+            text.contains("github.com/smarzban/herdr-file-viewer"),
+            "about_text must contain the bare repository URL (AC-17)"
         );
         assert!(
-            text.contains(env!("CARGO_PKG_LICENSE")),
-            "about_text must contain the license"
+            !text.contains("https://") && !text.contains("Repository:"),
+            "about_text must strip the URL scheme and the 'Repository:' label (AC-17)"
+        );
+        // The license reads "<SPDX> License" (e.g. "MIT License").
+        assert!(
+            text.contains("MIT License"),
+            "about_text must contain the license as '<SPDX> License' (AC-17)"
         );
     }
 
-    // (c) The star-CTA line is immediately before the License: line.
+    // (c) AC-18: the GitHub-star CTA uses a plain ★ (U+2605, not the ⭐️ emoji) and is the CLOSING
+    // line of About — the last non-empty line, below "<SPDX> License".
     #[test]
-    fn star_cta_is_immediately_before_license_line() {
+    fn star_cta_is_the_closing_line() {
         let text = about_text(None);
         let lines: Vec<&str> = text.split('\n').collect();
 
         let cta_pos = lines
             .iter()
-            .position(|l| l.contains("⭐️") && l.contains("star us on GitHub"))
-            .expect("about_text must contain the star CTA line");
+            .position(|l| l.contains('★') && l.contains("GitHub"))
+            .expect("about_text must contain the ★ GitHub CTA line (AC-18)");
+        // Plain star only — never the ⭐️ emoji (its double-width mis-renders in the TUI).
+        assert!(
+            !text.contains('⭐'),
+            "about_text must use a plain ★ (U+2605), not the ⭐️ emoji (AC-18)"
+        );
         let license_pos = lines
             .iter()
-            .position(|l| l.starts_with("License:"))
-            .expect("about_text must contain the License: line");
-
+            .position(|l| l.contains("License"))
+            .expect("about_text must contain the License line");
+        assert!(
+            license_pos < cta_pos,
+            "the CTA (line {cta_pos}) must come BELOW the License line (line {license_pos}) — AC-18"
+        );
+        // It is the LAST non-empty line of About.
+        let last_non_empty = lines
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .expect("about_text has a non-empty line");
         assert_eq!(
-            cta_pos + 1,
-            license_pos,
-            "star CTA (line {cta_pos}) must be exactly one before License: (line {license_pos})"
+            cta_pos, last_non_empty,
+            "the CTA must be the closing (last non-empty) line of About (AC-18)"
         );
     }
 

@@ -2583,14 +2583,19 @@ fn help_state() -> ViewState {
         active: 1, // About is active (the second tab) — proves the active indicator
         labels: vec!["What's New".to_string(), "About".to_string()],
         body: to_text(
-            "herdr-file-viewer v1.5.0\n\
+            "herdr-file-viewer\n\
              A git-aware, read-only file viewer\n\
-             Repository: https://github.com/smarzban/herdr-file-viewer\n\
-             License: MIT\n\
-             Up to date",
+             \n\
+             github.com/smarzban/herdr-file-viewer\n\
+             \n\
+             v1.5.0 · Up to date\n\
+             MIT License\n\
+             \n\
+             If you enjoy the file viewer, don't forget to give it a ★ on GitHub!",
         ),
         scroll: 0,
         hint: "Tab/←→ switch · Esc/q close".to_string(),
+        center: true, // About is center-aligned (What's New stays left)
     });
     state
 }
@@ -2685,6 +2690,7 @@ fn geometry_help_body_rows_counts_wrapped_rows_and_triggers_scrollbar() {
         body: to_text(&body_str),
         scroll: 0,
         hint: "Tab/←→ switch · Esc/q close".to_string(),
+        center: false, // What's New stays left-aligned
     });
 
     let area = Rect {
@@ -2757,6 +2763,7 @@ fn geometry_help_body_rows_measured_at_post_gutter_width() {
         body: to_text(&body_str),
         scroll: 0,
         hint: "Tab/←→ switch · Esc/q close".to_string(),
+        center: false, // What's New stays left-aligned
     });
 
     let area = Rect {
