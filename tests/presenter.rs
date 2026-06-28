@@ -2718,6 +2718,72 @@ fn geometry_help_body_rows_counts_wrapped_rows_and_triggers_scrollbar() {
     );
 }
 
+// FIX-A regression (AC-8/AC-9): `help_body_rows` must be measured at the ACTUAL drawn body width
+// (post scrollbar-gutter), not the full `inner.width`. When the scrollbar shows, the body draws into
+// a NARROWER `text.width` (inner.width − 2), so the true wrapped count is HIGHER than a count taken at
+// `inner.width`. If `geometry()` reported the wider-width count, the controller's scroll clamp would
+// stop short and a long wrapping changelog's tail would be unreachable. We craft a body whose wrapped
+// count strictly differs between the two widths and assert the reported total equals the NARROWER
+// (post-gutter) measurement — i.e. clamping reaches the true last wrapped row.
+#[test]
+fn geometry_help_body_rows_measured_at_post_gutter_width() {
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+
+    // A 100-wide frame ⇒ help popup inner width 72; once the vbar gutter is reserved the body draws
+    // at width 70. Use unbroken tokens (no spaces) so wrapping is pure char-wrap = ceil(len / width),
+    // letting the test predict both counts exactly without re-implementing word-wrap.
+    let inner_w = 72usize;
+    let text_w = inner_w - 2; // one gutter column + one gap (bar_layout reserves 2)
+
+    // Per-line length chosen so ceil(len/70) > ceil(len/72): 72*2 = 144 wraps to 2 rows at width 72
+    // but 3 rows at width 70. Stack enough such lines that the body overflows the viewport (forcing
+    // the scrollbar — the only case where the two widths diverge).
+    let token = "x".repeat(144);
+    let n_lines = 20usize;
+    let body_str = vec![token.as_str(); n_lines].join("\n");
+
+    let rows_at_inner = (144usize.div_ceil(inner_w)) * n_lines; // 2 * 20 = 40
+    let rows_at_text = (144usize.div_ceil(text_w)) * n_lines; // 3 * 20 = 60
+    assert!(
+        rows_at_text > rows_at_inner,
+        "test precondition: the post-gutter width must yield more wrapped rows"
+    );
+
+    let mut state = help_state();
+    state.help = Some(HelpView {
+        active: 0,
+        labels: vec!["What's New".to_string(), "About".to_string()],
+        body: to_text(&body_str),
+        scroll: 0,
+        hint: "Tab/←→ switch · Esc/q close".to_string(),
+    });
+
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let g = geometry(area, &state);
+
+    // The scrollbar must be present (the body overflows), which is the only regime where the body
+    // draws into the narrower post-gutter width.
+    assert!(
+        g.help_vbar.is_some(),
+        "the vertical scrollbar must show when the wrapped body overflows"
+    );
+    // The reported total must match the POST-GUTTER (narrower) measurement — not the wider
+    // `inner.width` one. A regression to `inner.width` would report `rows_at_inner` and leave the
+    // changelog's tail (the missing `rows_at_text − rows_at_inner` rows) unreachable.
+    assert_eq!(
+        g.help_body_rows as usize, rows_at_text,
+        "help_body_rows ({}) must be measured at the drawn body width {text_w} (= {rows_at_text}), \
+         not at inner.width {inner_w} (= {rows_at_inner}) — else the tail is unreachable",
+        g.help_body_rows
+    );
+}
+
 // T-7 crux (AC-10): the section-tab rects `geometry()` feeds back (`help_tabs`) must line up with
 // where the tabs are ACTUALLY drawn, so a click maps to the tab actually drawn (draw + hit-test
 // can't drift). Render the overlay, scan the buffer for each label, and assert the drawn label

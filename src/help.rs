@@ -202,6 +202,10 @@ mod tests {
             "about_text must contain the package name"
         );
         assert!(
+            text.contains(env!("CARGO_PKG_DESCRIPTION")),
+            "about_text must contain the package description (AC-17)"
+        );
+        assert!(
             text.contains(env!("CARGO_PKG_REPOSITORY")),
             "about_text must contain the repository URL"
         );

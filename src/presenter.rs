@@ -173,8 +173,11 @@ pub struct HelpView {
     /// The active section's prerendered body (an owned clone, so the Presenter stays borrow-free).
     /// Drawn via [`Paragraph::scroll`] so a tall changelog can be read with the scrollbar.
     pub body: Text<'static>,
-    /// The active section's vertical scroll offset, in (raw) lines. The Presenter draws from it;
-    /// the controller re-clamps the stored offset to the live measured body height each frame (AC-9).
+    /// The active section's vertical scroll offset, in **rendered (wrapped) rows** — the body draws
+    /// with `Paragraph::wrap`, so `scroll_by` advances rendered rows and `clamp_scroll` bounds the
+    /// offset against the wrapped `help_body_rows` (equalling raw lines only when the body doesn't
+    /// wrap). The Presenter draws from it; the controller re-clamps the stored offset to the live
+    /// measured body height each frame (AC-9).
     pub scroll: u16,
     /// The self-operating key-hints footer (AC-11) — at minimum how to switch sections and how to
     /// close (e.g. `"Tab/←→ switch · Esc/q close"`). Built by the controller so the Presenter stays
@@ -1465,10 +1468,11 @@ struct HelpLayout {
     /// The vertical scrollbar track rect (1-cell gutter right of the body), present only when the
     /// body overflows the visible height. The SAME rect `draw` renders into and `geometry` feeds back.
     vbar: Option<Rect>,
-    /// The body's total height in **wrapped (rendered) rows** at the body inner width — the extent
-    /// the scroll offset and scrollbar must be measured against, since the body is drawn with
-    /// `Paragraph::wrap` (raw `lines.len()` undercounts and leaves a long changelog's tail
-    /// unreachable). `0` when the interior is degenerate. Fed back via `PaneGeometry::help_body_rows`.
+    /// The body's total height in **wrapped (rendered) rows** at the ACTUAL drawn body width (i.e.
+    /// post scrollbar-gutter — `text.width`, not the full `inner.width`) — the extent the scroll
+    /// offset and scrollbar must be measured against, since the body is drawn with `Paragraph::wrap`
+    /// (raw `lines.len()` undercounts and leaves a long changelog's tail unreachable). `0` when the
+    /// interior is degenerate. Fed back via `PaneGeometry::help_body_rows`.
     body_rows: u16,
     /// Each section tab's screen rect in the top-border tab row, paired with its section index —
     /// `(index, cell_rect)`. Derived from the SAME widths `draw_help_overlay` renders the tab Line
@@ -1522,24 +1526,33 @@ fn help_overlay_layout(area: Rect, help: &HelpView) -> HelpLayout {
         };
     }
     // The body wraps (prose), so its height in rendered rows — not raw lines — is what the scroll
-    // offset and scrollbar must be measured against. Sum the per-line WRAPPED rows at the body inner
-    // width with the EXACT counter the content pane uses (`Controller::wrapped_rows_before`), so the
-    // help clamp and the content clamp can never drift. Measured at the full inner width before the
-    // 1-col scrollbar gutter is reserved — the same pragmatic approximation the content pane makes
-    // (no fixed-point iteration). A long changelog otherwise can't scroll to its last entry (AC-8/AC-9).
-    let w = (inner.width as usize).max(1);
-    let body_rows: usize = help
-        .body
-        .lines
-        .iter()
-        .map(|line| {
-            let line_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            crate::controller::wrapped_rows(&line_text, w).max(line.width().max(1).div_ceil(w))
-        })
-        .sum();
-    let body_rows = body_rows.min(u16::MAX as usize) as u16;
-    let needs_v = body_rows > inner.height;
+    // offset and scrollbar must be measured against. Sum the per-line WRAPPED rows with the EXACT
+    // counter the content pane uses (`Controller::wrapped_rows`), so the help clamp and the content
+    // clamp can never drift. A long changelog otherwise can't scroll to its last entry (AC-8/AC-9).
+    //
+    // Two-pass, mirroring the content pane (which measures at its live text width): the wrapped count
+    // depends on the width the body is ACTUALLY drawn into, and reserving the 1-col vbar gutter
+    // shrinks that width — so a count taken at the full `inner.width` UNDER-counts when the bar shows,
+    // leaving the changelog's tail unreachable (FIX-A). Pass 1 estimates at `inner.width` to decide
+    // whether the bar is needed; pass 2 recomputes against the post-gutter `text.width` actually drawn.
+    let body_rows_at = |w: u16| -> u16 {
+        let w = (w as usize).max(1);
+        let rows: usize = help
+            .body
+            .lines
+            .iter()
+            .map(|line| {
+                let line_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                crate::controller::wrapped_rows(&line_text, w).max(line.width().max(1).div_ceil(w))
+            })
+            .sum();
+        rows.min(u16::MAX as usize) as u16
+    };
+    let needs_v = body_rows_at(inner.width) > inner.height;
     let (text, vbar, _hbar) = bar_layout(inner, needs_v, false);
+    // Recompute against the width the body is genuinely drawn into (post-gutter), so the scroll clamp
+    // reaches the true last wrapped row — this now genuinely matches how the content pane measures.
+    let body_rows = body_rows_at(text.width);
     HelpLayout {
         popup,
         body: Some(text),

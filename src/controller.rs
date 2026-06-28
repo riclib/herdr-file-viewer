@@ -55,6 +55,12 @@ const WHEEL_STEP: isize = 3;
 /// Two left-clicks at the same cell within this window are a double-click (a folder toggles
 /// expand/collapse; a file opens in zoom mode — the editor hand-off is the `e` key).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Wall-clock bound for the synchronous What's New markdown render in `open_help`. The render runs
+/// on the input thread (the design settled on prerender-at-open), so it must be bounded well within
+/// the AC-22 responsiveness budget — far tighter than the shared 5s content `RENDER_TIMEOUT`, which
+/// would let a wedged `glow` freeze input for up to 5s. On timeout the existing render path falls
+/// back to plain text + a notice (AC-15). This reconciles prerender-at-open with AC-22.
+const HELP_RENDER_TIMEOUT: Duration = Duration::from_millis(250);
 /// The help overlay's self-operating key-hints footer (AC-11) — at minimum how to switch sections
 /// and how to close. Carried in `HelpView` so the Presenter stays mode-agnostic; matches the keys
 /// `handle_help_key` actually handles (Tab/←→ switch · digits/1-9 also; Esc/q/`?` close).
@@ -539,6 +545,10 @@ impl Controller {
         // modal and re_root only fires via picker-confirm — but kept structural so a future re-root
         // trigger can't strand an open prompt over a freshly re-rooted tree.
         self.prompt = None;
+        // Close the help overlay too (symmetric teardown). Inert today — help is modal and can't be
+        // open during a re-root — but matches the other modal teardowns so a future re-root trigger
+        // can't strand an open overlay over a freshly re-rooted tree.
+        self.help = None;
         self.last_click = None;
 
         // PREFERENCES ARE CARRIED (AC-12) — deliberately NOT reset: show_ignored, hide_hidden,
@@ -2094,13 +2104,17 @@ impl Controller {
         let prepared = Prepared::Full {
             text: crate::help::CHANGELOG_MD.to_owned(),
         };
-        let (whats_new_body, _notice) = crate::render::render(
-            &self.renderers,
-            &prepared,
-            ViewMode::RenderedMarkdown,
-            None,
-            None,
-        );
+        // The render is synchronous on the input thread, so bound it to the help-specific
+        // `HELP_RENDER_TIMEOUT` (within the AC-22 budget) rather than the shared 5s `RENDER_TIMEOUT`
+        // — a slow/wedged renderer must not freeze input. On timeout `render::render` already falls
+        // back to plain text + a notice (AC-15), so no new handling is needed here. This reconciles
+        // the design's prerender-at-open with AC-22's responsiveness budget.
+        let r = Renderers {
+            timeout: HELP_RENDER_TIMEOUT,
+            ..self.renderers.clone()
+        };
+        let (whats_new_body, _notice) =
+            crate::render::render(&r, &prepared, ViewMode::RenderedMarkdown, None, None);
         let whats_new = HelpSectionState {
             label: HelpSection::WhatsNew.label(),
             body: whats_new_body,

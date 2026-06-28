@@ -7038,6 +7038,59 @@ fn whats_new_body_falls_back_to_plain_text_when_renderer_is_absent() {
     );
 }
 
+/// A Renderers whose markdown command WORKS but is deliberately slow — it sleeps 2s then echoes
+/// stdin (`sh -c 'sleep 2 && cat'`). Used to prove `open_help` bounds the synchronous on-thread
+/// render with the help-specific timeout (FIX-B / AC-22): it must return well before the 2s sleep,
+/// falling back to plain text. (`sh`/`sleep`/`cat` are POSIX — Linux & macOS.)
+fn slow_markdown_renderers() -> Renderers {
+    Renderers {
+        markdown: vec!["sh".into(), "-c".into(), "sleep 2 && cat".into()],
+        diff: vec!["cat".into()],
+        full_diff: vec!["cat".into()],
+        syntax: vec!["cat".into()],
+        // The SHARED render timeout is generous (5s). FIX-B must NOT lean on it — the help path
+        // installs its own ~250ms bound — so we set this high to prove the bound is help-specific.
+        timeout: Duration::from_secs(5),
+    }
+}
+
+#[test]
+fn open_help_bounds_a_slow_markdown_render_to_the_help_budget() {
+    // FIX-B (AC-22): the What's New render is synchronous on the input thread. A slow/wedged
+    // markdown renderer must NOT freeze input for the shared 5s timeout — open_help bounds it with
+    // a help-specific ~250ms timeout and falls back to plain text. With a renderer that sleeps 2s,
+    // handle(ShowHelp) must return well under 1s (proving the bound) and the body must be the
+    // plain-text fallback (still the raw changelog), exercising a REAL subprocess render on open.
+    let dir = TempDir::new();
+    let mut ctrl = controller_with_renderers(dir.path(), slow_markdown_renderers());
+
+    let start = Instant::now();
+    ctrl.handle(Intent::ShowHelp);
+    let elapsed = start.elapsed();
+
+    assert!(
+        ctrl.help_open(),
+        "help must open even when the markdown renderer is slow"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "FIX-B/AC-22: open_help must return well under the 2s renderer sleep (the help-specific \
+         timeout bounds the input-thread block) — took {elapsed:?}"
+    );
+
+    let state = ctrl.help_state().expect("help_state() must be Some");
+    let body = state.active_body(); // section 0 = What's New
+    assert!(
+        !body.lines.is_empty(),
+        "the timed-out render must still yield a non-empty plain-text fallback body"
+    );
+    let text = flatten_text(body);
+    assert!(
+        text.contains("## [Unreleased]"),
+        "on timeout the body is the plain-text fallback (the raw changelog): {text:.80}"
+    );
+}
+
 // ---- T-5: handle_help_key + app.rs key gate (AC-2, AC-3, AC-7, AC-8, AC-9, AC-20) --------
 
 /// Open the help overlay on a fresh controller and return it. Panics if help is not open.
