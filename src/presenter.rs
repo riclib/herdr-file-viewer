@@ -98,6 +98,9 @@ pub struct ViewState {
     /// match highlights on top of the rendered text (AC-9, AC-11). `None` ⇒ draw the content
     /// as-is (byte-identical to today — the `None` arm is just `state.content.clone()`).
     pub search: Option<ContentSearch>,
+    /// When `Some`, the in-app help overlay is drawn on top of everything else (AC-1, AC-5).
+    /// `None` ⇒ no overlay. Drawn last in [`draw`] so it sits above the picker and finder.
+    pub help: Option<HelpView>,
 }
 
 /// The worktree picker's draw model (an owned snapshot of the controller's picker state, so
@@ -157,6 +160,33 @@ pub struct FinderView {
     /// `max_row_width − inner_width` at draw so it can never over-scroll. The query line is
     /// NOT scrolled; this affects only the match rows.
     pub hscroll: u16,
+}
+
+/// The help overlay's draw model — an owned, borrow-free snapshot of the controller's
+/// [`crate::help::HelpState`], so the Presenter holds no reference into the controller (exactly
+/// like [`FinderView`]/[`PickerView`]). Built by the Session Controller's `view_state()`.
+pub struct HelpView {
+    /// The index of the active section in `labels` — rendered with the active-tab indicator (AC-5).
+    pub active: usize,
+    /// The section labels (the tab row), in order. v1: `["What's New", "About"]`.
+    pub labels: Vec<String>,
+    /// The active section's prerendered body (an owned clone, so the Presenter stays borrow-free).
+    /// Drawn via [`Paragraph::scroll`] so a tall changelog can be read with the scrollbar.
+    pub body: Text<'static>,
+    /// The active section's vertical scroll offset, in **rendered (wrapped) rows** — the body draws
+    /// with `Paragraph::wrap`, so `scroll_by` advances rendered rows and `clamp_scroll` bounds the
+    /// offset against the wrapped `help_body_rows` (equalling raw lines only when the body doesn't
+    /// wrap). The Presenter draws from it; the controller re-clamps the stored offset to the live
+    /// measured body height each frame (AC-9).
+    pub scroll: u16,
+    /// The self-operating key-hints footer (AC-11) — at minimum how to switch sections and how to
+    /// close (e.g. `"Tab/←→ switch · Esc/q close"`). Built by the controller so the Presenter stays
+    /// mode-agnostic.
+    pub hint: String,
+    /// Center-align the active body? Set by the controller's `help_view()`: `true` only for the
+    /// About section (its short identity lines read better centered), `false` for What's New (whose
+    /// rendered changelog stays left-aligned). The Presenter applies it via `Paragraph::alignment`.
+    pub center: bool,
 }
 
 /// The single-character git-status marker shown beside a tree row (AC-7).
@@ -660,7 +690,7 @@ fn columns(area: Rect, state: &ViewState) -> (Option<Rect>, Option<Rect>, Option
 /// `tree_inner.y + r` is index `r + tree_scroll` (the tree scrolls to keep the selection in
 /// view, #45). `content_inner` is the content column interior. `divider_x` is the draggable
 /// boundary column (wide layout only).
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct PaneGeometry {
     pub area_x: u16,
     pub area_width: u16,
@@ -706,6 +736,28 @@ pub struct PaneGeometry {
     /// parks the offset past the real maximum and the first few Collapse presses appear to do
     /// nothing while it burns back down (the same fix as `finder_max_hscroll`, SMA-229).
     pub picker_max_hscroll: u16,
+    /// The screen rect where the help overlay's active body is drawn, `None` when the overlay is
+    /// closed. Exposed for next-frame hit-testing (T-7 adds the tab regions on top).
+    pub help_body: Option<Rect>,
+    /// The help body's visible viewport HEIGHT, in rows (`0` when the overlay is closed). Fed back
+    /// so the controller re-clamps the stored scroll to `[0, help_body_rows − this]` each frame —
+    /// the bottom bound deferred from T-5, enforced against the live measured height (AC-9).
+    pub help_body_height: u16,
+    /// The help body's total height in **wrapped (rendered) rows** at the body draw width (`0` when
+    /// the overlay is closed). The body is drawn with `Paragraph::wrap`, so its scroll offset is in
+    /// wrapped rows — fed back as the scroll's upper extent so the controller clamps against the
+    /// wrapped total (not raw `lines.len()`, which would leave a long changelog's tail unreachable —
+    /// AC-8/AC-9). Mirrors how the content pane clamps against its wrapped `rendered_line_count_for`.
+    pub help_body_rows: u16,
+    /// The help body's vertical scrollbar track rect (1-cell gutter right of the body), present only
+    /// when the body overflows. `None` when the overlay is closed or the body fits.
+    pub help_vbar: Option<Rect>,
+    /// The screen rect of each section tab in the help overlay's top-border tab row, paired with its
+    /// section index — `(index, cell_rect)`. Computed inside [`help_overlay_layout`] from the SAME
+    /// widths [`draw_help_overlay`] uses (the `"Help: "` prefix + cumulative `sanitize_label(label)`
+    /// widths + `HELP_TAB_SEP`), so a click maps to the tab actually drawn. Empty when the overlay is
+    /// closed. The controller hit-tests a left-click against these to switch sections (AC-10).
+    pub help_tabs: Vec<(usize, Rect)>,
 }
 
 /// Compute the [`PaneGeometry`] for hit-testing the current frame — the same layout [`draw`]
@@ -782,6 +834,18 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         None => 0,
     };
 
+    // Help: the SAME helper `draw_help_overlay` uses, so the fed-back body HEIGHT matches what is
+    // drawn — the controller clamps the stored scroll to `[0, body_lines − height]` each frame, the
+    // bottom bound deferred from T-5 (AC-9). All `None`/`0` when the overlay is closed.
+    let (help_body, help_body_height, help_body_rows, help_vbar, help_tabs) = match &state.help {
+        Some(help) => {
+            let hl = help_overlay_layout(area, help);
+            let height = hl.body.map_or(0, |b| b.height);
+            (hl.body, height, hl.body_rows, hl.vbar, hl.tabs)
+        }
+        None => (None, 0, 0, None, Vec::new()),
+    };
+
     PaneGeometry {
         area_x: body.x,
         area_width: body.width,
@@ -799,6 +863,11 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         finder_max_hscroll,
         finder_vbar,
         picker_max_hscroll,
+        help_body,
+        help_body_height,
+        help_body_rows,
+        help_vbar,
+        help_tabs,
     }
 }
 
@@ -835,6 +904,10 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
     // an independent check is correct — if both are somehow set, both draw (last wins).
     if let Some(finder) = &state.finder {
         draw_finder_overlay(frame, frame.area(), finder);
+    }
+    // The in-app help overlay draws LAST — on top of the picker/finder (AC-1, AC-5).
+    if let Some(help) = &state.help {
+        draw_help_overlay(frame, frame.area(), help);
     }
     dims
 }
@@ -1131,6 +1204,33 @@ const FINDER_PROMPT: &str = "> ";
 /// The placeholder shown on the query-input line when the query is empty (AC-2).
 const FINDER_PLACEHOLDER: &str = "> type to find a file…";
 
+/// The help overlay's top-left title (the box label).
+const HELP_TITLE: &str = "Help";
+/// The help overlay's desired interior WIDTH (columns) before clamping to the frame. A generous
+/// fixed size (the changelog/about bodies are unbounded — the box does NOT size to content like the
+/// finder; it clamps to the frame and the body scrolls).
+const HELP_WANT_INNER_W: u16 = 72;
+/// The help overlay's desired interior HEIGHT (rows) before clamping to the frame.
+const HELP_WANT_INNER_H: u16 = 20;
+/// The separator between section tabs in the help overlay's top border.
+const HELP_TAB_SEP: &str = "  ";
+
+/// The columns [`bar_layout`] reserves for a vertical scrollbar when the body overflows: a 1-cell
+/// gap before the bar + the 1-cell bar itself (see `bar_layout`'s `saturating_sub(2)`).
+const VSCROLL_GUTTER_W: u16 = 2;
+
+/// The help overlay's body **text width** (columns) on a standard terminal — the unclamped interior
+/// ([`HELP_WANT_INNER_W`]) minus the vertical-scrollbar gutter that [`bar_layout`] reserves. The
+/// changelog body always overflows the fixed-height box, so the vbar is always present and the body
+/// is always drawn this narrow. This is the SINGLE source the help layout AND the What's New glow
+/// `-w` both derive from, so glow wraps its markdown to exactly the width the body is drawn at — the
+/// Presenter's `Paragraph::wrap` then becomes a no-op and glow's hanging indents survive (the box is
+/// fixed-width, so this never changes on resize for a terminal ≥ ~76 cols; `Paragraph::wrap` is the
+/// graceful fallback for narrower frames where the box clamps below this width).
+pub(crate) const fn help_body_text_width() -> u16 {
+    HELP_WANT_INNER_W.saturating_sub(VSCROLL_GUTTER_W)
+}
+
 /// The computed layout geometry of the finder overlay, shared between [`draw_finder_overlay`]
 /// and [`geometry`] so neither can drift from the other. Both functions call
 /// [`finder_overlay_layout`] and operate on the returned rects.
@@ -1375,6 +1475,251 @@ fn draw_finder_overlay(frame: &mut Frame, area: Rect, finder: &FinderView) {
     }
 }
 
+/// The computed layout geometry of the help overlay, shared between [`draw_help_overlay`] and
+/// [`geometry`] so neither can drift from the other — mirroring [`FinderLayout`]/[`PickerLayout`].
+/// Both functions call [`help_overlay_layout`] and operate on the returned rects.
+struct HelpLayout {
+    /// The full popup outer rect (after centering + clamping to `area`). `draw` clears it + draws
+    /// the bordered block.
+    popup: Rect,
+    /// The padded interior where the body is drawn (the popup minus borders + uniform padding,
+    /// minus any reserved scrollbar gutter). `None` when the interior is degenerate (too small).
+    body: Option<Rect>,
+    /// The vertical scrollbar track rect (1-cell gutter right of the body), present only when the
+    /// body overflows the visible height. The SAME rect `draw` renders into and `geometry` feeds back.
+    vbar: Option<Rect>,
+    /// The body's total height in **wrapped (rendered) rows** at the ACTUAL drawn body width (i.e.
+    /// post scrollbar-gutter — `text.width`, not the full `inner.width`) — the extent the scroll
+    /// offset and scrollbar must be measured against, since the body is drawn with `Paragraph::wrap`
+    /// (raw `lines.len()` undercounts and leaves a long changelog's tail unreachable). `0` when the
+    /// interior is degenerate. Fed back via `PaneGeometry::help_body_rows`.
+    body_rows: u16,
+    /// Each section tab's screen rect in the top-border tab row, paired with its section index —
+    /// `(index, cell_rect)`. Derived from the SAME widths `draw_help_overlay` renders the tab Line
+    /// with (the `"Help: "` prefix + cumulative `sanitize_label(label)` widths + `HELP_TAB_SEP`), so
+    /// the drawn tabs and the hit-test rects can never drift. Each rect is the tab label's own cells
+    /// (1 row tall, at `popup.y`); a tab clipped past the popup's right edge is dropped.
+    tabs: Vec<(usize, Rect)>,
+}
+
+/// Compute the help overlay's layout geometry for the given frame `area` and `help` draw model.
+/// This is the **single authoritative place** for the help overlay's sizing + centering — both
+/// [`draw_help_overlay`] and [`geometry`] call it, so the drawn rects and the hit-test / clamp
+/// geometry are guaranteed to agree (mirrors [`finder_overlay_layout`]).
+///
+/// Unlike the finder/picker (size-to-content), the help overlay is a **fixed centered box** clamped
+/// to the frame — the changelog body is unbounded, so the box does not grow with it; the body
+/// scrolls instead.
+fn help_overlay_layout(area: Rect, help: &HelpView) -> HelpLayout {
+    // Fixed desired size (+ border + uniform padding), then clamp to the frame with a 1-cell margin.
+    let want_w = HELP_WANT_INNER_W
+        .saturating_add(2)
+        .saturating_add(PICKER_PADDING * 2);
+    let want_h = HELP_WANT_INNER_H
+        .saturating_add(2)
+        .saturating_add(PICKER_PADDING * 2);
+    let cap_w = area.width.saturating_sub(2);
+    let cap_h = area.height.saturating_sub(2);
+    let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
+
+    let block = Block::bordered().padding(Padding::uniform(PICKER_PADDING));
+    let inner = block.inner(popup);
+
+    // Section-tab rects in the top-border tab row, derived from the SAME span widths the draw path
+    // lays out: a left-aligned `title_top` Line begins at the first interior border column
+    // (`popup.x + 1`), starting with the `"Help: "` prefix; each tab is `sanitize_label(label)`
+    // wide, separated by `HELP_TAB_SEP`. We walk those widths to place each tab's cell rect, so a
+    // click maps to the tab actually drawn (the whole point of the shared helper). Rects fully past
+    // the popup's right border are dropped (clipped off-screen, not clickable).
+    let tabs = help_tab_rects(popup, &help.labels);
+
+    // The body fills the whole interior (tabs + footer ride the border, not inner rows). Reserve a
+    // 1-cell vertical scrollbar gutter (with a 1-cell gap) only when the body overflows — there is
+    // no horizontal overflow because the body wraps. A degenerate (zero-size) interior yields no body.
+    if inner.width == 0 || inner.height == 0 {
+        return HelpLayout {
+            popup,
+            body: None,
+            vbar: None,
+            body_rows: 0,
+            tabs,
+        };
+    }
+    // The body wraps (prose), so its height in rendered rows — not raw lines — is what the scroll
+    // offset and scrollbar must be measured against. Sum the per-line WRAPPED rows with the EXACT
+    // counter the content pane uses (`text_layout::wrapped_rows`), so the help clamp and the content
+    // clamp can never drift. A long changelog otherwise can't scroll to its last entry (AC-8/AC-9).
+    //
+    // Two-pass, mirroring the content pane (which measures at its live text width): the wrapped count
+    // depends on the width the body is ACTUALLY drawn into, and reserving the 1-col vbar gutter
+    // shrinks that width — so a count taken at the full `inner.width` UNDER-counts when the bar shows,
+    // leaving the changelog's tail unreachable (FIX-A). Pass 1 estimates at `inner.width` to decide
+    // whether the bar is needed; pass 2 recomputes against the post-gutter `text.width` actually drawn.
+    let body_rows_at = |w: u16| -> u16 {
+        let w = (w as usize).max(1);
+        let rows: usize = help
+            .body
+            .lines
+            .iter()
+            .map(|line| {
+                let line_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                crate::text_layout::wrapped_rows(&line_text, w).max(line.width().max(1).div_ceil(w))
+            })
+            .sum();
+        rows.min(u16::MAX as usize) as u16
+    };
+    let needs_v = body_rows_at(inner.width) > inner.height;
+    let (text, vbar, _hbar) = bar_layout(inner, needs_v, false);
+    // When the box is NOT clamped (terminal ≥ ~76 cols, the common case) AND the body overflows — the
+    // real changelog always does, so the vbar is always present — the body is drawn at exactly
+    // `help_body_text_width()`, the width the What's New glow render wraps to. Pin that agreement so
+    // the shared constant can never silently drift from the `bar_layout` math it models. (A short body
+    // with no vbar is drawn at the full interior, which is still ≥ the glow wrap width — fits fine.)
+    debug_assert!(
+        inner.width < HELP_WANT_INNER_W || vbar.is_none() || text.width == help_body_text_width(),
+        "help body text width {} must match help_body_text_width() {} when unclamped + overflowing",
+        text.width,
+        help_body_text_width(),
+    );
+    // Recompute against the width the body is genuinely drawn into (post-gutter), so the scroll clamp
+    // reaches the true last wrapped row — this now genuinely matches how the content pane measures.
+    let body_rows = body_rows_at(text.width);
+    HelpLayout {
+        popup,
+        body: Some(text),
+        vbar,
+        body_rows,
+        tabs,
+    }
+}
+
+/// Compute each section tab's screen rect in the help overlay's top-border tab row, paired with its
+/// section index. This is the single place the tab x-positions are derived; both the draw path (via
+/// the tab `Line` it builds with the same spans) and the hit-test (via [`PaneGeometry::help_tabs`])
+/// flow from it, so a click can never map to a different tab than the one drawn.
+///
+/// Layout mirrors [`draw_help_overlay`]'s `title_top`: a left-aligned title begins at the first
+/// interior border column (`popup.x + 1`) with the `"{HELP_TITLE}: "` prefix, then each label —
+/// `sanitize_label(label)` wide — separated by [`HELP_TAB_SEP`]. A tab whose cells fall entirely
+/// past the popup's right border is dropped (ratatui clips it off-screen, so it isn't clickable).
+fn help_tab_rects(popup: Rect, labels: &[String]) -> Vec<(usize, Rect)> {
+    // The title row is the popup's top border; left-aligned titles start one cell in from the corner.
+    let row = popup.y;
+    let mut x = popup.x.saturating_add(1).saturating_add(prefix_width());
+    // The rightmost interior column (exclusive of the right border corner): popup.x + width - 1.
+    let right_edge = popup.x.saturating_add(popup.width.saturating_sub(1));
+    let mut out = Vec::with_capacity(labels.len());
+    for (i, label) in labels.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(HELP_TAB_SEP.chars().count() as u16);
+        }
+        let w = sanitize_label(label).chars().count() as u16;
+        // Keep only a tab that begins before the right border — its visible cells are clickable.
+        if w > 0 && x < right_edge {
+            // Clip the tab's width to what fits before the right border.
+            let visible_w = w.min(right_edge.saturating_sub(x));
+            out.push((
+                i,
+                Rect {
+                    x,
+                    y: row,
+                    width: visible_w,
+                    height: 1,
+                },
+            ));
+        }
+        x = x.saturating_add(w);
+    }
+    out
+}
+
+/// The display width (columns) of the help tab row's leading `"{HELP_TITLE}: "` prefix.
+fn prefix_width() -> u16 {
+    format!("{HELP_TITLE}: ").chars().count() as u16
+}
+
+/// Draw the in-app help overlay as a centered, bordered, fixed-size modal over everything else
+/// (AC-1, AC-5, AC-11). The interior is the active section's body, scrollable; a vertical
+/// scrollbar appears when it overflows. The chrome rides the border:
+///   - **Top border:** the section tabs (`HELP_TITLE` is the box label; each label is a tab, the
+///     ACTIVE one REVERSED so it is visibly indicated — AC-5).
+///   - **Bottom border:** the self-operating key-hints footer (switch + close — AC-11).
+///
+/// Reuses [`centered_rect_sized`], `PICKER_PADDING`, and the `Clear`/`Block`/`Scrollbar` primitives
+/// — no new layout abstraction. The body `Text` is already produced by the controller (T-4); this
+/// function only lays it out (delegate-rendering, constitution #2).
+fn draw_help_overlay(frame: &mut Frame, area: Rect, help: &HelpView) {
+    // Delegate all sizing + centering to the shared layout helper, so this and `geometry()` agree.
+    let layout = help_overlay_layout(area, help);
+
+    // Top border: the box label followed by the section tabs, the active one REVERSED (AC-5). The
+    // hints/labels are static or first-party (no untrusted repo input crosses into the overlay), but
+    // `Color::Reset` is set so the tab spans match the body text rather than inheriting the (blue)
+    // border tint — the same idiom the picker chrome uses.
+    let mut tab_spans: Vec<Span<'static>> = vec![Span::styled(
+        format!("{HELP_TITLE}: "),
+        Style::new().fg(Color::Reset),
+    )];
+    for (i, label) in help.labels.iter().enumerate() {
+        if i > 0 {
+            tab_spans.push(Span::styled(HELP_TAB_SEP, Style::new().fg(Color::Reset)));
+        }
+        let mut style = Style::new().fg(Color::Reset);
+        if i == help.active {
+            // The active tab is REVERSED — the visible active-section indicator (AC-5).
+            style = style
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD);
+        }
+        tab_spans.push(Span::styled(sanitize_label(label), style));
+    }
+    let tabs = Line::from(tab_spans);
+
+    // Bottom border: the self-operating key-hints footer (AC-11), centered, in the body's color.
+    let footer = Line::styled(sanitize_label(&help.hint), Style::new().fg(Color::Reset)).centered();
+
+    // Clear whatever is beneath the popup so it reads as a true modal (on top of the picker/finder).
+    frame.render_widget(Clear, layout.popup);
+
+    let block = Block::bordered()
+        .title_top(tabs)
+        .title_bottom(footer)
+        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .padding(Padding::uniform(PICKER_PADDING));
+    frame.render_widget(block, layout.popup);
+
+    if let Some(body_area) = layout.body {
+        // The body wraps (prose: the rendered changelog / about text) and scrolls vertically.
+        // About is center-aligned (`help.center`); What's New stays left as today.
+        let alignment = if help.center {
+            ratatui::layout::Alignment::Center
+        } else {
+            ratatui::layout::Alignment::Left
+        };
+        frame.render_widget(
+            Paragraph::new(help.body.clone())
+                .alignment(alignment)
+                .wrap(Wrap { trim: false })
+                .scroll((help.scroll, 0)),
+            body_area,
+        );
+        // Vertical scrollbar when the body overflows — the same `layout.vbar` rect `geometry` feeds
+        // back, so a press/drag on it (T-7) hit-tests where it is drawn. Tracks the scroll OFFSET
+        // (the body has a real offset, like the content pane — unlike the cursor-tracking tree bar).
+        // Sized against the WRAPPED row total (`layout.body_rows`), not raw `lines.len()`, so the
+        // thumb matches the offset extent the scroll clamp uses (the body is drawn with `wrap`).
+        if let Some(track) = layout.vbar {
+            draw_vscrollbar(
+                frame,
+                track,
+                layout.body_rows as usize,
+                help.scroll as usize,
+                body_area.height as usize,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1396,6 +1741,57 @@ mod tests {
             !sanitize_label("\u{1b}\u{07}\u{7f}\u{9b}z")
                 .chars()
                 .any(|c| c.is_control())
+        );
+    }
+
+    #[test]
+    fn help_body_text_width_is_the_interior_minus_the_scrollbar_gutter() {
+        // The glow `-w` target: the unclamped interior minus the 1-gap + 1-bar vbar gutter.
+        assert_eq!(help_body_text_width(), HELP_WANT_INNER_W - 2);
+        assert_eq!(help_body_text_width(), 70);
+        assert!(
+            help_body_text_width() < HELP_WANT_INNER_W,
+            "the body text width must be narrower than the full interior (gutter reserved)"
+        );
+        assert!(
+            help_body_text_width() > 0,
+            "the body text width must be a usable positive column count"
+        );
+    }
+
+    #[test]
+    fn help_body_text_width_matches_the_drawn_body_on_a_wide_frame() {
+        use ratatui::text::{Line, Text};
+        // A body tall enough to overflow the fixed box → the vbar is present, so the drawn body
+        // width equals `help_body_text_width()`. This pins the shared constant to the SAME width
+        // `help_overlay_layout` actually draws (and that the glow `-w` is given), preventing drift.
+        let body = Text::from(
+            (0..200)
+                .map(|i| Line::from(format!("line {i}")))
+                .collect::<Vec<_>>(),
+        );
+        let help = HelpView {
+            active: 0,
+            labels: vec!["What's New".to_string(), "About".to_string()],
+            body,
+            scroll: 0,
+            hint: "x".to_string(),
+            center: false,
+        };
+        // A frame comfortably wider than the fixed box so it is NOT clamped.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = help_overlay_layout(area, &help);
+        let body_rect = layout.body.expect("a non-degenerate body");
+        assert!(layout.vbar.is_some(), "an overflowing body shows the vbar");
+        assert_eq!(
+            body_rect.width,
+            help_body_text_width(),
+            "the drawn body width must equal the shared help_body_text_width()"
         );
     }
 }

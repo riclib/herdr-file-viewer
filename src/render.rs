@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The size cap: files at or above this many bytes are previewed, not shown whole (AC-13).
 const MAX_BYTES: u64 = 1024 * 1024; // 1 MB
@@ -177,6 +177,32 @@ pub fn render(
     }
 }
 
+/// Return a copy of a markdown renderer command (e.g. glow) with its wrap width set to `width`:
+/// replace the argument following the `-w` flag, or append `-w <width>` if absent. Used by the help
+/// overlay's What's New render so glow wraps the changelog to the fixed help-box body width (with its
+/// own hanging indents) instead of the default `-w 0` (no wrap → the Presenter's flat re-wrap loses
+/// the indents). The base command (and its `{name}`/`-` args) is otherwise unchanged.
+pub(crate) fn with_wrap_width(command: &[String], width: u16) -> Vec<String> {
+    let mut out = command.to_vec();
+    let w = width.to_string();
+    match out.iter().position(|a| a == "-w") {
+        // Replace the value after `-w`; if `-w` is the trailing arg with no value, append one.
+        Some(i) => match out.get_mut(i + 1) {
+            Some(v) => *v = w,
+            None => out.push(w),
+        },
+        // No `-w` at all: append the flag + value (kept ahead of any trailing positional is not
+        // required — glow accepts flags after `-`, but we insert before the final `-` if present
+        // for tidiness).
+        None => {
+            let insert_at = out.iter().rposition(|a| a == "-").unwrap_or(out.len());
+            out.insert(insert_at, w);
+            out.insert(insert_at, "-w".to_string());
+        }
+    }
+    out
+}
+
 /// Substitute the `{name}` placeholder in a renderer command with the selected file name,
 /// so a stdin-fed renderer (e.g. `bat --file-name={name}`) can still infer the language —
 /// keeping the secure stdin design while enabling syntax highlighting (AC-10).
@@ -320,11 +346,21 @@ fn run_renderer(command: &[String], input: &str, timeout: Duration) -> Result<St
         let _ = tx.send(buf);
     });
 
+    // A SINGLE combined wall-clock deadline for the whole invocation (the doc'd "per-invocation
+    // wall-clock bound"), NOT `timeout` applied twice. The stdout phase below waits up to
+    // `timeout`, then the Ok-path exit-wait gets only the REMAINING budget — so a renderer that
+    // closes stdout late and then lingers on exit can't burn ~2× the timeout (which, for the
+    // synchronous help render, would blow AC-22's responsiveness budget). See item 1 / AC-22.
+    let deadline = Instant::now() + timeout;
     match rx.recv_timeout(timeout) {
         Ok(buf) => {
-            // stdout closed; the process should exit promptly. Bound that wait too, so a
-            // renderer that closes stdout then hangs is still killed (no indefinite block).
-            match wait_bounded(&mut child, timeout) {
+            // stdout closed; the process should exit promptly. Bound that wait by what's LEFT of
+            // the single deadline, so a renderer that closes stdout then hangs is still killed and
+            // the TOTAL never exceeds `timeout` (no indefinite block, no doubled budget).
+            match wait_bounded(
+                &mut child,
+                deadline.saturating_duration_since(Instant::now()),
+            ) {
                 Some(status) if status.success() => Ok(String::from_utf8_lossy(&buf).into_owned()),
                 Some(status) => Err(format!("{prog} exited with {status}")),
                 None => Err(format!("{prog} did not exit")),
@@ -460,6 +496,31 @@ mod tests {
     }
 
     #[test]
+    fn with_wrap_width_replaces_the_w_value_without_disturbing_the_rest() {
+        // The default markdown command: glow with `-w 0` (no wrap). The help overlay rewrites the
+        // 0 to the box body width so glow wraps with its own hanging indents.
+        let base: Vec<String> = ["glow", "-s", "dark", "-w", "0", "-"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = with_wrap_width(&base, 70);
+        assert_eq!(got, ["glow", "-s", "dark", "-w", "70", "-"]);
+        // The wrap value is non-zero (the whole point — `-w 0` disables wrapping → flat re-wrap).
+        let i = got.iter().position(|a| a == "-w").expect("-w present");
+        assert_ne!(got[i + 1], "0", "the help render must use a non-zero -w");
+    }
+
+    #[test]
+    fn with_wrap_width_inserts_the_flag_when_absent() {
+        let base: Vec<String> = ["glow", "-"].iter().map(|s| s.to_string()).collect();
+        let got = with_wrap_width(&base, 70);
+        let i = got.iter().position(|a| a == "-w").expect("-w inserted");
+        assert_eq!(got[i + 1], "70");
+        // The trailing stdin positional is preserved at the end.
+        assert_eq!(got.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
     fn small_text_file_is_returned_in_full() {
         let p = tmp("small.txt", b"hello\nworld\n");
         match classify(&std::env::temp_dir(), &p) {
@@ -574,6 +635,46 @@ mod tests {
         assert!(
             forced,
             "CLICOLOR_FORCE=1 must be set on the renderer subprocess"
+        );
+    }
+
+    #[test]
+    fn run_renderer_bounds_total_wall_clock_to_a_single_timeout_on_slow_exit() {
+        // R3 item 1 / AC-22: `run_renderer` must enforce a SINGLE combined wall-clock deadline,
+        // not apply `timeout` twice (once waiting for stdout, again waiting for exit). This
+        // exercises the Ok→wait_bounded slow-exit path: `cat` echoes stdin then closes stdout
+        // (fast EOF → the recv_timeout(stdout) phase returns promptly), but the shell then sleeps
+        // 2s before exiting — so the exit-wait is what would burn a second full `timeout` under
+        // the old code. The combined deadline caps the TOTAL at roughly one `timeout`.
+        // A generous 1s timeout so the (roughly fixed, ~100ms) process-spawn/scheduling overhead on a
+        // loaded CI runner is a SMALL fraction of it — a tight bound on a small timeout flaked here
+        // (a 200ms timeout + ~120ms overhead blew a 1.4× bound on a busy macOS runner).
+        let timeout = Duration::from_millis(1000);
+        // Two phases, each timed to expose the double-bound: the renderer holds stdout open for
+        // ~0.8× the timeout (so the `recv_timeout(stdout)` phase nearly burns a full timeout, but
+        // still returns Ok), THEN lingers ~2s before exiting (so the Ok-path exit-wait would burn
+        // a SECOND full timeout under the bug). `exec 1>&-` closes stdout precisely at the phase
+        // boundary so the reader thread sees EOF and `recv_timeout` returns Ok → the slow-exit
+        // `wait_bounded` path. Under the 2× bug: ~0.8×+1.0× ≈ 1.8×. Under the single combined
+        // deadline: ~0.8× + remaining(~0.2×) ≈ 1.0×.
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat >/dev/null; sleep 0.8; exec 1>&-; sleep 3".to_string(),
+        ];
+        let start = std::time::Instant::now();
+        let _ = run_renderer(&cmd, "hello", timeout);
+        let elapsed = start.elapsed();
+        // The bug applies `timeout` twice → ~2×. A single combined deadline keeps it ~1×; allow
+        // slack for the 10ms poll + scheduling, but well under the ~1.8× the bug produces here.
+        // Single combined deadline → total ≈ 1× the timeout (+overhead). The 2× bug here ≈ 1.8×
+        // (0.8× recv + a fresh 1.0× exit-wait). Assert < 1.5×: comfortably above 1×+CI-overhead
+        // (~380ms headroom), comfortably below the bug's ~1.8× (~300ms margin).
+        assert!(
+            elapsed < timeout.mul_f32(1.5),
+            "run_renderer must bound TOTAL wall-clock to a single timeout (~{timeout:?}); \
+             took {elapsed:?} (the 2× bug would take ~{:?})",
+            timeout.mul_f32(1.8)
         );
     }
 

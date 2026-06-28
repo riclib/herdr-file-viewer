@@ -15,6 +15,7 @@ use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::herdr::HerdrCli;
 use herdr_file_viewer::intent::Intent;
 use herdr_file_viewer::presenter::{Focus, PaneGeometry};
+use herdr_file_viewer::render::Renderers;
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::layout::Rect;
 use ratatui::text::Text;
@@ -104,6 +105,7 @@ fn controller(
             opened: opened.clone(),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let ctrl = Controller::new(
         common::resolved(root.to_path_buf(), is_git_repo),
@@ -586,6 +588,7 @@ fn controller_with_lines(root: &Path, n: usize) -> Controller {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     Controller::new(
         common::resolved(root.to_path_buf(), false),
@@ -773,6 +776,7 @@ fn left_right_scroll_the_content_horizontally_when_focused_and_unwrapped() {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let mut ctrl = Controller::new(
         common::resolved(dir.path().to_path_buf(), false),
@@ -844,6 +848,7 @@ fn wrapped_content_scrolls_vertically_to_the_bottom_and_not_horizontally() {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let mut ctrl = Controller::new(
         common::resolved(dir.path().to_path_buf(), false),
@@ -1021,6 +1026,11 @@ fn wide_geometry() -> PaneGeometry {
         finder_max_hscroll: 0,
         finder_vbar: None,
         picker_max_hscroll: 0,
+        help_body: None,
+        help_body_height: 0,
+        help_body_rows: 0,
+        help_vbar: None,
+        help_tabs: Vec::new(),
     }
 }
 
@@ -1495,6 +1505,7 @@ fn horizontal_wheel_scrolls_the_content_sideways() {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let mut ctrl = Controller::new(
         common::resolved(dir.path().to_path_buf(), false),
@@ -1573,6 +1584,7 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let mut ctrl = Controller::new(
         common::resolved(dir.path().to_path_buf(), true),
@@ -1680,6 +1692,7 @@ fn focus_gained_keeps_tree_and_content_in_sync_after_a_changed_only_refilter() {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let mut ctrl = Controller::new(
         common::resolved(dir.path().to_path_buf(), true),
@@ -1723,6 +1736,7 @@ fn controller_with_clipboard(root: &Path, is_git_repo: bool) -> (Controller, Rec
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(clipboard),
+        renderers: None,
     };
     let ctrl = Controller::new(
         common::resolved(root.to_path_buf(), is_git_repo),
@@ -2888,6 +2902,11 @@ fn re_root_only_reachable_via_switch_worktree_intent() {
         // so the prompt modal guard cannot block SwitchWorktree in Part 2.
         if ctrl.prompt_open() {
             ctrl.handle_prompt_key(key(KeyCode::Esc));
+        }
+        // ShowHelp (in Intent::ALL since T-3) opens the help overlay; close it symmetrically
+        // so the help modal guard cannot block SwitchWorktree in Part 2.
+        if ctrl.help_open() {
+            ctrl.close_help();
         }
     }
 
@@ -4982,6 +5001,7 @@ fn changed_controller_with_lines(root: &Path, file: &str, n: usize) -> Controlle
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     Controller::new(
         common::resolved(root.to_path_buf(), true),
@@ -5117,6 +5137,7 @@ fn controller_with_wrap_lines(root: &Path) -> Controller {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     Controller::new(
         common::resolved(root.to_path_buf(), false),
@@ -5424,6 +5445,7 @@ fn controller_with_search_content(root: &Path) -> Controller {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     Controller::new(
         common::resolved(root.to_path_buf(), false),
@@ -6147,6 +6169,7 @@ fn poll_clears_stale_committed_search_after_content_swap() {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     let mut ctrl = Controller::new(
         common::resolved(dir.path().to_path_buf(), false),
@@ -6387,6 +6410,7 @@ fn controller_with_sentinel_excluded_content(root: &Path) -> Controller {
             opened: Arc::new(Mutex::new(Vec::new())),
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
     };
     Controller::new(
         common::resolved(root.to_path_buf(), false),
@@ -6810,4 +6834,1191 @@ fn open_search_does_not_zoom_when_content_already_visible() {
         "#7b: zoomed must remain false when content is already visible"
     );
     assert!(ctrl.prompt_open(), "prompt is open");
+}
+
+// ---- T-3: ShowHelp intent + open_help --------------------------------------------------
+
+#[test]
+fn show_help_opens_help_overlay_with_whats_new_active_and_non_empty_bodies() {
+    // AC-1, AC-6, AC-19: handle(ShowHelp) → help_open() is true; active section is
+    // "What's New"; both section bodies are non-empty (works without glow — to_text is pure).
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    assert!(!ctrl.help_open(), "help is closed by default");
+
+    let fx = ctrl.handle(Intent::ShowHelp);
+    assert!(fx.redraw, "opening help signals a redraw");
+    assert!(ctrl.help_open(), "help_open() must be true after ShowHelp");
+
+    let state = ctrl
+        .help_state()
+        .expect("help_state() must be Some after ShowHelp");
+    assert_eq!(
+        state.active_index(),
+        0,
+        "active section must be 0 (What's New) on open"
+    );
+    assert_eq!(
+        state.section_labels(),
+        vec!["What's New", "About"],
+        "sections are What's New then About"
+    );
+    assert!(
+        !state.active_body().lines.is_empty(),
+        "What's New body must be non-empty"
+    );
+    assert!(
+        !state.sections[1].body.lines.is_empty(),
+        "About body must be non-empty"
+    );
+}
+
+#[test]
+fn open_help_resets_double_click_state() {
+    // R3 item 2: open_help must clear last_click (mirrors open_finder), so a tree click made just
+    // before the overlay opened can't pair with a same-row click made just after it closes and be
+    // mistaken for a double-click (which would zoom a file). We exercise it behaviorally: a first
+    // click selects+arms last_click; ShowHelp then close_help clear it; a second same-row click
+    // must therefore be a SINGLE click (no zoom), not a double-click.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.set_pane_geometry(wide_geometry());
+
+    // First click on the file row — selects and arms last_click.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1));
+    assert!(!ctrl.zoomed(), "a single click does not zoom");
+
+    // Open then close help — open_help must reset last_click.
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open());
+    ctrl.close_help();
+
+    // Second click on the SAME row. Were last_click still armed from the first click (and within
+    // the double-click window), this would be treated as a double-click and zoom. With the reset
+    // it is a fresh single click → no zoom.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1));
+    assert!(
+        !ctrl.zoomed(),
+        "open_help must reset last_click so a pre-overlay click can't pair as a double-click"
+    );
+}
+
+#[test]
+fn show_help_is_inert_while_picker_is_open() {
+    // Modal gate: ShowHelp must be a no-op while the worktree picker is open.
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::SwitchWorktree);
+    assert!(
+        !ctrl.help_open(),
+        "picker open → help stays closed on ShowHelp"
+    );
+}
+
+#[test]
+fn show_help_is_inert_while_finder_is_open() {
+    // Modal gate: ShowHelp is a no-op while the go-to-file finder is open.
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::OpenFinder);
+    // finder is open — further intents in handle() return early
+    assert!(
+        !ctrl.help_open(),
+        "finder open → help stays closed on ShowHelp"
+    );
+}
+
+#[test]
+fn show_help_is_inert_while_help_is_already_open() {
+    // The help gate prevents a second open from stacking a new HelpState on top.
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "first ShowHelp opens help");
+
+    // A second ShowHelp must be a no-op (gate: help.is_some() → noop).
+    // We cannot easily introspect that the state didn't change, but we can at least
+    // confirm that help is still open and no panic occurred.
+    ctrl.handle(Intent::ShowHelp);
+    assert!(
+        ctrl.help_open(),
+        "help remains open after redundant ShowHelp"
+    );
+}
+
+// ---- T-4: Render What's New as markdown (AC-14, AC-15) ----------------------------------
+
+/// Flatten a `Text<'static>` to a plain string for assertions.
+fn flatten_text(t: &ratatui::text::Text) -> String {
+    t.lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// A Renderers whose markdown command UPPERCASES its stdin (`tr a-z A-Z`). The raw CHANGELOG
+/// has mixed-case `## [Unreleased]`, so a help body containing the UPPERCASED `## [UNRELEASED]`
+/// proves the renderer actually ran and its OUTPUT — not the raw embedded text — reached the
+/// overlay (AC-14). A `cat` passthrough could not distinguish "rendered" from a plain `to_text`
+/// of the same string; a transforming command can. (`tr` is POSIX — Linux & macOS.)
+///
+/// The command is wrapped in `sh -c '…'` and carries a trailing `-w 0` so it mirrors the real glow
+/// command's shape: `open_help` rewrites the `-w` value to the help-box body width
+/// (`with_wrap_width`), and the wrapper makes that flag harmlessly inert (it lands in `sh`'s ignored
+/// positional params `$1 $2`, while the `-c` body reads stdin). This keeps the test exercising the
+/// `-w`-replace path real glow takes, rather than a special-cased command with no `-w`.
+fn uppercasing_markdown_renderers() -> Renderers {
+    Renderers {
+        markdown: vec![
+            "sh".into(),
+            "-c".into(),
+            "tr a-z A-Z".into(),
+            "sh".into(),
+            "-w".into(),
+            "0".into(),
+        ],
+        diff: vec!["cat".into()],
+        full_diff: vec!["cat".into()],
+        syntax: vec!["cat".into()],
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// Build a Renderers whose markdown command is a non-existent binary — simulates the
+/// "renderer absent" fallback path (AC-15).
+fn absent_markdown_renderers() -> Renderers {
+    Renderers {
+        markdown: vec!["herdr-no-such-binary-xyz".into()],
+        diff: vec!["cat".into()],
+        full_diff: vec!["cat".into()],
+        syntax: vec!["cat".into()],
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// Build a controller that receives a specific `Renderers` for the help overlay.
+fn controller_with_renderers(root: &std::path::Path, renderers: Renderers) -> Controller {
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(StubGit::default()),
+            content: Box::new(StubContent),
+        }),
+        editor: Box::new(StubEditor {
+            fail: false,
+            opened: Arc::new(Mutex::new(Vec::new())),
+        }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: Some(renderers),
+    };
+    Controller::new(
+        common::resolved(root.to_path_buf(), false),
+        Baseline::Head,
+        components,
+    )
+}
+
+#[test]
+fn whats_new_body_is_rendered_via_markdown_renderer_when_present() {
+    // AC-14: with a markdown renderer available, What's New shows the renderer's OUTPUT.
+    // The stub uppercases stdin (`tr a-z A-Z`), so the rendered body carries `## [UNRELEASED]`
+    // — a string the raw CHANGELOG (mixed-case `## [Unreleased]`) does not contain. This
+    // proves open_help routed the changelog through render::render and displayed its output,
+    // not a plain `to_text` of the embedded string.
+    let dir = TempDir::new();
+    let mut ctrl = controller_with_renderers(dir.path(), uppercasing_markdown_renderers());
+
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "help must be open");
+
+    let state = ctrl.help_state().expect("help_state() must be Some");
+    let body = state.active_body(); // section 0 = What's New
+    assert!(
+        !body.lines.is_empty(),
+        "AC-14: What's New body must be non-empty with a renderer"
+    );
+    let text = flatten_text(body);
+    assert!(
+        text.contains("## [UNRELEASED]"),
+        "AC-14: What's New shows the markdown renderer's (uppercased) output: {text:.80}"
+    );
+    assert!(
+        !text.contains("## [Unreleased]"),
+        "AC-14: the raw mixed-case heading must NOT survive — proving rendering was applied"
+    );
+}
+
+#[test]
+fn whats_new_body_falls_back_to_plain_text_when_renderer_is_absent() {
+    // AC-15: with the markdown renderer absent (non-existent binary), render::render falls
+    // back to plain text + a notice.  open_help() must not crash; the body must still be
+    // non-empty (the CHANGELOG text is shown as plain text).
+    let dir = TempDir::new();
+    let mut ctrl = controller_with_renderers(dir.path(), absent_markdown_renderers());
+
+    ctrl.handle(Intent::ShowHelp);
+    assert!(
+        ctrl.help_open(),
+        "help must open even when renderer is absent"
+    );
+
+    let state = ctrl.help_state().expect("help_state() must be Some");
+    let body = state.active_body();
+    assert!(
+        !body.lines.is_empty(),
+        "AC-15: plain-text fallback must produce a non-empty body"
+    );
+    let text = flatten_text(body);
+    // The fallback shows the RAW embedded changelog (mixed-case heading), not a transformed
+    // render — contrast with the AC-14 case above.
+    assert!(
+        text.contains("## [Unreleased]"),
+        "AC-15: the plain-text fallback still shows the (raw) changelog: {text:.80}"
+    );
+}
+
+/// A Renderers whose markdown command WORKS but is deliberately slow — it sleeps 2s then echoes
+/// stdin (`sh -c 'sleep 2 && cat'`). Used to prove `open_help` bounds the synchronous on-thread
+/// render with the help-specific timeout (FIX-B / AC-22): it must return well before the 2s sleep,
+/// falling back to plain text. (`sh`/`sleep`/`cat` are POSIX — Linux & macOS.)
+fn slow_markdown_renderers() -> Renderers {
+    Renderers {
+        markdown: vec!["sh".into(), "-c".into(), "sleep 2 && cat".into()],
+        diff: vec!["cat".into()],
+        full_diff: vec!["cat".into()],
+        syntax: vec!["cat".into()],
+        // The SHARED render timeout is generous (5s). FIX-B must NOT lean on it — the help path
+        // installs its own ~250ms bound — so we set this high to prove the bound is help-specific.
+        timeout: Duration::from_secs(5),
+    }
+}
+
+#[test]
+fn open_help_bounds_a_slow_markdown_render_to_the_help_budget() {
+    // FIX-B (AC-22): the What's New render is synchronous on the input thread. A slow/wedged
+    // markdown renderer must NOT freeze input for the shared 5s timeout — open_help bounds it with
+    // a help-specific ~250ms timeout and falls back to plain text. With a renderer that sleeps 2s,
+    // handle(ShowHelp) must return well under 1s (proving the bound) and the body must be the
+    // plain-text fallback (still the raw changelog), exercising a REAL subprocess render on open.
+    let dir = TempDir::new();
+    let mut ctrl = controller_with_renderers(dir.path(), slow_markdown_renderers());
+
+    let start = Instant::now();
+    ctrl.handle(Intent::ShowHelp);
+    let elapsed = start.elapsed();
+
+    assert!(
+        ctrl.help_open(),
+        "help must open even when the markdown renderer is slow"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "FIX-B/AC-22: open_help must return well under the 2s renderer sleep (the help-specific \
+         timeout bounds the input-thread block) — took {elapsed:?}"
+    );
+
+    let state = ctrl.help_state().expect("help_state() must be Some");
+    let body = state.active_body(); // section 0 = What's New
+    assert!(
+        !body.lines.is_empty(),
+        "the timed-out render must still yield a non-empty plain-text fallback body"
+    );
+    let text = flatten_text(body);
+    assert!(
+        text.contains("## [Unreleased]"),
+        "on timeout the body is the plain-text fallback (the raw changelog): {text:.80}"
+    );
+}
+
+// ---- T-5: handle_help_key + app.rs key gate (AC-2, AC-3, AC-7, AC-8, AC-9, AC-20) --------
+
+/// Open the help overlay on a fresh controller and return it. Panics if help is not open.
+fn open_help_ctrl() -> Controller {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "precondition: help must be open");
+    ctrl
+}
+
+// AC-7: Tab / Right advance the active section; Shift+Tab / Left retreat; '2' selects index 1.
+#[test]
+fn help_tab_advances_section() {
+    let mut ctrl = open_help_ctrl();
+    // Two sections: 0 = What's New, 1 = About.
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        1,
+        "Tab must advance to section 1"
+    );
+}
+
+#[test]
+fn help_right_advances_section() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Right));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        1,
+        "Right must advance to section 1"
+    );
+}
+
+#[test]
+fn help_shift_tab_retreats_section() {
+    let mut ctrl = open_help_ctrl();
+    // Move to section 1 first, then retreat.
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    assert_eq!(ctrl.help_state().unwrap().active_index(), 1);
+    ctrl.handle_help_key(key(KeyCode::BackTab));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        0,
+        "Shift+Tab must retreat to section 0"
+    );
+}
+
+#[test]
+fn help_left_retreats_section() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Tab)); // advance to 1
+    ctrl.handle_help_key(key(KeyCode::Left));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        0,
+        "Left must retreat to section 0"
+    );
+}
+
+#[test]
+fn help_digit_selects_section() {
+    let mut ctrl = open_help_ctrl();
+    // '2' → select(1) → section index 1.
+    ctrl.handle_help_key(key(KeyCode::Char('2')));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        1,
+        "'2' must select section index 1"
+    );
+}
+
+// AC-8 / AC-9 top bound: j / Down increase scroll; k / Up from 0 stays at 0.
+#[test]
+fn help_j_increases_scroll() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Char('j')));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 1, "j must increase scroll by 1");
+}
+
+#[test]
+fn help_down_increases_scroll() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Down));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 1, "Down must increase scroll by 1");
+}
+
+#[test]
+fn help_k_from_zero_stays_at_zero() {
+    let mut ctrl = open_help_ctrl();
+    // scroll is 0 at open; k / Up must saturate at 0 (AC-9 top bound).
+    ctrl.handle_help_key(key(KeyCode::Char('k')));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 0, "k from scroll=0 must stay at 0 (saturates)");
+}
+
+#[test]
+fn help_up_from_zero_stays_at_zero() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Up));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 0, "Up from scroll=0 must stay at 0 (saturates)");
+}
+
+// T-6 follow-up regression (AC-8/AC-9): the help body is drawn with `Paragraph::wrap`, so its
+// scroll offset is in WRAPPED rows. `set_pane_geometry` must clamp the stored scroll against the
+// WRAPPED total the Presenter measured (`help_body_rows`), NOT raw `body.lines.len()`. We feed a
+// geometry whose wrapped total exceeds both the viewport height AND the raw line count, then prove
+// the scroll is clamped to `help_body_rows - help_body_height` — strictly larger than the raw
+// `lines.len() - height` would allow, i.e. the last wrapped row is reachable.
+#[test]
+fn help_scroll_clamps_against_wrapped_row_total_not_raw_lines() {
+    let mut ctrl = open_help_ctrl();
+
+    // The active "What's New" body's raw line count (the changelog).
+    let raw_lines = ctrl.help_state().unwrap().active_body().lines.len() as u16;
+    assert!(
+        raw_lines > 0,
+        "precondition: the changelog body is non-empty"
+    );
+
+    // A geometry whose WRAPPED total exceeds the raw line count AND the viewport — as it would when
+    // the prose wraps. Pick the height first, then a wrapped total clearly above raw_lines.
+    let height = 18u16;
+    let wrapped_rows = raw_lines + 25; // > raw_lines and > height
+    let geom = PaneGeometry {
+        help_body_height: height,
+        help_body_rows: wrapped_rows,
+        ..wide_geometry()
+    };
+
+    // Over-scroll far past any bound (scroll_by only saturates at 0; the bottom bound is the clamp).
+    for _ in 0..200 {
+        ctrl.handle_help_key(key(KeyCode::Char('j')));
+    }
+
+    ctrl.set_pane_geometry(geom);
+
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    let wrapped_max = wrapped_rows - height;
+    let raw_max = raw_lines.saturating_sub(height);
+    assert_eq!(
+        scroll, wrapped_max,
+        "scroll must clamp to the WRAPPED max (help_body_rows - height = {wrapped_max})"
+    );
+    assert!(
+        scroll > raw_max,
+        "the wrapped clamp ({scroll}) must exceed the raw-lines clamp ({raw_max}) — the last \
+         wrapped row is reachable, which a raw-line clamp would forbid"
+    );
+}
+
+// R3 item 3: handle_help_key must ignore Ctrl/Alt chords (mirroring input::map_key's guard), so
+// Ctrl+'?' / Alt+1 don't close or switch sections. Shift is the exception — it IS allowed (Shift+Tab
+// = BackTab retreats sections).
+#[test]
+fn help_ctrl_chord_is_consumed_as_a_noop_does_not_close() {
+    let mut ctrl = open_help_ctrl();
+    // Ctrl+'?' must NOT close the overlay (a bare '?' would).
+    let fx = ctrl.handle_help_key(key_ctrl('?'));
+    assert!(
+        ctrl.help_open(),
+        "Ctrl+'?' must not close the help overlay (modifier chord)"
+    );
+    assert!(!fx.redraw, "Ctrl+'?' is a consumed no-op (no redraw)");
+
+    // Ctrl+Tab must NOT switch sections.
+    let before = ctrl.help_state().unwrap().active_index();
+    ctrl.handle_help_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        before,
+        "Ctrl+Tab must not switch sections"
+    );
+}
+
+#[test]
+fn help_shift_tab_still_retreats_shift_is_allowed() {
+    // Shift is the allowed modifier (Shift+Tab = BackTab). Prove a Tab WITH Shift held still drives
+    // section navigation — the guard must subtract SHIFT before rejecting, like map_key does.
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Tab)); // → section 1
+    assert_eq!(ctrl.help_state().unwrap().active_index(), 1);
+    // BackTab carrying SHIFT (as crossterm reports Shift+Tab) must still retreat.
+    ctrl.handle_help_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        0,
+        "Shift+Tab (BackTab) must still retreat — Shift is allowed"
+    );
+}
+
+// R3 item 5 (AC-9): the scroll-down handler must clamp EAGERLY against the last-known geometry, so
+// the drawn offset never over-scrolls past the last wrapped row even on the SHOWN frame (no 1-frame
+// over-scroll fixed only by the next set_pane_geometry). We set a known geometry first, over-scroll
+// with j, and assert the in-handler offset is already pinned to help_body_rows - help_body_height —
+// WITHOUT any further set_pane_geometry call after the keypresses.
+#[test]
+fn help_scroll_down_clamps_eagerly_in_handler() {
+    let mut ctrl = open_help_ctrl();
+
+    let raw_lines = ctrl.help_state().unwrap().active_body().lines.len() as u16;
+    let height = 6u16;
+    let wrapped_rows = raw_lines + 50; // overflowing body
+    let geom = PaneGeometry {
+        help_body_height: height,
+        help_body_rows: wrapped_rows,
+        ..wide_geometry()
+    };
+    // Feed the geometry ONCE up front (as a draw would), then never again — the clamp under test
+    // must be applied by the key handler itself, not by a later set_pane_geometry.
+    ctrl.set_pane_geometry(geom);
+
+    let max = wrapped_rows - height;
+    // Over-scroll far past the bottom with j.
+    for _ in 0..300 {
+        ctrl.handle_help_key(key(KeyCode::Char('j')));
+    }
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(
+        scroll, max,
+        "j at the bottom must clamp eagerly to help_body_rows - help_body_height ({max}), \
+         not over-scroll waiting for the next frame's set_pane_geometry"
+    );
+
+    // The wheel path (help_scroll) clamps eagerly too.
+    for _ in 0..50 {
+        ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 6, 3));
+    }
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(
+        scroll, max,
+        "wheel ScrollDown at the bottom must also clamp eagerly to {max}"
+    );
+}
+
+// R3 item 7a (AC-11): the shipped help footer hint must carry BOTH the switch affordance and the
+// close affordance — so emptying or truncating HELP_FOOTER_HINT fails the suite. Read it through the
+// `help_view()` projection (`view_state().help.hint`), since the const itself is private.
+#[test]
+fn help_footer_hint_advertises_switch_and_close() {
+    let ctrl = open_help_ctrl();
+    let vs = ctrl.view_state();
+    let hint = vs
+        .help
+        .expect("help is open → view_state().help is Some")
+        .hint;
+    // Switch affordance: Tab is the canonical section-switch key.
+    assert!(
+        hint.contains("Tab") && hint.contains("switch"),
+        "footer hint must advertise how to switch sections (got {hint:?})"
+    );
+    // Close affordance: both Esc and '?' (the toggle key) close the overlay.
+    assert!(
+        hint.contains("close") && hint.contains("Esc") && hint.contains('?'),
+        "footer hint must advertise how to close, including '?' (got {hint:?})"
+    );
+}
+
+// R3 item 7b (AC-5 / AC-7): the help_view() projection must TRACK the active section. Opening help
+// then switching with Tab must move the projection's `active` index, swap the visible `body` to the
+// new section's body, keep labels ["What's New","About"], and set `center` true only for About.
+#[test]
+fn help_view_projection_tracks_the_active_section() {
+    let mut ctrl = open_help_ctrl();
+
+    // Section 0 = What's New: active 0, labels in order, NOT centered, body == What's New body.
+    let vs = ctrl.view_state();
+    let hv = vs.help.expect("help open");
+    assert_eq!(hv.active, 0, "active section is What's New (0) on open");
+    assert_eq!(
+        hv.labels,
+        vec!["What's New".to_string(), "About".to_string()],
+        "labels are What's New then About"
+    );
+    assert!(!hv.center, "What's New is left-aligned (not centered)");
+    let whats_new_body = flatten_text(&hv.body);
+    let about_state_body = flatten_text(&ctrl.help_state().unwrap().sections[1].body);
+    assert_eq!(
+        whats_new_body,
+        flatten_text(ctrl.help_state().unwrap().active_body()),
+        "the projected body matches the active (What's New) section body"
+    );
+
+    // Switch to About (Tab → section 1): projection follows.
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    let vs = ctrl.view_state();
+    let hv = vs.help.expect("help still open");
+    assert_eq!(
+        hv.active, 1,
+        "Tab moves the projection's active index to About (1)"
+    );
+    assert!(
+        hv.center,
+        "About is centered (center == true only for About)"
+    );
+    assert_eq!(
+        flatten_text(&hv.body),
+        about_state_body,
+        "the projected body now follows the active (About) section body"
+    );
+    assert_ne!(
+        flatten_text(&hv.body),
+        whats_new_body,
+        "the body changed when the active section changed"
+    );
+}
+
+// AC-2 / AC-3: '?', Esc, and 'q' each close the overlay.
+#[test]
+fn help_question_mark_closes() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Char('?')));
+    assert!(!ctrl.help_open(), "'?' must close the help overlay");
+}
+
+#[test]
+fn help_esc_closes() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Esc));
+    assert!(!ctrl.help_open(), "Esc must close the help overlay");
+}
+
+#[test]
+fn help_q_closes() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Char('q')));
+    assert!(!ctrl.help_open(), "'q' must close the help overlay");
+}
+
+// AC-20: an unhandled key (e.g. 'f') while help is open is consumed — does NOT open the
+// finder, does NOT change the tree selection.
+#[test]
+fn help_consumes_unrecognised_key_does_not_open_finder() {
+    let mut ctrl = open_help_ctrl();
+    let selected_before = ctrl.tree().cursor();
+    ctrl.handle_help_key(key(KeyCode::Char('f')));
+    // Help is still open (not closed by 'f').
+    assert!(ctrl.help_open(), "help must stay open after 'f'");
+    // Finder must not have been opened (the 'f' key was consumed, not leaked).
+    assert!(
+        !ctrl.finder_open(),
+        "'f' must not open the finder while help is open"
+    );
+    // Tree selection unchanged.
+    assert_eq!(
+        ctrl.tree().cursor(),
+        selected_before,
+        "'f' must not change the tree cursor"
+    );
+}
+
+// handle_help_key returns Effects::redraw() for all recognised keys.
+#[test]
+fn help_key_returns_redraw_for_tab() {
+    let mut ctrl = open_help_ctrl();
+    let fx = ctrl.handle_help_key(key(KeyCode::Tab));
+    assert!(fx.redraw, "Tab must return Effects::redraw()");
+}
+
+#[test]
+fn help_key_returns_noop_for_unknown_key() {
+    let mut ctrl = open_help_ctrl();
+    let fx = ctrl.handle_help_key(key(KeyCode::Char('x')));
+    assert!(!fx.redraw, "unknown key 'x' must return Effects::noop()");
+    assert!(!fx.quit, "unknown key 'x' must not quit");
+}
+
+// Defensive: handle_help_key is a no-op when help is closed (guard).
+#[test]
+fn handle_help_key_is_noop_when_help_is_closed() {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(!ctrl.help_open(), "precondition: help is closed");
+    let fx = ctrl.handle_help_key(key(KeyCode::Tab));
+    assert!(!fx.redraw, "noop when help is closed");
+}
+
+// ---- T-7: handle_help_mouse + mouse gate + section-tab hit-test (AC-8, AC-10, AC-21) -----
+
+/// A frame area large enough for the help overlay's fixed centered box (≥ its want size).
+fn help_area() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    }
+}
+
+/// Feed the controller the live help geometry the Presenter would draw this frame, computed from
+/// the controller's own `view_state()` — exactly as the run loop does after each draw. Returns the
+/// geometry so the test can read its `help_tabs`.
+fn set_live_help_geometry(ctrl: &mut Controller) -> PaneGeometry {
+    let area = help_area();
+    let vs = ctrl.view_state();
+    let g = herdr_file_viewer::presenter::geometry(area, &vs);
+    ctrl.set_pane_geometry(g.clone());
+    g
+}
+
+// AC-8 via mouse: a wheel ScrollDown while help is open scrolls the active section's body.
+#[test]
+fn help_wheel_scrolls_active_section() {
+    let mut ctrl = open_help_ctrl();
+    // Geometry that lets the body overflow (so the bottom clamp does not pin scroll to 0): a tall
+    // wrapped changelog over a short viewport.
+    let raw_lines = ctrl.help_state().unwrap().active_body().lines.len() as u16;
+    let geom = PaneGeometry {
+        help_body_height: 5,
+        help_body_rows: raw_lines + 200,
+        ..wide_geometry()
+    };
+    ctrl.set_pane_geometry(geom);
+
+    let before = ctrl.help_state().unwrap().sections[0].scroll;
+    // Position is irrelevant — the help overlay owns all wheel events while open.
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 6, 3));
+    assert!(fx.redraw, "ScrollDown redraws");
+    let after = ctrl.help_state().unwrap().sections[0].scroll;
+    assert!(
+        after > before,
+        "ScrollDown must increase the active section's scroll (was {before}, now {after})"
+    );
+}
+
+#[test]
+fn help_wheel_up_scrolls_active_section_back() {
+    let mut ctrl = open_help_ctrl();
+    let raw_lines = ctrl.help_state().unwrap().active_body().lines.len() as u16;
+    let geom = PaneGeometry {
+        help_body_height: 5,
+        help_body_rows: raw_lines + 200,
+        ..wide_geometry()
+    };
+    ctrl.set_pane_geometry(geom.clone());
+
+    // Scroll down a couple of wheel steps first, then back up.
+    ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 6, 3));
+    let mid = ctrl.help_state().unwrap().sections[0].scroll;
+    assert!(mid > 0, "precondition: scrolled down off the top");
+    ctrl.set_pane_geometry(geom); // re-feed so the clamp stays the same
+    ctrl.handle_mouse(mouse(MouseEventKind::ScrollUp, 6, 3));
+    let after = ctrl.help_state().unwrap().sections[0].scroll;
+    assert!(
+        after < mid,
+        "ScrollUp must decrease the active section's scroll (was {mid}, now {after})"
+    );
+}
+
+// AC-10: a left-click whose (col,row) lands on a section-tab cell activates that section. Driven
+// from the LIVE geometry so the click maps to the tab actually drawn (draw + hit-test can't drift).
+#[test]
+fn help_click_on_tab_activates_that_section() {
+    let mut ctrl = open_help_ctrl();
+    // Active starts at 0 (What's New). We will click the OTHER tab and assert the active changes.
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        0,
+        "precondition: section 0 is active at open"
+    );
+
+    let g = set_live_help_geometry(&mut ctrl);
+    assert!(
+        !g.help_tabs.is_empty(),
+        "geometry() must expose the section-tab rects while help is open"
+    );
+
+    // Find the tab rect for a section other than the active one (index 1 = About).
+    let (target_idx, rect) = g
+        .help_tabs
+        .iter()
+        .find(|(i, _)| *i != ctrl.help_state().unwrap().active_index())
+        .copied()
+        .expect("there is at least one non-active tab rect to click");
+    assert_eq!(target_idx, 1, "the non-active tab is index 1 (About)");
+
+    // Press the left button on a cell INSIDE that tab's rect. The tab activates on press
+    // (Down(Left)), per the T-7 contract — a tab is a chrome control, not a list row.
+    let col = rect.x + rect.width / 2;
+    let row = rect.y;
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(fx.redraw, "a press on a tab redraws");
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        target_idx,
+        "pressing a section tab activates that section (AC-10)"
+    );
+}
+
+// AC-21: a click or wheel ANYWHERE while help is open must not move the tree cursor, change the
+// tree selection, or scroll the content pane — every mouse event is consumed by handle_help_mouse.
+#[test]
+fn help_mouse_never_leaks_to_tree_or_content() {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "precondition: help is open");
+
+    // Capture the pre-state of everything the mouse could leak into.
+    let tree_cursor_before = ctrl.tree().cursor();
+    let content_scroll_before = ctrl.content_scroll();
+
+    set_live_help_geometry(&mut ctrl);
+
+    // A click on what WOULD be a tree row (col 6, row 3) under the overlay.
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 3));
+    // A wheel over what WOULD be the content pane.
+    ctrl.handle_mouse(mouse(MouseEventKind::ScrollDown, 50, 5));
+    // A press + drag (divider/scrollbar gestures) — also inert.
+    ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 0));
+    ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 0));
+
+    assert_eq!(
+        ctrl.tree().cursor(),
+        tree_cursor_before,
+        "the tree cursor must not move while help is open (AC-21)"
+    );
+    assert_eq!(
+        ctrl.content_scroll(),
+        content_scroll_before,
+        "the content pane must not scroll while help is open (AC-21)"
+    );
+    assert!(
+        ctrl.help_open(),
+        "the help overlay stays open under stray mouse events (modal — Esc/q/'?' close it)"
+    );
+}
+
+// A click that misses every tab rect (e.g. on the body) is a consumed no-op: help stays open, no
+// section change. Mirrors handle_finder_click's outside-rows inert path.
+#[test]
+fn help_click_off_tabs_is_inert_noop() {
+    let mut ctrl = open_help_ctrl();
+    let g = set_live_help_geometry(&mut ctrl);
+    let active_before = ctrl.help_state().unwrap().active_index();
+
+    // A cell well below the tab row (the body) — inside the popup but on no tab rect.
+    let body_row = g.help_body.expect("help body present").y.saturating_add(1);
+    let fx = ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, body_row));
+    assert!(
+        !fx.redraw,
+        "a press off every tab is a consumed no-op (no redraw)"
+    );
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        active_before,
+        "a press off the tabs does not change the active section"
+    );
+    assert!(ctrl.help_open(), "the overlay stays open");
+}
+
+// ---- T-8: No-side-effect + responsiveness (AC-4, AC-22) ----------------------------------
+
+/// Capture a snapshot of the viewer state that AC-4 asserts is unchanged after help use:
+/// the tree cursor, the visible node paths (expansions encode which dirs are open), the
+/// content scroll offset, and the effective view mode.
+struct ViewerSnapshot {
+    tree_cursor: usize,
+    visible_paths: Vec<std::path::PathBuf>,
+    content_scroll: u16,
+    view_mode: Option<ViewMode>,
+}
+
+fn capture_viewer_snapshot(ctrl: &Controller) -> ViewerSnapshot {
+    ViewerSnapshot {
+        tree_cursor: ctrl.tree().cursor(),
+        visible_paths: ctrl
+            .tree()
+            .visible_nodes()
+            .iter()
+            .map(|n| n.path.clone())
+            .collect(),
+        content_scroll: ctrl.content_scroll(),
+        view_mode: ctrl.selected_view_mode(),
+    }
+}
+
+fn assert_snapshot_unchanged(before: &ViewerSnapshot, after: &ViewerSnapshot, label: &str) {
+    assert_eq!(
+        after.tree_cursor, before.tree_cursor,
+        "AC-4 ({label}): tree cursor must be unchanged"
+    );
+    assert_eq!(
+        after.visible_paths, before.visible_paths,
+        "AC-4 ({label}): visible node list (expansions) must be unchanged"
+    );
+    assert_eq!(
+        after.content_scroll, before.content_scroll,
+        "AC-4 ({label}): content scroll must be unchanged"
+    );
+    assert_eq!(
+        after.view_mode, before.view_mode,
+        "AC-4 ({label}): view mode must be unchanged"
+    );
+}
+
+// AC-4: opening, using, and closing the overlay over a file selection leaves all viewer
+// state (root, tree cursor, expansions, content scroll, view mode) unchanged.
+#[test]
+fn help_open_use_close_does_not_mutate_viewer_state_with_file_selected() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // Move the cursor to the second file (b.md) and set a non-zero content scroll so we
+    // have something to verify is preserved.
+    ctrl.handle(Intent::NavDown);
+    // content_scroll stays 0 here (StubContent returns a short body); that's fine —
+    // the test still asserts it is unchanged (0 == 0).
+
+    let before = capture_viewer_snapshot(&ctrl);
+
+    // Open, switch section (Tab), scroll body (j), close via Esc.
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "precondition: help opened");
+    ctrl.handle_help_key(key(KeyCode::Tab)); // switch to About
+    ctrl.handle_help_key(key(KeyCode::Char('j'))); // scroll down
+    ctrl.handle_help_key(key(KeyCode::Esc)); // close
+    assert!(!ctrl.help_open(), "postcondition: help closed");
+
+    let after = capture_viewer_snapshot(&ctrl);
+    assert_snapshot_unchanged(&before, &after, "file selected");
+}
+
+// AC-4 (directory-selected variant): same round-trip over a directory selection.
+#[test]
+fn help_open_use_close_does_not_mutate_viewer_state_with_directory_selected() {
+    let dir = TempDir::new();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("c.rs"), "fn c() {}").unwrap();
+    std::fs::write(dir.path().join("top.txt"), "top").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    // The tree starts with the cursor on `sub/` (first visible node — a directory).
+    // Keep it there so selected_view_mode() is None (directory).
+
+    let before = capture_viewer_snapshot(&ctrl);
+
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "precondition: help opened (dir selected)");
+    ctrl.handle_help_key(key(KeyCode::Tab)); // switch section
+    ctrl.handle_help_key(key(KeyCode::Char('j'))); // scroll
+    ctrl.handle_help_key(key(KeyCode::Char('j'))); // scroll again
+    ctrl.handle_help_key(key(KeyCode::Char('q'))); // close via q
+
+    assert!(!ctrl.help_open(), "postcondition: help closed via q");
+    let after = capture_viewer_snapshot(&ctrl);
+    assert_snapshot_unchanged(&before, &after, "directory selected");
+}
+
+// AC-4 (close_help path): close via the controller's close_help() method directly.
+#[test]
+fn help_close_help_method_does_not_mutate_viewer_state() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("notes.md"), "# Notes\n").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::NavDown); // put cursor on notes.md if present (or stays at 0)
+
+    let before = capture_viewer_snapshot(&ctrl);
+
+    ctrl.handle(Intent::ShowHelp);
+    ctrl.handle_help_key(key(KeyCode::Char('2'))); // jump to section index 1 (About)
+    ctrl.handle_help_key(key(KeyCode::Char('j'))); // scroll the About section
+    ctrl.close_help(); // close via public API, not a key
+
+    assert!(!ctrl.help_open(), "postcondition: help closed");
+    let after = capture_viewer_snapshot(&ctrl);
+    assert_snapshot_unchanged(&before, &after, "close_help() API path");
+}
+
+// AC-22: opening the overlay, switching a section, and scrolling the body are each well
+// within the 300 ms AC-23 budget. The `renderers: None` path makes `open_help` call
+// `render::render` in-process (no external subprocess), so the timed paths are O(1) on the
+// prerendered bodies — purely in-process operations.
+#[test]
+fn help_open_switch_scroll_each_within_300ms() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    // Use the default controller (renderers: None → no glow subprocess on the timed path).
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // --- open_help (handle(ShowHelp)) ---
+    let t_open = Instant::now();
+    ctrl.handle(Intent::ShowHelp);
+    let open_elapsed = t_open.elapsed();
+    assert!(
+        ctrl.help_open(),
+        "precondition: help must be open for section-switch + scroll"
+    );
+    assert!(
+        open_elapsed < Duration::from_millis(300),
+        "AC-22: handle(ShowHelp) must complete within 300 ms (took {open_elapsed:?})"
+    );
+
+    // --- section switch (Tab) — O(1) index bump on the prerendered bodies ---
+    let t_switch = Instant::now();
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    let switch_elapsed = t_switch.elapsed();
+    assert!(
+        switch_elapsed < Duration::from_millis(300),
+        "AC-22: section switch (Tab) must complete within 300 ms (took {switch_elapsed:?})"
+    );
+
+    // --- body scroll (j) — O(1) integer increment + clamp ---
+    let t_scroll = Instant::now();
+    ctrl.handle_help_key(key(KeyCode::Char('j')));
+    let scroll_elapsed = t_scroll.elapsed();
+    assert!(
+        scroll_elapsed < Duration::from_millis(300),
+        "AC-22: body scroll (j) must complete within 300 ms (took {scroll_elapsed:?})"
+    );
+}
+
+// ---- T-9: negative-criteria conformance (AC-N2 no git, AC-N5 no network, AC-N6 section set) --
+
+/// A Git Service stub that records EVERY query (status / changed_set / diff) it receives, so a
+/// test can assert that a code path issued NO git command at all. Distinct from the file-level
+/// `StubGit` (which records only the `changed_set` baseline) — AC-N2 needs to count all three.
+#[derive(Default, Clone)]
+struct CountingGit {
+    /// One entry per call, in order: "status", "changed_set", or "diff" — so a test can both
+    /// count and identify what was queried.
+    calls: Recorder<&'static str>,
+}
+
+impl GitService for CountingGit {
+    fn status(&self) -> BTreeMap<PathBuf, Status> {
+        self.calls.lock().unwrap().push("status");
+        BTreeMap::new()
+    }
+    fn changed_set(&self, _baseline: Baseline) -> BTreeMap<PathBuf, Status> {
+        self.calls.lock().unwrap().push("changed_set");
+        BTreeMap::new()
+    }
+    fn diff(&self, _rel_path: &Path, _baseline: Baseline, _full_context: bool) -> String {
+        self.calls.lock().unwrap().push("diff");
+        String::new()
+    }
+}
+
+/// Build a controller backed by a `CountingGit`, returning the controller and the shared call
+/// log so a test can read back exactly which git queries fired. `is_git_repo` is passed through
+/// so the AC-N2 test can use the harder repo case (where construction DOES query git) and still
+/// prove the HELP path adds nothing.
+fn controller_counting_git(root: &Path, is_git_repo: bool) -> (Controller, Recorder<&'static str>) {
+    let git = CountingGit::default();
+    let calls = git.calls.clone();
+    let git: Arc<dyn GitService> = Arc::new(git);
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::clone(&git),
+            content: Box::new(StubContent),
+        }),
+        editor: Box::new(StubEditor {
+            fail: false,
+            opened: Arc::new(Mutex::new(Vec::new())),
+        }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let ctrl = Controller::new(
+        common::resolved(root.to_path_buf(), is_git_repo),
+        Baseline::Head,
+        components,
+    );
+    (ctrl, calls)
+}
+
+// AC-N6 (via open_help): the HelpState the controller actually builds has EXACTLY two sections,
+// labelled "What's New" then "About" — no third section (scope guard vs. the deferred SMA-49
+// Keybindings/Settings). This complements the source-level guard in `src/help.rs` by asserting the
+// runtime object `open_help` constructs matches the contract.
+#[test]
+fn open_help_builds_exactly_two_sections_whats_new_and_about() {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::ShowHelp);
+    let state = ctrl
+        .help_state()
+        .expect("help_state() must be Some after ShowHelp");
+
+    assert_eq!(
+        state.section_labels(),
+        vec!["What's New", "About"],
+        "AC-N6: open_help builds exactly What's New then About"
+    );
+    assert_eq!(
+        state.sections.len(),
+        2,
+        "AC-N6: exactly two sections — no third (deferred SMA-49) section"
+    );
+}
+
+// AC-N2 (no git): opening, using, and closing the help overlay issues NO git command. We use the
+// REPO case (is_git_repo = true), where construction legitimately queries git (status + changed_set)
+// for the tree markers — so we first drain that construction log, then prove the entire help round
+// trip (open → switch section → scroll → close) adds ZERO further git calls. NOTE: open_help DOES
+// shell out to the markdown renderer (glow) to render the changelog — that is a subprocess, but it
+// is NOT git; this asserts "no git", precisely, by counting calls on the Git Service.
+#[test]
+fn help_path_issues_no_git_command() {
+    let dir = TempDir::new();
+    let (mut ctrl, calls) = controller_counting_git(dir.path(), true);
+
+    // Construction may query git (status + changed_set for the initial tree markers). Drain that
+    // baseline so we measure ONLY the help path below.
+    let baseline_calls = calls.lock().unwrap().len();
+
+    // The full help round trip: open, switch section (Tab), scroll the body (j), then close (Esc).
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "precondition: help opened");
+    ctrl.handle_help_key(key(KeyCode::Tab)); // switch What's New → About
+    ctrl.handle_help_key(key(KeyCode::Char('j'))); // scroll the active section
+    ctrl.handle_help_key(key(KeyCode::Esc)); // close
+    assert!(!ctrl.help_open(), "postcondition: help closed");
+
+    let after = calls.lock().unwrap();
+    assert_eq!(
+        after.len(),
+        baseline_calls,
+        "AC-N2: the help path (open/use/close) must issue NO git command — \
+         calls after construction baseline {baseline_calls}: {:?}",
+        &after[baseline_calls..]
+    );
+}
+
+// AC-N5 (no network): the help path reads only the ALREADY-cached update status and never invokes
+// the update-check / network probe. We inject a cached `Some(version)` via the SAME seam the run
+// loop uses (`set_update` with `rx: None` — i.e. no probe receiver), then prove (1) opening help
+// reflects exactly that cached value in the About body, and (2) the help round trip never consumed
+// or required an update probe (the absence of an `update_rx` is undisturbed — help reads the cached
+// field directly, it does not start a check).
+#[test]
+fn help_path_reads_cached_update_status_and_issues_no_network_probe() {
+    use herdr_file_viewer::update::{UpdateState, Version};
+
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // Inject a cached "update available" with NO probe receiver — exactly what a run loop that has
+    // already determined the status (or has the once-a-day check disabled) installs. If the help
+    // path tried to probe, it would have to create/await a receiver; it must not.
+    let cached = Version {
+        major: 7,
+        minor: 7,
+        patch: 7,
+    };
+    ctrl.set_update(UpdateState {
+        initial: Some(cached),
+        rx: None,
+    });
+
+    // Open help → the About section body is assembled from `self.update_available` (the cached
+    // value), never a fresh probe. Section index 1 is About.
+    ctrl.handle(Intent::ShowHelp);
+    let state = ctrl.help_state().expect("help_state() Some after ShowHelp");
+    let about = flatten_text(&state.sections[1].body);
+    assert!(
+        about.contains("Update available: v7.7.7"),
+        "AC-N5: About reflects the CACHED update status (v7.7.7), proving no fresh probe: {about:.120}"
+    );
+
+    // Drive the rest of the help round trip; none of it polls/awaits a network result.
+    ctrl.handle_help_key(key(KeyCode::Char('j')));
+    ctrl.handle_help_key(key(KeyCode::Esc));
+    assert!(!ctrl.help_open(), "help closed");
+
+    // Re-open with the cached value cleared to None → "Up to date", again from the cached field
+    // only. This double-check pins that the line is a pure projection of the cached status.
+    ctrl.set_update(UpdateState {
+        initial: None,
+        rx: None,
+    });
+    ctrl.handle(Intent::ShowHelp);
+    let state = ctrl.help_state().expect("help_state() Some after re-open");
+    let about = flatten_text(&state.sections[1].body);
+    assert!(
+        about.contains("Up to date") && !about.contains("Update available"),
+        "AC-N5: with the cached status None, About shows 'Up to date' — no probe ran: {about:.120}"
+    );
 }

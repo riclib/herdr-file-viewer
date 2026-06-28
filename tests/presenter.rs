@@ -3,7 +3,7 @@
 
 use herdr_file_viewer::git::Status;
 use herdr_file_viewer::presenter::{
-    ContentSearch, FinderView, Focus, PickerRowView, PickerView, ViewState, draw,
+    ContentSearch, FinderView, Focus, HelpView, PickerRowView, PickerView, ViewState, draw,
 };
 use herdr_file_viewer::render::to_text;
 use herdr_file_viewer::search::Match;
@@ -83,6 +83,7 @@ fn sample_state() -> ViewState {
         branch: None,
         prompt: None,
         search: None,
+        help: None,
     }
 }
 
@@ -2568,5 +2569,299 @@ fn search_highlight_snapshot() {
     insta::assert_snapshot!(
         "presenter_search_highlight",
         render(&search_state(), 100, 24)
+    );
+}
+
+// ── Help overlay tests (T-6, AC-5, AC-11) ────────────────────────────────────
+
+/// A `ViewState` with the help overlay open. Two sections, active = the SECOND (About) so the
+/// snapshot proves the active indicator picks the active tab — not just the first. The body is a
+/// few lines of plain text; the hint string is what the controller carries (AC-11).
+fn help_state() -> ViewState {
+    let mut state = sample_state();
+    state.help = Some(HelpView {
+        active: 1, // About is active (the second tab) — proves the active indicator
+        labels: vec!["What's New".to_string(), "About".to_string()],
+        body: to_text(
+            "Herdr File Viewer\n\
+             A git-aware, read-only file viewer\n\
+             \n\
+             github.com/smarzban/herdr-file-viewer\n\
+             \n\
+             v1.5.0 · Up to date\n\
+             MIT License\n\
+             \n\
+             If you enjoy the file viewer, don't forget to give it a ★ on GitHub!",
+        ),
+        scroll: 0,
+        hint: "Tab/←→ switch · Esc/q close".to_string(),
+        center: true, // About is center-aligned (What's New stays left)
+    });
+    state
+}
+
+#[test]
+fn help_overlay_indicates_active_section_and_shows_footer_hints() {
+    // AC-5: the section tabs are shown with the ACTIVE one (About) visibly indicated.
+    // AC-11: the footer shows how to switch sections and how to close.
+    let out = render(&help_state(), 100, 24);
+    assert!(out.contains("What's New"), "What's New tab is shown\n{out}");
+    assert!(out.contains("About"), "About tab is shown\n{out}");
+    // The footer hints (switch + close) appear (AC-11).
+    assert!(
+        out.contains("switch") && out.contains("close"),
+        "footer shows how to switch sections and close\n{out}"
+    );
+    // The active body (About) is shown — its top line is the display title.
+    assert!(
+        out.contains("Herdr File Viewer"),
+        "the active section's body is drawn\n{out}"
+    );
+    // The two-column layout is still underneath (AC-1 — partial overlay).
+    assert!(
+        out.contains("┌r"),
+        "the tree column is drawn under the overlay\n{out}"
+    );
+}
+
+#[test]
+fn help_overlay_active_tab_is_reversed() {
+    // AC-5: the active tab ("About") is rendered with a visible indicator (REVERSED), distinct
+    // from the inactive tab ("What's New").
+    use ratatui::style::Modifier;
+
+    let st = help_state();
+    let buf = render_buffer(&st, 100, 24);
+    let (w, h) = (buf.area().width, buf.area().height);
+
+    // Locate "About" in the buffer and confirm its first cell is REVERSED (the active indicator).
+    let needle = "About";
+    let mut found: Option<(u16, u16)> = None;
+    'outer: for y in 0..h {
+        for x in 0..w {
+            let matches = needle.chars().enumerate().all(|(i, ch)| {
+                let cx = x + i as u16;
+                cx < w
+                    && buf
+                        .cell((cx, y))
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+            });
+            if matches {
+                found = Some((x, y));
+                break 'outer;
+            }
+        }
+    }
+    let (ax, ay) = found.expect("the active tab label 'About' is in the buffer");
+    assert!(
+        buf.cell((ax, ay))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED),
+        "the active tab (About) is REVERSED-highlighted (AC-5)"
+    );
+}
+
+#[test]
+fn help_overlay_snapshot() {
+    insta::assert_snapshot!("presenter_help", render(&help_state(), 100, 24));
+}
+
+// T-6 follow-up regression (AC-8/AC-9): the help body is drawn with `Paragraph::wrap`, so its
+// scroll extent must be measured in WRAPPED rows, not raw `lines.len()`. A body with only a few
+// raw lines that each wrap many times overflows the viewport even though the raw line count fits —
+// `geometry()` must report `help_body_rows > body.lines.len()` AND surface the vertical scrollbar.
+// Without this, the bottom of a long (wrapping) changelog is unreachable and the bar is mis-sized.
+#[test]
+fn geometry_help_body_rows_counts_wrapped_rows_and_triggers_scrollbar() {
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+
+    // Four raw lines, each ~300 cols of space-separated words → each wraps to several rows at the
+    // ~72-col body width. Raw count (4) easily FITS the viewport; the wrapped total does NOT.
+    let long_line = "word ".repeat(60); // 300 chars
+    let body_str = format!("{long_line}\n{long_line}\n{long_line}\n{long_line}");
+    let raw_lines = 4usize;
+
+    let mut state = help_state();
+    state.help = Some(HelpView {
+        active: 0,
+        labels: vec!["What's New".to_string(), "About".to_string()],
+        body: to_text(&body_str),
+        scroll: 0,
+        hint: "Tab/←→ switch · Esc/q close".to_string(),
+        center: false, // What's New stays left-aligned
+    });
+
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let g = geometry(area, &state);
+
+    let body_height = g.help_body_height;
+    assert!(
+        body_height as usize >= raw_lines,
+        "precondition: the {raw_lines} raw lines fit the viewport (height {body_height}) — \
+         so a RAW-line trigger would not show a scrollbar"
+    );
+    assert!(
+        g.help_body_rows as usize > raw_lines,
+        "help_body_rows ({}) must exceed the raw line count ({raw_lines}) — wrapped rows are counted",
+        g.help_body_rows
+    );
+    assert!(
+        g.help_body_rows > body_height,
+        "help_body_rows ({}) must exceed the viewport height ({body_height}) so the body overflows",
+        g.help_body_rows
+    );
+    assert!(
+        g.help_vbar.is_some(),
+        "the vertical scrollbar must be present when the WRAPPED body overflows, even though the \
+         raw line count fits"
+    );
+}
+
+// FIX-A regression (AC-8/AC-9): `help_body_rows` must be measured at the ACTUAL drawn body width
+// (post scrollbar-gutter), not the full `inner.width`. When the scrollbar shows, the body draws into
+// a NARROWER `text.width` (inner.width − 2), so the true wrapped count is HIGHER than a count taken at
+// `inner.width`. If `geometry()` reported the wider-width count, the controller's scroll clamp would
+// stop short and a long wrapping changelog's tail would be unreachable. We craft a body whose wrapped
+// count strictly differs between the two widths and assert the reported total equals the NARROWER
+// (post-gutter) measurement — i.e. clamping reaches the true last wrapped row.
+#[test]
+fn geometry_help_body_rows_measured_at_post_gutter_width() {
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::Rect;
+
+    // A 100-wide frame ⇒ help popup inner width 72; once the vbar gutter is reserved the body draws
+    // at width 70. Use unbroken tokens (no spaces) so wrapping is pure char-wrap = ceil(len / width),
+    // letting the test predict both counts exactly without re-implementing word-wrap.
+    let inner_w = 72usize;
+    let text_w = inner_w - 2; // one gutter column + one gap (bar_layout reserves 2)
+
+    // Per-line length chosen so ceil(len/70) > ceil(len/72): 72*2 = 144 wraps to 2 rows at width 72
+    // but 3 rows at width 70. Stack enough such lines that the body overflows the viewport (forcing
+    // the scrollbar — the only case where the two widths diverge).
+    let token = "x".repeat(144);
+    let n_lines = 20usize;
+    let body_str = vec![token.as_str(); n_lines].join("\n");
+
+    let rows_at_inner = (144usize.div_ceil(inner_w)) * n_lines; // 2 * 20 = 40
+    let rows_at_text = (144usize.div_ceil(text_w)) * n_lines; // 3 * 20 = 60
+    assert!(
+        rows_at_text > rows_at_inner,
+        "test precondition: the post-gutter width must yield more wrapped rows"
+    );
+
+    let mut state = help_state();
+    state.help = Some(HelpView {
+        active: 0,
+        labels: vec!["What's New".to_string(), "About".to_string()],
+        body: to_text(&body_str),
+        scroll: 0,
+        hint: "Tab/←→ switch · Esc/q close".to_string(),
+        center: false, // What's New stays left-aligned
+    });
+
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let g = geometry(area, &state);
+
+    // The scrollbar must be present (the body overflows), which is the only regime where the body
+    // draws into the narrower post-gutter width.
+    assert!(
+        g.help_vbar.is_some(),
+        "the vertical scrollbar must show when the wrapped body overflows"
+    );
+    // The reported total must match the POST-GUTTER (narrower) measurement — not the wider
+    // `inner.width` one. A regression to `inner.width` would report `rows_at_inner` and leave the
+    // changelog's tail (the missing `rows_at_text − rows_at_inner` rows) unreachable.
+    assert_eq!(
+        g.help_body_rows as usize, rows_at_text,
+        "help_body_rows ({}) must be measured at the drawn body width {text_w} (= {rows_at_text}), \
+         not at inner.width {inner_w} (= {rows_at_inner}) — else the tail is unreachable",
+        g.help_body_rows
+    );
+}
+
+// T-7 crux (AC-10): the section-tab rects `geometry()` feeds back (`help_tabs`) must line up with
+// where the tabs are ACTUALLY drawn, so a click maps to the tab actually drawn (draw + hit-test
+// can't drift). Render the overlay, scan the buffer for each label, and assert the drawn label
+// sits inside its reported rect; also assert the ACTIVE tab's REVERSED cell falls in its rect.
+#[test]
+fn help_tab_rects_agree_with_drawn_tab_positions() {
+    use herdr_file_viewer::presenter::geometry;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Modifier;
+
+    let st = help_state(); // active = 1 (About); labels = ["What's New", "About"]
+    let (w, h) = (100u16, 24u16);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    };
+    let buf = render_buffer(&st, w, h);
+
+    // Find the first (x,y) where `needle` is drawn contiguously.
+    let find_cell = |needle: &str| -> (u16, u16) {
+        for y in 0..h {
+            for x in 0..w {
+                let hit = needle.chars().enumerate().all(|(i, ch)| {
+                    let cx = x + i as u16;
+                    cx < w
+                        && buf
+                            .cell((cx, y))
+                            .is_some_and(|c| c.symbol() == ch.to_string())
+                });
+                if hit {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("{needle:?} not found in buffer — draw did not render it");
+    };
+
+    let g = geometry(area, &st);
+    assert_eq!(g.help_tabs.len(), 2, "both section tabs have a rect");
+
+    // Each label's drawn start cell must be contained in its reported tab rect.
+    let labels = ["What's New", "About"];
+    for (idx, rect) in &g.help_tabs {
+        let (dx, dy) = find_cell(labels[*idx]);
+        assert!(
+            rect.contains(Position { x: dx, y: dy }),
+            "tab {idx} ({:?}) drawn at ({dx},{dy}) must lie inside its reported rect {rect:?}",
+            labels[*idx]
+        );
+        assert_eq!(rect.y, dy, "the tab rect row must match the drawn row");
+        assert_eq!(
+            rect.x, dx,
+            "the tab rect start col must match the drawn col"
+        );
+    }
+
+    // The ACTIVE tab (index 1 = About) is REVERSED; its first cell must be inside its rect.
+    let (about_idx, about_rect) = g
+        .help_tabs
+        .iter()
+        .find(|(i, _)| *i == 1)
+        .copied()
+        .expect("the active tab (About) has a rect");
+    assert_eq!(about_idx, 1);
+    assert!(
+        buf.cell((about_rect.x, about_rect.y))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED),
+        "the active tab's first cell (at its rect origin) is REVERSED — the rect tracks the drawn tab"
     );
 }

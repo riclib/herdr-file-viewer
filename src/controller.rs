@@ -18,13 +18,15 @@
 
 use crate::finder::FinderState;
 use crate::git::{Baseline, Status};
+use crate::help::{HelpSection, HelpSectionState, HelpState};
 use crate::herdr::HerdrCli;
 use crate::infile::{PromptMode, PromptState, SearchState};
 use crate::intent::Intent;
 use crate::picker::PickerState;
 use crate::presenter::{
-    ContentSearch, FinderView, Focus, PaneGeometry, PickerRowView, PickerView, ViewState,
+    ContentSearch, FinderView, Focus, HelpView, PaneGeometry, PickerRowView, PickerView, ViewState,
 };
+use crate::render::{Prepared, Renderers};
 use crate::root::Resolved;
 use crate::tree::{Node, NodeKind, TreeModel};
 use crate::update::{self, UpdateState, Version};
@@ -53,6 +55,16 @@ const WHEEL_STEP: isize = 3;
 /// Two left-clicks at the same cell within this window are a double-click (a folder toggles
 /// expand/collapse; a file opens in zoom mode — the editor hand-off is the `e` key).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Wall-clock bound for the synchronous What's New markdown render in `open_help`. The render runs
+/// on the input thread (the design settled on prerender-at-open), so it must be bounded well within
+/// the AC-22 responsiveness budget — far tighter than the shared 5s content `RENDER_TIMEOUT`, which
+/// would let a wedged `glow` freeze input for up to 5s. On timeout the existing render path falls
+/// back to plain text + a notice (AC-15). This reconciles prerender-at-open with AC-22.
+const HELP_RENDER_TIMEOUT: Duration = Duration::from_millis(250);
+/// The help overlay's self-operating key-hints footer (AC-11) — at minimum how to switch sections
+/// and how to close. Carried in `HelpView` so the Presenter stays mode-agnostic; matches the keys
+/// `handle_help_key` actually handles (Tab/←→ switch · digits/1-9 also; Esc/q/`?` close).
+const HELP_FOOTER_HINT: &str = "Tab/←→ switch · 1-9 jump · j/k scroll · Esc/q/? close";
 
 /// Read-only git queries the controller coordinates. Behind a trait so tests stub it and
 /// the run loop injects an implementation bound to the real repository. `Send + Sync` so the
@@ -115,6 +127,11 @@ pub struct Components {
     pub providers: Box<dyn Fn(&Resolved) -> RootProviders>,
     pub editor: Box<dyn EditorHandoff>,
     pub clipboard: Box<dyn Clipboard>,
+    /// The external renderer commands used for the in-app help overlay's What's New section
+    /// (T-4: render CHANGELOG_MD as markdown via the same renderer the content pane uses).
+    /// `None` ⇒ the markdown renderer is absent; `render::render` falls back to plain text
+    /// and a notice (AC-15) — the same fallback it applies for any missing renderer.
+    pub renderers: Option<Renderers>,
 }
 
 /// What the run loop should do after an intent is handled.
@@ -212,6 +229,9 @@ pub struct Controller {
     /// The provider factory (ADR-0004), kept so a re-root can rebuild the root-bound providers
     /// (Git Service + Content Renderer) against the new root.
     providers: Box<dyn Fn(&Resolved) -> RootProviders>,
+    /// The external renderer commands for the help overlay's What's New section (T-4).
+    /// Built from `Components::renderers` at construction; `None` ⇒ fallback.
+    renderers: Renderers,
     /// Render dispatch to the worker thread (AC-23). `latest_seq` is the most recently
     /// dispatched job; a `poll`ed result with a smaller seq is stale and dropped.
     job_tx: mpsc::Sender<RenderJob>,
@@ -287,6 +307,10 @@ pub struct Controller {
     /// search + its highlighting (AC-20). The incremental-typing path (`refresh_search`) does NOT
     /// call `dispatch_render`, so live typing is never wiped by that clear.
     search: Option<SearchState>,
+    /// The open help overlay's state, or `None` when closed (AC-1, AC-6). Opened by the `?`
+    /// key (ShowHelp intent); dismissed by Esc/`q` (T-5). Modal — while `Some`, handle() and
+    /// handle_mouse() return early (AC-N4).
+    help: Option<HelpState>,
 }
 
 impl Controller {
@@ -301,7 +325,17 @@ impl Controller {
             providers,
             editor,
             clipboard,
+            renderers,
         } = components;
+        // Materialise the renderers: `None` ⇒ a Renderers with an absent markdown command so
+        // `render::render` falls back to plain text + a notice (AC-15) without extra branching.
+        let renderers = renderers.unwrap_or_else(|| Renderers {
+            markdown: vec!["herdr-no-such-markdown-renderer".into()],
+            diff: vec!["herdr-no-such-diff-renderer".into()],
+            full_diff: vec!["herdr-no-such-full-diff-renderer".into()],
+            syntax: vec!["herdr-no-such-syntax-renderer".into()],
+            timeout: std::time::Duration::from_millis(100),
+        });
         let RootProviders { git, content } = providers(&resolved);
         let root = resolved.root.clone();
         let is_git_repo = resolved.is_git_repo;
@@ -347,6 +381,7 @@ impl Controller {
             editor,
             clipboard,
             providers,
+            renderers,
             job_tx,
             result_rx,
             latest_seq: 0,
@@ -363,6 +398,7 @@ impl Controller {
             pending_goto: None,
             applied_seq: 0,
             search: None,
+            help: None,
             herdr: None,
             our_workspace_id: None,
             base_branch,
@@ -509,6 +545,10 @@ impl Controller {
         // modal and re_root only fires via picker-confirm — but kept structural so a future re-root
         // trigger can't strand an open prompt over a freshly re-rooted tree.
         self.prompt = None;
+        // Close the help overlay too (symmetric teardown). Inert today — help is modal and can't be
+        // open during a re-root — but matches the other modal teardowns so a future re-root trigger
+        // can't strand an open overlay over a freshly re-rooted tree.
+        self.help = None;
         self.last_click = None;
 
         // PREFERENCES ARE CARRIED (AC-12) — deliberately NOT reset: show_ignored, hide_hidden,
@@ -698,12 +738,23 @@ impl Controller {
         // this an over-scroll right parks the offset past the widest row (SMA-229).
         let finder_max_hscroll = geom.finder_max_hscroll;
         let picker_max_hscroll = geom.picker_max_hscroll;
+        // The help body's measured viewport height and its WRAPPED row total — used to enforce the
+        // scroll bottom-bound that T-5 deferred (AC-9): `scroll_by` only saturates at 0, so the lower
+        // clamp is applied here against the live geometry, exactly as the finder/picker re-clamp their
+        // hscroll. The body is drawn with `Paragraph::wrap`, so its offset is in wrapped rows — clamp
+        // against the wrapped total the Presenter measured (`help_body_rows`), NOT raw `lines.len()`,
+        // or a long changelog's last entries stay unreachable (mirrors the content pane's clamp).
+        let help_body_height = geom.help_body_height;
+        let help_body_rows = geom.help_body_rows;
         self.geom = geom;
         if let Some(finder) = self.finder.as_mut() {
             finder.clamp_hscroll(finder_max_hscroll);
         }
         if let Some(picker) = self.picker.as_mut() {
             picker.clamp_hscroll(picker_max_hscroll);
+        }
+        if let Some(help) = self.help.as_mut() {
+            help.clamp_scroll(help_body_rows, help_body_height);
         }
     }
 
@@ -764,6 +815,7 @@ impl Controller {
                 matches: s.matches.clone(),
                 current: s.current,
             }),
+            help: self.help_view(),
         }
     }
 
@@ -873,6 +925,33 @@ impl Controller {
         })
     }
 
+    /// The owned help-overlay draw model for the Presenter (AC-5, AC-11), or `None` when the
+    /// overlay is closed. Projects [`HelpState`] → [`HelpView`]: the active index, the section
+    /// labels, the active body (cloned so the Presenter stays borrow-free) + its scroll, and the
+    /// self-operating key-hints footer string (AC-11). The footer is built here so the Presenter
+    /// stays mode-agnostic — it shows, at minimum, how to switch sections and how to close.
+    fn help_view(&self) -> Option<HelpView> {
+        let help = self.help.as_ref()?;
+        let active = help.active_index();
+        let labels: Vec<String> = help
+            .section_labels()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Center the About section only; What's New stays left-aligned. About is the section whose
+        // label is `HelpSection::About::label()` ("About") — matched by label so the projection
+        // stays decoupled from the section index (the Vec is the SMA-49 seam).
+        let center = labels.get(active).map(String::as_str) == Some(HelpSection::About.label());
+        Some(HelpView {
+            active,
+            labels,
+            body: help.active_body().clone(),
+            scroll: help.sections[active].scroll,
+            hint: HELP_FOOTER_HINT.to_string(),
+            center,
+        })
+    }
+
     /// Whether the content pane wraps for `node`: forced on by the `w` override, else the
     /// per-mode default — prose (rendered markdown / plain text) wraps; diffs and code stay
     /// unwrapped so their columns align. Takes the node so the draw path needn't re-walk.
@@ -914,6 +993,11 @@ impl Controller {
         if self.prompt.is_some() {
             return Effects::noop();
         }
+        // The help overlay is modal: while it is open, all other intents are inert. The run loop
+        // (T-5) will route keys to handle_help_key instead; this guard mirrors finder/prompt.
+        if self.help.is_some() {
+            return Effects::noop();
+        }
         match intent {
             Intent::NavUp => self.navigate(-1),
             Intent::NavDown => self.navigate(1),
@@ -941,6 +1025,7 @@ impl Controller {
             Intent::OpenSearch => self.open_search(),
             Intent::NextMatch => self.next_match(),
             Intent::PrevMatch => self.prev_match(),
+            Intent::ShowHelp => self.open_help(),
             Intent::Close => self.close_or_unzoom(),
         }
     }
@@ -1037,6 +1122,12 @@ impl Controller {
         // WRONG file, or strand a bogus override on a directory. Make the mouse inert, like the picker.
         if self.prompt.is_some() {
             return Effects::noop();
+        }
+        // The help overlay is modal but IS mouse-interactive (like the finder): the wheel scrolls
+        // the active section's body and a click on a section tab switches sections. Route to its own
+        // handler, which consumes every event and never leaks to the tree/content beneath (AC-21).
+        if self.help.is_some() {
+            return self.handle_help_mouse(ev);
         }
         // The finder is also a modal overlay, but it IS mouse-interactive: wheel scrolls the
         // selection, click selects a result row, double-click confirms. Route to the finder's
@@ -1245,6 +1336,70 @@ impl Controller {
             return self.confirm_finder();
         }
         Effects::redraw()
+    }
+
+    /// Handle a mouse event while the help overlay is open. The help overlay owns all mouse while
+    /// open and never leaks events to the tree/content beneath (AC-21) — mirroring
+    /// [`handle_finder_mouse`](Self::handle_finder_mouse).
+    ///
+    /// - `ScrollDown`/`ScrollUp` → `scroll_by(±WHEEL_STEP)` on the active section (AC-8 via mouse).
+    ///   No clamp here: [`set_pane_geometry`](Self::set_pane_geometry) re-clamps the stored scroll to
+    ///   the live measured body height after the next draw (the same split the keyboard path uses).
+    /// - `Down(Left)` whose `(col,row)` lands on a section-tab rect → `select(that index)` (AC-10).
+    /// - `Shift`+mouse → inert (terminal selection, same as the main gate).
+    /// - everything else → consumed no-op (`Effects::noop()`).
+    fn handle_help_mouse(&mut self, ev: MouseEvent) -> Effects {
+        use ratatui::layout::Position;
+        // Shift+mouse: terminal selection — inert, same as the main mouse gate.
+        if ev.modifiers.contains(KeyModifiers::SHIFT) {
+            return Effects::noop();
+        }
+        match ev.kind {
+            MouseEventKind::ScrollDown => self.help_scroll(WHEEL_STEP),
+            MouseEventKind::ScrollUp => self.help_scroll(-WHEEL_STEP),
+            // A left press on a section tab switches sections (AC-10). Hit-test against the tab rects
+            // the Presenter fed back (`geom.help_tabs`), so the click maps to the tab actually drawn.
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = Position {
+                    x: ev.column,
+                    y: ev.row,
+                };
+                let hit = self
+                    .geom
+                    .help_tabs
+                    .iter()
+                    .find(|(_, r)| r.contains(pos))
+                    .map(|(idx, _)| *idx);
+                if let Some(idx) = hit
+                    && let Some(help) = self.help.as_mut()
+                {
+                    help.select(idx);
+                    return Effects::redraw();
+                }
+                // A press off every tab is a consumed no-op (modal — the overlay stays open).
+                Effects::noop()
+            }
+            // Other events (drag, release, right/middle button, Moved): inert, but consumed.
+            _ => Effects::noop(),
+        }
+    }
+
+    /// Scroll the active help section by `delta` rows. A no-op when help is closed. After scrolling
+    /// it clamps EAGERLY against the last-known geometry (mirrors the `j`/`Down` key path), so a
+    /// wheel-down at the bottom never over-scrolls past the last wrapped row on the shown frame; the
+    /// post-draw clamp in [`set_pane_geometry`](Self::set_pane_geometry) stays the resize backstop.
+    fn help_scroll(&mut self, delta: isize) -> Effects {
+        let (rows, height) = (self.geom.help_body_rows, self.geom.help_body_height);
+        if let Some(help) = self.help.as_mut() {
+            help.scroll_by(delta as i32);
+            // Eager clamp only once a frame has measured the body (rows > 0) — see handle_help_key.
+            if rows > 0 {
+                help.clamp_scroll(rows, height);
+            }
+            Effects::redraw()
+        } else {
+            Effects::noop()
+        }
     }
 
     /// A completed left-click: select the tree row it landed on (or focus the content pane). A
@@ -1521,8 +1676,9 @@ impl Controller {
     /// real last row. Without wrapping each source line is one (truncated) row. With wrapping a
     /// line spans multiple rows: ratatui's exact `line_count` is private, and an arithmetic
     /// `ceil`/`floor` undercounts word wrapping (words don't pack to the column), which would
-    /// leave the bottom of wrapped prose unreachable — so [`wrapped_rows`] simulates the word
-    /// packing, floored by the all-columns char-wrap count so leading/interior spaces can't
+    /// leave the bottom of wrapped prose unreachable — so [`crate::text_layout::wrapped_rows`]
+    /// simulates the word packing, floored by the all-columns char-wrap count so leading/interior
+    /// spaces can't
     /// make it undershoot. Off the per-frame path: only scroll / resize / wrap-toggle keypaths
     /// reach it (`set_content_viewport` early-returns on an unchanged size).
     fn rendered_line_count(&self) -> u16 {
@@ -1555,7 +1711,7 @@ impl Controller {
             .take(n)
             .map(|l| {
                 let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-                wrapped_rows(&text, w).max(l.width().max(1).div_ceil(w))
+                crate::text_layout::wrapped_rows(&text, w).max(l.width().max(1).div_ceil(w))
             })
             .sum::<usize>()
     }
@@ -1948,6 +2104,150 @@ impl Controller {
     /// Whether the go-to-file finder overlay is currently open.
     pub fn finder_open(&self) -> bool {
         self.finder.is_some()
+    }
+
+    /// Open the in-app help overlay (AC-1, AC-6, AC-19). Builds two sections:
+    ///
+    /// - What's New: the embedded CHANGELOG rendered as markdown via `render::render` (T-4,
+    ///   AC-14). If the markdown renderer is absent/times out, `render::render` falls back to
+    ///   plain text + a notice (AC-15) — no extra handling needed here.
+    /// - About: the about_text() string rendered as plain text.
+    ///
+    /// Sets the active section to 0 (What's New) and returns `Effects::redraw()`.
+    fn open_help(&mut self) -> Effects {
+        let prepared = Prepared::Full {
+            // Render from the first version heading onward — the changelog's file-meta preamble
+            // (title + Keep-a-Changelog/SemVer paragraph + link refs) doesn't belong in What's New.
+            text: crate::help::changelog_display().to_owned(),
+        };
+        // The render is synchronous on the input thread, so bound it to the help-specific
+        // `HELP_RENDER_TIMEOUT` (within the AC-22 budget) rather than the shared 5s `RENDER_TIMEOUT`
+        // — a slow/wedged renderer must not freeze input. On timeout `render::render` already falls
+        // back to plain text + a notice (AC-15), so no new handling is needed here. This reconciles
+        // the design's prerender-at-open with AC-22's responsiveness budget.
+        //
+        // Wrap the changelog at the help box's fixed body width (NOT the default `-w 0`): glow then
+        // wraps with its own hanging indents, and the Presenter's `Paragraph::wrap` becomes a no-op
+        // that preserves them. The width is the SAME constant the layout draws the body at
+        // (`presenter::help_body_text_width`), so glow's wrapped lines fit exactly — never wider (a
+        // wider glow wrap would re-introduce a flat 1-char re-wrap in the Presenter). The box is
+        // fixed-width, so there is nothing to re-render on resize.
+        let r = Renderers {
+            timeout: HELP_RENDER_TIMEOUT,
+            markdown: crate::render::with_wrap_width(
+                &self.renderers.markdown,
+                crate::presenter::help_body_text_width(),
+            ),
+            ..self.renderers.clone()
+        };
+        let (whats_new_body, _notice) =
+            crate::render::render(&r, &prepared, ViewMode::RenderedMarkdown, None, None);
+        let whats_new = HelpSectionState {
+            label: HelpSection::WhatsNew.label(),
+            body: whats_new_body,
+            scroll: 0,
+        };
+        let about_body = crate::help::about_text(self.update_available);
+        let about = HelpSectionState {
+            label: HelpSection::About.label(),
+            body: crate::render::to_text(&about_body),
+            scroll: 0,
+        };
+        self.help = Some(HelpState::new(vec![whats_new, about]));
+        // Reset double-click state (mirrors open_finder): a tree click made just before the overlay
+        // opened must not pair with a same-row click made just after it closes as a double-click.
+        self.last_click = None;
+        Effects::redraw()
+    }
+
+    /// Whether the help overlay is currently open.
+    pub fn help_open(&self) -> bool {
+        self.help.is_some()
+    }
+
+    /// The current help overlay state, or `None` when closed.
+    /// Exposed for tests and (T-6) the `ViewState` projection.
+    pub fn help_state(&self) -> Option<&HelpState> {
+        self.help.as_ref()
+    }
+
+    /// Dismiss the help overlay. Called by T-5's handle_help_key on Esc/`q`.
+    /// A no-op when the overlay is already closed.
+    pub fn close_help(&mut self) {
+        self.help = None;
+    }
+
+    /// Route a key event while the help overlay is open (AC-2, AC-3, AC-7, AC-8, AC-9, AC-20).
+    ///
+    /// - `?` / `Esc` / `q` → close the overlay (`Effects::redraw()`).
+    /// - `Tab` / `Right` → `next()` (advance section, wrapping, AC-7).
+    /// - `Shift+Tab` (`BackTab`) / `Left` → `prev()` (retreat section, wrapping, AC-7).
+    /// - `'1'..='9'` → `select(n-1)` (jump to section by digit, AC-7).
+    /// - `j` / `Down` → `scroll_by(+1)` (AC-8).
+    /// - `k` / `Up` → `scroll_by(-1)` (saturates at 0, AC-9 top bound; bottom clamp is T-6).
+    /// - Any other key → consumed as a no-op (`Effects::noop()`) — nothing leaks to the tree
+    ///   or viewer (AC-20).
+    ///
+    /// When the overlay is not open, all keys are a defensive no-op.
+    pub fn handle_help_key(&mut self, key: KeyEvent) -> Effects {
+        // Ignore Ctrl/Alt chords (mirrors input::map_key): Shift is allowed (Shift+Tab = BackTab
+        // retreats), but a Ctrl+'?' / Alt+1 must NOT close or switch — consume it as a no-op so it
+        // neither acts here nor leaks past the modal. (R3 item 3, consistency with map_key.)
+        if key.modifiers.difference(KeyModifiers::SHIFT) != KeyModifiers::NONE {
+            return Effects::noop();
+        }
+        // Read the last-known help-body geometry up front (the borrow of `self.help` below is
+        // exclusive), so the scroll-down arm can clamp eagerly against it.
+        let (help_body_rows, help_body_height) =
+            (self.geom.help_body_rows, self.geom.help_body_height);
+        let Some(help) = self.help.as_mut() else {
+            return Effects::noop();
+        };
+        match key.code {
+            // Close keys: '?' / Esc / 'q' dismiss the overlay (AC-2, AC-3).
+            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.help = None;
+                Effects::redraw()
+            }
+            // Section navigation: Tab / Right → next (AC-7).
+            KeyCode::Tab | KeyCode::Right => {
+                help.next();
+                Effects::redraw()
+            }
+            // Section navigation: Shift+Tab (BackTab) / Left → prev (AC-7).
+            KeyCode::BackTab | KeyCode::Left => {
+                help.prev();
+                Effects::redraw()
+            }
+            // Digit keys '1'..='9': direct section select (AC-7).
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize); // '1' → 0, '2' → 1, …
+                help.select(idx);
+                Effects::redraw()
+            }
+            // Scroll down: j / Down → scroll_by(+1) (AC-8), then clamp EAGERLY against the
+            // last-known geometry so the drawn offset never over-scrolls past the last wrapped row
+            // on the shown frame (mirrors scroll_content's max_content_scroll). The post-draw clamp
+            // in set_pane_geometry stays as the backstop for resize/width changes. (R3 item 5/AC-9.)
+            KeyCode::Char('j') | KeyCode::Down => {
+                help.scroll_by(1);
+                // Clamp eagerly only once a frame has measured the body (help_body_rows > 0);
+                // before the first draw there is no geometry to clamp against and clamping to a
+                // zero total would wrongly forbid all scroll. set_pane_geometry remains the
+                // per-frame backstop. (R3 item 5.)
+                if help_body_rows > 0 {
+                    help.clamp_scroll(help_body_rows, help_body_height);
+                }
+                Effects::redraw()
+            }
+            // Scroll up: k / Up → scroll_by(-1) (saturates at 0, AC-9 top bound).
+            KeyCode::Char('k') | KeyCode::Up => {
+                help.scroll_by(-1);
+                Effects::redraw()
+            }
+            // Any other key: consumed as a no-op — does not reach the tree/viewer (AC-20).
+            _ => Effects::noop(),
+        }
     }
 
     /// Open the go-to-line prompt (AC-1). Opens whenever a **file** is selected, in any view: in a
@@ -2676,41 +2976,9 @@ fn is_markdown(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// How many rows one rendered line occupies under ratatui's word wrapper (`Wrap{trim:false}`)
-/// at `width` columns: greedy word packing — fill the row with space-separated words until the
-/// next one doesn't fit, then wrap; a word wider than the row is broken across rows. A plain
-/// `ceil(width/col)` undercounts this (words rarely pack flush to the column), which is what
-/// would make the bottom of wrapped prose unreachable via the scroll clamp. Char counts stand
-/// in for display width — close enough for the clamp, and the caller floors with the
-/// all-columns char-wrap so it never undershoots.
-fn wrapped_rows(text: &str, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for (i, word) in text.split(' ').enumerate() {
-        let wl = word.chars().count();
-        let sep = usize::from(i > 0);
-        if col != 0 && col + sep + wl > width {
-            rows += 1; // doesn't fit → start a new row
-            col = 0;
-        }
-        if col == 0 {
-            // word starts a fresh row; a word wider than the row breaks across full rows
-            let extra = wl.saturating_sub(1) / width;
-            rows += extra;
-            col = wl - extra * width;
-        } else {
-            col += sep + wl;
-        }
-    }
-    rows
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DOUBLE_CLICK, is_double_click, wrapped_rows};
+    use super::{DOUBLE_CLICK, HELP_RENDER_TIMEOUT, is_double_click};
     use std::time::Instant;
 
     #[test]
@@ -2733,17 +3001,19 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_rows_counts_word_wrapping_not_just_char_wrapping() {
-        // Four width-6 words in a 10-col pane pack one per row → 4 rows, even though the
-        // 27-column line char-wraps to only 3. The scroll clamp must use the larger count.
-        assert_eq!(wrapped_rows("aaaaaa aaaaaa aaaaaa aaaaaa", 10), 4);
-        // A single over-long word is broken like char wrapping.
-        assert_eq!(wrapped_rows(&"x".repeat(100), 25), 4);
-        // Words that pack flush share rows.
-        assert_eq!(wrapped_rows("ab cd ef", 8), 1); // "ab cd ef" = 8 cols, fits exactly
-        // Short / empty / zero-width are one row.
-        assert_eq!(wrapped_rows("hello", 80), 1);
-        assert_eq!(wrapped_rows("", 80), 1);
-        assert_eq!(wrapped_rows("anything", 0), 1);
+    fn help_render_timeout_within_ac22_budget() {
+        // FIX-B / AC-22: open_help renders What's New synchronously on the input thread, so the
+        // worst-case input-thread block is HELP_RENDER_TIMEOUT. Since R3 item 1, `run_renderer`
+        // enforces a SINGLE combined wall-clock deadline (the stdout-wait and the exit-wait share
+        // one `timeout`, not two), so the real worst-case is now exactly `HELP_RENDER_TIMEOUT`, not
+        // ~2× it — making this `≤ 300ms` assertion a TRUE single wall-clock bound rather than a
+        // best-case one. A slow/wedged renderer is killed at it and the plain-text fallback applies.
+        // This pins that bound deterministically within the 300 ms responsiveness budget: bumping
+        // the timeout past it fails HERE, covering the slow real-renderer path that a wall-clock
+        // timing assertion could only check flakily.
+        assert!(
+            HELP_RENDER_TIMEOUT <= std::time::Duration::from_millis(300),
+            "HELP_RENDER_TIMEOUT ({HELP_RENDER_TIMEOUT:?}) must stay within the 300ms AC-22 budget"
+        );
     }
 }
