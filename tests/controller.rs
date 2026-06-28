@@ -7032,3 +7032,180 @@ fn whats_new_body_falls_back_to_plain_text_when_renderer_is_absent() {
         "AC-15: the plain-text fallback still shows the (raw) changelog: {text:.80}"
     );
 }
+
+// ---- T-5: handle_help_key + app.rs key gate (AC-2, AC-3, AC-7, AC-8, AC-9, AC-20) --------
+
+/// Open the help overlay on a fresh controller and return it. Panics if help is not open.
+fn open_help_ctrl() -> Controller {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.handle(Intent::ShowHelp);
+    assert!(ctrl.help_open(), "precondition: help must be open");
+    ctrl
+}
+
+// AC-7: Tab / Right advance the active section; Shift+Tab / Left retreat; '2' selects index 1.
+#[test]
+fn help_tab_advances_section() {
+    let mut ctrl = open_help_ctrl();
+    // Two sections: 0 = What's New, 1 = About.
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        1,
+        "Tab must advance to section 1"
+    );
+}
+
+#[test]
+fn help_right_advances_section() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Right));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        1,
+        "Right must advance to section 1"
+    );
+}
+
+#[test]
+fn help_shift_tab_retreats_section() {
+    let mut ctrl = open_help_ctrl();
+    // Move to section 1 first, then retreat.
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    assert_eq!(ctrl.help_state().unwrap().active_index(), 1);
+    ctrl.handle_help_key(key(KeyCode::BackTab));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        0,
+        "Shift+Tab must retreat to section 0"
+    );
+}
+
+#[test]
+fn help_left_retreats_section() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Tab)); // advance to 1
+    ctrl.handle_help_key(key(KeyCode::Left));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        0,
+        "Left must retreat to section 0"
+    );
+}
+
+#[test]
+fn help_digit_selects_section() {
+    let mut ctrl = open_help_ctrl();
+    // '2' → select(1) → section index 1.
+    ctrl.handle_help_key(key(KeyCode::Char('2')));
+    assert_eq!(
+        ctrl.help_state().unwrap().active_index(),
+        1,
+        "'2' must select section index 1"
+    );
+}
+
+// AC-8 / AC-9 top bound: j / Down increase scroll; k / Up from 0 stays at 0.
+#[test]
+fn help_j_increases_scroll() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Char('j')));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 1, "j must increase scroll by 1");
+}
+
+#[test]
+fn help_down_increases_scroll() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Down));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 1, "Down must increase scroll by 1");
+}
+
+#[test]
+fn help_k_from_zero_stays_at_zero() {
+    let mut ctrl = open_help_ctrl();
+    // scroll is 0 at open; k / Up must saturate at 0 (AC-9 top bound).
+    ctrl.handle_help_key(key(KeyCode::Char('k')));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 0, "k from scroll=0 must stay at 0 (saturates)");
+}
+
+#[test]
+fn help_up_from_zero_stays_at_zero() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Up));
+    let scroll = ctrl.help_state().unwrap().sections[0].scroll;
+    assert_eq!(scroll, 0, "Up from scroll=0 must stay at 0 (saturates)");
+}
+
+// AC-2 / AC-3: '?', Esc, and 'q' each close the overlay.
+#[test]
+fn help_question_mark_closes() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Char('?')));
+    assert!(!ctrl.help_open(), "'?' must close the help overlay");
+}
+
+#[test]
+fn help_esc_closes() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Esc));
+    assert!(!ctrl.help_open(), "Esc must close the help overlay");
+}
+
+#[test]
+fn help_q_closes() {
+    let mut ctrl = open_help_ctrl();
+    ctrl.handle_help_key(key(KeyCode::Char('q')));
+    assert!(!ctrl.help_open(), "'q' must close the help overlay");
+}
+
+// AC-20: an unhandled key (e.g. 'f') while help is open is consumed — does NOT open the
+// finder, does NOT change the tree selection.
+#[test]
+fn help_consumes_unrecognised_key_does_not_open_finder() {
+    let mut ctrl = open_help_ctrl();
+    let selected_before = ctrl.tree().cursor();
+    ctrl.handle_help_key(key(KeyCode::Char('f')));
+    // Help is still open (not closed by 'f').
+    assert!(ctrl.help_open(), "help must stay open after 'f'");
+    // Finder must not have been opened (the 'f' key was consumed, not leaked).
+    assert!(
+        !ctrl.finder_open(),
+        "'f' must not open the finder while help is open"
+    );
+    // Tree selection unchanged.
+    assert_eq!(
+        ctrl.tree().cursor(),
+        selected_before,
+        "'f' must not change the tree cursor"
+    );
+}
+
+// handle_help_key returns Effects::redraw() for all recognised keys.
+#[test]
+fn help_key_returns_redraw_for_tab() {
+    let mut ctrl = open_help_ctrl();
+    let fx = ctrl.handle_help_key(key(KeyCode::Tab));
+    assert!(fx.redraw, "Tab must return Effects::redraw()");
+}
+
+#[test]
+fn help_key_returns_noop_for_unknown_key() {
+    let mut ctrl = open_help_ctrl();
+    let fx = ctrl.handle_help_key(key(KeyCode::Char('x')));
+    assert!(!fx.redraw, "unknown key 'x' must return Effects::noop()");
+    assert!(!fx.quit, "unknown key 'x' must not quit");
+}
+
+// Defensive: handle_help_key is a no-op when help is closed (guard).
+#[test]
+fn handle_help_key_is_noop_when_help_is_closed() {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(!ctrl.help_open(), "precondition: help is closed");
+    let fx = ctrl.handle_help_key(key(KeyCode::Tab));
+    assert!(!fx.redraw, "noop when help is closed");
+}

@@ -172,6 +172,21 @@ fn event_loop(terminal: &mut DefaultTerminal, controller: &mut Controller) -> io
                     }
                     dirty |= fx.redraw;
                 }
+                // While the help overlay is open, every key press is routed directly to
+                // `handle_help_key` so printable keys (including `j`, `q`, …) navigate the
+                // overlay instead of firing viewer intents (AC-20). Mutually exclusive with the
+                // finder/prompt arms above — only one modal is ever open.
+                Event::Key(key) if key.kind == KeyEventKind::Press && controller.help_open() => {
+                    let fx = controller.handle_help_key(key);
+                    if fx.clear {
+                        let _ = terminal.clear();
+                        dirty = true;
+                    }
+                    if fx.quit {
+                        return Ok(());
+                    }
+                    dirty |= fx.redraw;
+                }
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
                         && let Some(intent) = input::map_key(key) =>
