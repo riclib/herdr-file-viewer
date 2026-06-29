@@ -1,4 +1,4 @@
-//! App wiring — assemble the real components and run the terminal event loop (T-20).
+//! App wiring — assemble the real components and run the terminal event loop.
 //!
 //! [`run`] is the binary's body: read the herdr launch context, resolve the root and
 //! git-presence, build the live Git Service / Content Renderer / Editor Launcher behind the
@@ -88,7 +88,7 @@ pub fn run() -> io::Result<()> {
     // HERDR_FILE_VIEWER_NO_UPDATE_CHECK). The banner, if any, appears on a later draw.
     controller.set_update(crate::update::start_default());
     // Inject the herdr query channel + the viewer's own workspace id for the worktree picker's
-    // agent-active overlay (AC-3) — the first real use of the T-4 host seam. `ctx` is still in
+    // agent-active overlay (AC-3) — the first real use of the host seam. `ctx` is still in
     // scope (only borrowed by `root::resolve`). A missing/failing herdr degrades to a git-only
     // picker (AC-15).
     controller.set_host(

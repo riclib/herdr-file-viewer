@@ -7270,7 +7270,9 @@ fn help_scroll_clamps_against_wrapped_row_total_not_raw_lines() {
     };
 
     // Over-scroll far past any bound (scroll_by only saturates at 0; the bottom bound is the clamp).
-    for _ in 0..200 {
+    // Pump well past any plausible wrapped_max (raw_lines + 7 here) so the clamp, not the pump
+    // count, is the limiting factor — robust against changelog growth.
+    for _ in 0..1000 {
         ctrl.handle_help_key(key(KeyCode::Char('j')));
     }
 

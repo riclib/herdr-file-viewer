@@ -1,4 +1,4 @@
-//! Match Highlighter — overlay highlight styling onto content-pane spans (T-7 / AC-9, AC-11).
+//! Match Highlighter — overlay highlight styling onto content-pane spans (AC-9, AC-11).
 //!
 //! `apply` re-segments each `Line`'s spans at match boundaries and patches highlight
 //! styles onto the sub-spans that fall within a match's `[start, end)` byte range.

@@ -152,7 +152,7 @@ fn run_ls_remote_in(repo_url: &str, run_dir: &Path) -> io::Result<String> {
         let _ = tx.send(buf);
     });
     match rx.recv_timeout(PROBE_TIMEOUT) {
-        Ok(buf) => match wait_bounded(&mut child, PROBE_TIMEOUT) {
+        Ok(buf) => match crate::proc::wait_bounded(&mut child, PROBE_TIMEOUT) {
             Some(status) if status.success() => Ok(String::from_utf8_lossy(&buf).into_owned()),
             Some(status) => Err(io::Error::other(format!(
                 "git ls-remote exited with {status}"
@@ -163,27 +163,6 @@ fn run_ls_remote_in(repo_url: &str, run_dir: &Path) -> io::Result<String> {
             let _ = child.kill();
             let _ = child.wait();
             Err(io::Error::other("git ls-remote timed out"))
-        }
-    }
-}
-
-/// Wait for a child to exit within `grace`, killing and reaping it if it overruns.
-fn wait_bounded(
-    child: &mut std::process::Child,
-    grace: Duration,
-) -> Option<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
         }
     }
 }

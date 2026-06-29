@@ -357,7 +357,7 @@ fn run_renderer(command: &[String], input: &str, timeout: Duration) -> Result<St
             // stdout closed; the process should exit promptly. Bound that wait by what's LEFT of
             // the single deadline, so a renderer that closes stdout then hangs is still killed and
             // the TOTAL never exceeds `timeout` (no indefinite block, no doubled budget).
-            match wait_bounded(
+            match crate::proc::wait_bounded(
                 &mut child,
                 deadline.saturating_duration_since(Instant::now()),
             ) {
@@ -370,27 +370,6 @@ fn run_renderer(command: &[String], input: &str, timeout: Duration) -> Result<St
             let _ = child.kill();
             let _ = child.wait();
             Err(format!("{prog} timed out"))
-        }
-    }
-}
-
-/// Wait for a child to exit within `grace`, polling; kill and reap it if it overruns.
-fn wait_bounded(
-    child: &mut std::process::Child,
-    grace: Duration,
-) -> Option<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
         }
     }
 }

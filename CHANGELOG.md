@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Extracted the duplicated `wait_bounded` subprocess reaper (child wait + poll + timeout-kill)
+  from `render.rs` and `update/mod.rs` into one shared `src/proc.rs` helper. Pure dedup — no
+  behavior change; the total wall-clock timeout bound is unchanged (the 4/4-model audit
+  finding, security-adjacent).
+- Documented `git` as a runtime requirement in `docs/install.md` (the git-aware tree + diff
+  views shell out to the system `git` CLI; without it those features degrade but the viewer
+  still opens). Also corrected the `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` wording: any value (the
+  var's mere presence) disables the check, not just `=1`.
+- `docs/renderers.md`: documented the bundled `assets/markdown-style.json` palette glow is
+  pointed at when present (falling back to glow's built-in `dark` style), and corrected the
+  overclaimed `cargo` fallback — only `delta` and `bat` are cargo-installable; `glow` is Go
+  and the helper prints its manual install link instead.
+- `ARCHITECTURE.md`: noted the one on-disk exception to "ephemeral state only" — the advisory
+  `update-check.json` timestamp cache (safe to delete); added the new `proc` module to the
+  component table.
+- `herdr-plugin.toml`: corrected the pane comment (the `[[actions]]` do summon the viewer at
+  runtime via launcher scripts — the old comment claimed no runtime command did).
+- `.github/workflows/release.yml`: corrected the stale prebuilt-gate comment — the install
+  step selects the prebuilt by **declared version match**, not commit exactness; the published
+  `COMMIT` marker is informational only (used to note when the checkout is ahead of the
+  released binary).
+- Swept `src/**` comments clean of internal build-process references (`T-N`, `SMA-N`,
+  `review-gate R[N]`) and corrected the stale "search keystrokes are no-ops" comment in
+  `controller.rs` (in-file search is fully implemented). No code behavior changed.
+- `CHANGELOG.md`: added the missing `[1.1.0]`–`[1.6.0]` release-tag link references (only
+  `[1.0.0]` had one).
+
 ## [1.6.0] - 2026-06-28
 
 ### Added
@@ -181,3 +211,11 @@ First public release: a git-aware, read-only file viewer that runs as a herdr pl
   [SECURITY.md](SECURITY.md).
 
 [1.0.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.0.0
+[1.1.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.1.0
+[1.2.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.2.0
+[1.2.1]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.2.1
+[1.2.2]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.2.2
+[1.3.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.3.0
+[1.4.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.4.0
+[1.5.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.5.0
+[1.6.0]: https://github.com/smarzban/herdr-file-viewer/releases/tag/v1.6.0

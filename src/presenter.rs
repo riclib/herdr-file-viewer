@@ -148,7 +148,7 @@ pub struct ContentSearch {
 }
 
 /// The finder overlay's draw model (an owned snapshot of the controller's finder state).
-/// Built by the Session Controller's `view_state()` (T-8).
+/// Built by the Session Controller's `view_state()`.
 pub struct FinderView {
     /// The current query text drawn on the input line.
     pub query: String,
@@ -480,7 +480,7 @@ fn draw_tree(frame: &mut Frame, area: Rect, state: &ViewState) {
     // rather than showing a blank/placeholder branch. Sanitized + truncated like the top title.
     if let Some(branch) = &state.branch {
         // Middle-ellipsis (not tail) so a long branch keeps both its `prefix/` and trailing feature
-        // name visible when the tree column is narrow (SMA-249).
+        // name visible when the tree column is narrow.
         block = block.title_bottom(truncate_middle(&sanitize_label(branch), area.width));
     }
     let inner = block.inner(area);
@@ -569,7 +569,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     // Overlay highlight when a committed search is active. `highlight::apply` returns the same
     // line count and never changes a line's text width — only re-segments spans and patches
     // styles — so `content_rows` and `max_width` (computed above from `state.content`) stay
-    // valid. When `search` is `None`, cloning `state.content` is byte-identical to the pre-T-12
+    // valid. When `search` is `None`, cloning `state.content` is byte-identical to the prior
     // path, so existing snapshots are unaffected (AC zero-churn invariant).
     let content_text = match &state.search {
         Some(cs) => ratatui::text::Text::from(crate::highlight::apply(
@@ -734,14 +734,14 @@ pub struct PaneGeometry {
     /// minus the inner width; `0` when rows fit or the picker is closed). Fed back so the controller
     /// clamps the *stored* `hscroll` in state each frame — without it, over-scrolling right (Expand)
     /// parks the offset past the real maximum and the first few Collapse presses appear to do
-    /// nothing while it burns back down (the same fix as `finder_max_hscroll`, SMA-229).
+    /// nothing while it burns back down (the same fix as `finder_max_hscroll`).
     pub picker_max_hscroll: u16,
     /// The screen rect where the help overlay's active body is drawn, `None` when the overlay is
-    /// closed. Exposed for next-frame hit-testing (T-7 adds the tab regions on top).
+    /// closed. Exposed for next-frame hit-testing (the tab regions are layered on top).
     pub help_body: Option<Rect>,
     /// The help body's visible viewport HEIGHT, in rows (`0` when the overlay is closed). Fed back
     /// so the controller re-clamps the stored scroll to `[0, help_body_rows − this]` each frame —
-    /// the bottom bound deferred from T-5, enforced against the live measured height (AC-9).
+    /// the bottom bound enforced against the live measured height (AC-9).
     pub help_body_height: u16,
     /// The help body's total height in **wrapped (rendered) rows** at the body draw width (`0` when
     /// the overlay is closed). The body is drawn with `Paragraph::wrap`, so its scroll offset is in
@@ -827,7 +827,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     };
 
     // Picker: the SAME helper `draw_picker_overlay` uses, so the fed-back `max_hscroll` matches what
-    // is drawn — the controller clamps the stored picker hscroll to it each frame (SMA-229). `0`
+    // is drawn — the controller clamps the stored picker hscroll to it each frame. `0`
     // when the picker is closed.
     let picker_max_hscroll = match &state.picker {
         Some(picker) => picker_overlay_layout(area, picker).max_hscroll,
@@ -836,7 +836,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
 
     // Help: the SAME helper `draw_help_overlay` uses, so the fed-back body HEIGHT matches what is
     // drawn — the controller clamps the stored scroll to `[0, body_lines − height]` each frame, the
-    // bottom bound deferred from T-5 (AC-9). All `None`/`0` when the overlay is closed.
+    // bottom bound enforced against the live measured height (AC-9). All `None`/`0` when the overlay is closed.
     let (help_body, help_body_height, help_body_rows, help_vbar, help_tabs) = match &state.help {
         Some(help) => {
             let hl = help_overlay_layout(area, help);
@@ -960,7 +960,7 @@ struct PickerLayout {
     /// inner width (`0` when every row fits). The single source of truth for the clamp —
     /// [`draw_picker_overlay`] clamps the displayed offset to it AND [`geometry`] feeds it back so
     /// the controller clamps the *stored* `hscroll` to the same value, so the two can never
-    /// disagree (which is what made an over-scroll-right need several left presses to undo, SMA-229).
+    /// disagree (which is what made an over-scroll-right need several left presses to undo).
     max_hscroll: u16,
 }
 
@@ -1088,7 +1088,7 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     let visible = layout.inner.height as usize;
     // Clamp the displayed hscroll to `layout.max_hscroll` — the SAME value the controller clamps the
     // stored offset to (via geometry feedback), so display and state never disagree. A no-op when
-    // every row fits, and never scrolls past the widest row (SMA-229).
+    // every row fits, and never scrolls past the widest row.
     let hscroll = picker.hscroll.min(layout.max_hscroll);
 
     let window: Vec<Line> = rows.into_iter().skip(layout.offset).take(visible).collect();
@@ -1646,7 +1646,7 @@ fn prefix_width() -> u16 {
 ///   - **Bottom border:** the self-operating key-hints footer (switch + close — AC-11).
 ///
 /// Reuses [`centered_rect_sized`], `PICKER_PADDING`, and the `Clear`/`Block`/`Scrollbar` primitives
-/// — no new layout abstraction. The body `Text` is already produced by the controller (T-4); this
+/// — no new layout abstraction. The body `Text` is already produced by the controller; this
 /// function only lays it out (delegate-rendering, constitution #2).
 fn draw_help_overlay(frame: &mut Frame, area: Rect, help: &HelpView) {
     // Delegate all sizing + centering to the shared layout helper, so this and `geometry()` agree.
@@ -1704,7 +1704,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, help: &HelpView) {
             body_area,
         );
         // Vertical scrollbar when the body overflows — the same `layout.vbar` rect `geometry` feeds
-        // back, so a press/drag on it (T-7) hit-tests where it is drawn. Tracks the scroll OFFSET
+        // back, so a press/drag on it hit-tests where it is drawn. Tracks the scroll OFFSET
         // (the body has a real offset, like the content pane — unlike the cursor-tracking tree bar).
         // Sized against the WRAPPED row total (`layout.body_rows`), not raw `lines.len()`, so the
         // thumb matches the offset extent the scroll clamp uses (the body is drawn with `wrap`).
