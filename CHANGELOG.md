@@ -47,6 +47,19 @@ All notable changes to this project are documented here. The format is based on
   `#[ignore]` e2e tests (`e2e_help`, `e2e_editor`) are retained with their existing rationale —
   they may now pass on macOS CI after the timing fix, but that can only be confirmed on the
   macOS CI matrix, so the ignores stay until verified.
+- **Test coverage (SMA-338/339/340/341):** strengthened `no_handled_intent_mutates_the_filesystem`
+  so it routes every `Intent::ALL` variant through the real handler (closing any modal an intent
+  opened before the next iteration, so guards don't short-circuit the dispatch) and asserts a
+  content-aware FS/git snapshot — the read-only invariant (AC-N1/N2) is now genuinely exercised.
+  Added a modal × intent cross-product guard matrix (5 modal states × all 28 intents = 140 pairs)
+  driving off `Intent::ALL` so a new intent variant is auto-covered — asserts modal isolation
+  (AC-5/AC-6), no second modal opens, tree/FS unchanged. Extracted the git porcelain/diff parser
+  into testable helpers (`parse_porcelain_status`, `parse_name_status`) and added table-driven
+  unit tests for malformed/truncated input, rename/copy edge cases, unknown status codes, and
+  direct `classify`/`classify_name_status` per-code assertions — the defensive branches that were
+  previously unreachable are now exercised. Added an OSC-52 clipboard-exfiltration ingestion test
+  (AC-27 named vector) on the content-renderer path, and gated the CLI smoke test's network path
+  by setting `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` so it performs no network I/O (hermetic).
 
 ## [1.6.0] - 2026-06-28
 

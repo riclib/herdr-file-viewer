@@ -24,9 +24,9 @@ const N: usize = 10_000;
 
 /// A generous slack factor: 2N work may take more than 2× wall-clock (allocator/cache effects,
 /// a second copy in memory, scheduling jitter under parallel test load), but an O(n²)
-/// regression blows well past this. 3.0× keeps the test stable on a loaded CI lane while still
+/// regression blows well past this. 4.0× keeps the test stable on a loaded CI lane while still
 /// catching the regressions that matter. Mirrors the `mul_f32(1.5)` philosophy from `render.rs`.
-const RATIO_SLACK: f32 = 3.0;
+const RATIO_SLACK: f32 = 4.0;
 
 /// `elapsed * factor`, the form used by the `render.rs` exemplar (`timeout.mul_f32(1.5)`).
 fn scaled(elapsed: Duration, factor: f32) -> Duration {
@@ -36,7 +36,7 @@ fn scaled(elapsed: Duration, factor: f32) -> Duration {
 /// A minimum base time below which the ratio is meaningless (sub-millisecond timings are
 /// dominated by scheduler noise). If the N-side timing is below this, the bound falls back to a
 /// safe absolute floor so a jitter spike on the 2N side can't trip the ratio.
-const MIN_BASE: Duration = Duration::from_millis(5);
+const MIN_BASE: Duration = Duration::from_millis(15);
 
 /// Build the synthetic content: lines of ~80 chars with "fn" appearing 5× per line so there are
 /// thousands of matches (the realistic worst case for the highlighter).

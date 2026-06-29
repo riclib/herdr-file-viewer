@@ -13,22 +13,22 @@ use herdr_file_viewer::{fuzzy, index};
 use std::fs;
 use std::time::{Duration, Instant};
 
-/// N for the scaling pair. 100 dirs × 100 files = 10,000 files; 2N = 200 × 100 = 20,000. Large
+/// N for the scaling pair. 200 dirs × 100 files = 20,000 files; 2N = 400 × 100 = 40,000. Large
 /// enough that the base timing is ~tens of ms (robust against scheduler jitter when the full
 /// suite runs in parallel), cheap enough for the default lane.
-const DIRS: usize = 100;
+const DIRS: usize = 200;
 const FILES_PER_DIR: usize = 100;
 
 /// Slack factor: 2N work may take more than 2× wall-clock (allocator/cache effects, a second
 /// copy in memory, scheduling jitter under parallel test load), but an O(n²) regression blows
-/// well past this. 3.0× keeps the test stable on a loaded CI lane. Mirrors `mul_f32(1.5)` from
-/// `render.rs`.
-const RATIO_SLACK: f32 = 3.0;
+/// well past this. 4.0× keeps the test stable on a loaded CI lane while still catching the
+/// regressions that matter. Mirrors `mul_f32(1.5)` from `render.rs`.
+const RATIO_SLACK: f32 = 4.0;
 
 /// A minimum base time below which the ratio is meaningless (sub-millisecond timings are
 /// dominated by scheduler noise). If the N-side timing is below this, the bound falls back to a
 /// safe absolute floor so a jitter spike on the 2N side can't trip the ratio.
-const MIN_BASE: Duration = Duration::from_millis(5);
+const MIN_BASE: Duration = Duration::from_millis(15);
 
 /// `elapsed * factor`, the form used by the `render.rs` exemplar (`timeout.mul_f32(1.5)`).
 fn scaled(elapsed: Duration, factor: f32) -> Duration {

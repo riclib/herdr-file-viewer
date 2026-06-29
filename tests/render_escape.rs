@@ -103,6 +103,38 @@ fn osc_sequences_are_dropped_through_both_terminators() {
 }
 
 #[test]
+fn osc_52_clipboard_exfiltration_is_neutralized() {
+    // OSC 52 ; clipboard c ; base64 payload ; BEL terminator. A clipboard-exfiltration vector
+    // named by AC-27 — deserves its own case on the content-renderer path. Neither the OSC
+    // sequence, the `52;c;` parameter, nor the base64 payload may survive into the spans.
+    let payload = base64_clipboard_payload();
+    let hostile = format!("before\x1b]52;c;{payload}\x07after");
+    let rendered = flatten(&to_text(&hostile));
+
+    assert!(
+        !rendered.contains('\u{1b}'),
+        "AC-27: no ESC byte survives: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("52;c;"),
+        "AC-27: OSC-52 parameter not reproduced: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(&payload),
+        "AC-27: OSC-52 base64 clipboard payload not reproduced: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("before") && rendered.contains("after"),
+        "surrounding text preserved: {rendered:?}"
+    );
+}
+
+fn base64_clipboard_payload() -> String {
+    // "stolen" base64-encoded — a plausible clipboard payload that must never reach the spans.
+    "c3RvbGVu".to_string()
+}
+
+#[test]
 fn c1_control_codepoints_are_dropped() {
     // C1 controls (U+0080–U+009F, e.g. U+009B = a single-byte CSI introducer) are acted on by
     // some terminals, so each is dropped. (AC-27)

@@ -494,11 +494,34 @@ fn navigation_moves_the_cursor_and_signals_redraw() {
 fn no_handled_intent_mutates_the_filesystem() {
     // AC-N1 / AC-N3: handling the entire intent vocabulary writes nothing — the viewer is
     // read-only and exposes no edit path (the editor stub launches nothing real).
+    //
+    // This is the strengthened version of the earlier tautological test. The previous test
+    // iterated `Intent::ALL` on one controller, but `Intent::OpenFinder` (and OpenSearch /
+    // ShowHelp) open a modal partway through the loop; from that point on every subsequent
+    // intent hit the modal guard in `handle()` and returned `Effects::noop()` WITHOUT reaching
+    // its real handler — so ~6 trailing intents were never actually exercised. That made the
+    // test unable to catch a write regression in those handlers.
+    //
+    // Fix: after each intent, close any modal it opened (finder / prompt / help / picker) so the
+    // NEXT intent is dispatched on a clean no-modal controller and reaches its real handler.
+    // `snapshot_no_git` (relative path + bytes, excluding `.git`) is used so the assertion
+    // catches a content write, a create, a rename, or a delete — not just file existence. A
+    // real git repo is used so the git-touching intents (Refresh, ToggleBaseline,
+    // ToggleChangedOnly, SwitchWorktree) run their real controller-side git state machinery
+    // (still against the stub, never mutating the worktree).
+    //
+    // Sanity check (by reasoning, not left in the test): if any handler wrote to disk — e.g.
+    // `activate()` called `std::fs::write` — the (rel-path, bytes) snapshot would differ and this
+    // assertion would fail with a diff naming the offending file. The `Close` intent is skipped
+    // because it ends the session (`quit: true`); its handler `close_or_unzoom` only flips
+    // in-memory `zoomed`/`search` state and never touches the filesystem.
     let dir = TempDir::new();
+    init_repo_with_commit(dir.path());
     std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
     std::fs::write(dir.path().join("sub").join("c.txt"), "c\n").unwrap();
-    let before = snapshot(dir.path());
+    std::fs::write(dir.path().join("notes.md"), "# Hello\n").unwrap();
+    let before = snapshot_no_git(dir.path());
 
     let (mut ctrl, _, _) = controller(dir.path(), true, StubGit::default(), false);
     for intent in Intent::ALL {
@@ -506,12 +529,29 @@ fn no_handled_intent_mutates_the_filesystem() {
             continue; // Close ends the session; exercise every other intent
         }
         let _ = ctrl.handle(intent);
+        ctrl.poll();
+
+        // Close any modal the intent opened so the next iteration dispatches on a clean
+        // no-modal controller and reaches the real handler (not a guard short-circuit).
+        // The run loop closes these via the per-modal key handlers; mirror that here.
+        if ctrl.finder_open() {
+            ctrl.handle_finder_key(key(KeyCode::Esc));
+        }
+        if ctrl.prompt_open() {
+            ctrl.handle_prompt_key(key(KeyCode::Esc));
+        }
+        if ctrl.help_open() {
+            ctrl.close_help();
+        }
+        if ctrl.picker().is_some() {
+            ctrl.handle(Intent::Close);
+        }
     }
 
+    let after = snapshot_no_git(dir.path());
     assert_eq!(
-        snapshot(dir.path()),
-        before,
-        "no intent mutated any file (AC-N1, AC-N3)"
+        after, before,
+        "no intent mutated any file's contents or the tree layout (AC-N1, AC-N3)"
     );
 }
 
@@ -960,28 +1000,6 @@ fn resize_intents_move_the_tree_content_divider_and_clamp() {
         min,
         "cannot shrink past the minimum"
     );
-}
-
-/// A sorted (path, bytes) snapshot of every file under `root`, for an exact read-only check.
-fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut out = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .collect();
-        entries.sort();
-        for p in entries {
-            if p.is_dir() {
-                walk(&p, out);
-            } else {
-                out.push((p.clone(), std::fs::read(&p).unwrap()));
-            }
-        }
-    }
-    walk(root, &mut out);
-    out
 }
 
 // ---- mouse (AC-18 is keyboard-first; mouse is additive) -------------------------------
@@ -2733,6 +2751,299 @@ fn picker_other_intents_are_inert() {
         common::canon(ctrl.root()),
         common::canon(&root_before),
         "root unchanged for inert intents (double-check)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SMA-339: modal × intent cross-product guard matrix (AC-5, AC-6).
+// ---------------------------------------------------------------------------
+
+/// The modal states exercised by the cross-product matrix. Each variant carries the name a
+/// failure message needs, and a flag for whether `Intent::Close` (the one intent that can end
+/// the session) closes the modal rather than being a noop — true for finder/prompt/help (the
+/// `handle()` guard short-circuits Close before it reaches `close_or_unzoom`, so the modal stays
+/// open and the session does NOT quit), false for the picker (Close routes to
+/// `handle_picker_intent` which cancels the picker).
+enum ModalKind {
+    Picker,
+    Finder,
+    PromptGoToLine,
+    PromptSearch,
+    Help,
+}
+
+impl ModalKind {
+    fn name(&self) -> &'static str {
+        match self {
+            ModalKind::Picker => "picker",
+            ModalKind::Finder => "finder",
+            ModalKind::PromptGoToLine => "prompt(go-to-line)",
+            ModalKind::PromptSearch => "prompt(search)",
+            ModalKind::Help => "help",
+        }
+    }
+
+    /// Whether the modal is open on the controller after `handle(Intent::Close)`.
+    /// For finder/prompt/help the `handle()` guard returns noop BEFORE the match, so Close
+    /// never reaches `close_or_unzoom` — the modal stays open and the session does not quit.
+    /// For the picker, Close routes to `handle_picker_intent` which cancels the picker.
+    fn open_after_close(&self) -> bool {
+        matches!(
+            self,
+            ModalKind::Finder
+                | ModalKind::PromptGoToLine
+                | ModalKind::PromptSearch
+                | ModalKind::Help
+        )
+    }
+
+    /// Whether the intent is one the picker's own handler routes (Nav/Expand/Collapse/Activate/
+    /// Close). Only meaningful for the picker; the other modals short-circuit every intent in
+    /// `handle()` before the match, so no intent reaches a per-modal handler.
+    fn is_picker_own(&self, intent: Intent) -> bool {
+        matches!(
+            intent,
+            Intent::NavUp
+                | Intent::NavDown
+                | Intent::Expand
+                | Intent::Collapse
+                | Intent::Activate
+                | Intent::Close
+        )
+    }
+}
+
+/// Build a fresh controller with the given modal already open. The picker needs a real git
+/// repo with a linked worktree; the go-to-line/search prompts need a file selected. The temp
+/// dirs are leaked so they survive the test.
+fn controller_with_modal_open(kind: &ModalKind) -> Controller {
+    match kind {
+        ModalKind::Picker => {
+            // Reuse the existing two-worktree setup (leaks its temp dirs).
+            let (ctrl, _, _) = setup_picker_with_two_worktrees();
+            ctrl
+        }
+        ModalKind::Finder => {
+            let dir = TempDir::new();
+            std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+            std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+            let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+            ctrl.handle(Intent::OpenFinder);
+            assert!(ctrl.finder_open(), "precondition: finder is open");
+            std::mem::forget(dir);
+            ctrl
+        }
+        ModalKind::PromptGoToLine => {
+            // OpenGoToLine requires a file selected (selected_view_mode().is_some()); an
+            // unchanged .rs file renders as SyntaxContent, so the prompt opens.
+            let dir = TempDir::new();
+            std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+            let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+            assert!(
+                ctrl.selected_view_mode().is_some(),
+                "precondition: a file is selected so OpenGoToLine opens the prompt"
+            );
+            ctrl.handle(Intent::OpenGoToLine);
+            assert!(
+                ctrl.prompt_open(),
+                "precondition: go-to-line prompt is open"
+            );
+            std::mem::forget(dir);
+            ctrl
+        }
+        ModalKind::PromptSearch => {
+            let dir = TempDir::new();
+            std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+            let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+            ctrl.handle(Intent::OpenSearch);
+            assert!(ctrl.prompt_open(), "precondition: search prompt is open");
+            std::mem::forget(dir);
+            ctrl
+        }
+        ModalKind::Help => {
+            let dir = TempDir::new();
+            std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+            let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+            ctrl.handle(Intent::ShowHelp);
+            assert!(ctrl.help_open(), "precondition: help overlay is open");
+            std::mem::forget(dir);
+            ctrl
+        }
+    }
+}
+
+/// Whether the modal of `kind` is currently open on `ctrl`.
+fn modal_open(kind: &ModalKind, ctrl: &Controller) -> bool {
+    match kind {
+        ModalKind::Picker => ctrl.picker().is_some(),
+        ModalKind::Finder => ctrl.finder_open(),
+        ModalKind::PromptGoToLine | ModalKind::PromptSearch => ctrl.prompt_open(),
+        ModalKind::Help => ctrl.help_open(),
+    }
+}
+
+/// Whether any modal at all is open on `ctrl` — used to assert no second modal opens.
+fn any_modal_open(ctrl: &Controller) -> bool {
+    ctrl.picker().is_some() || ctrl.finder_open() || ctrl.prompt_open() || ctrl.help_open()
+}
+
+/// The full cross-product: for each modal × each `Intent::ALL` variant, drive `handle(intent)`
+/// and assert the intent is inert (or routes only to the picker's own handler) — never reaching
+/// the tree, never opening a second modal, never mutating the filesystem, and (for finder/prompt/
+/// help) never closing the modal via the `handle()` guard. Driving off `Intent::ALL` means a new
+/// intent variant is automatically covered: it lands in the matrix and must be classified.
+///
+/// AC-5/AC-6 (modal isolation): while a modal is open, intents that would otherwise drive the
+/// tree (Nav, ToggleIgnore, CycleView, …) or open another modal (OpenFinder, OpenSearch,
+/// ShowHelp, SwitchWorktree) must be absorbed by the modal guard.
+#[test]
+fn modal_intent_cross_product_isolates_the_tree() {
+    let modals = [
+        ModalKind::Picker,
+        ModalKind::Finder,
+        ModalKind::PromptGoToLine,
+        ModalKind::PromptSearch,
+        ModalKind::Help,
+    ];
+
+    for modal in modals {
+        for &intent in Intent::ALL.iter() {
+            // Fresh controller with the modal open for every (modal × intent) pair, so an
+            // earlier intent can't leave state that masks a later one.
+            let mut ctrl = controller_with_modal_open(&modal);
+
+            // A populated temp dir backs every setup; snapshot it (rel-path + bytes, excluding
+            // .git) so the read-only invariant (AC-N1/N2) is checked per pair, not just once.
+            // root() is the temp dir for every modal except the picker, whose root is the repo;
+            // snapshot_no_git handles both by walking from root().
+            let before = snapshot_no_git(ctrl.root());
+            let root_before = common::canon(ctrl.root());
+            let tree_cursor_before = ctrl.tree().cursor();
+            let modal_open_before = modal_open(&modal, &ctrl);
+
+            assert!(
+                modal_open_before,
+                "precondition: {:?} is open before {:?}",
+                modal.name(),
+                intent
+            );
+
+            let fx = ctrl.handle(intent);
+            ctrl.poll();
+
+            // 1. The filesystem is unchanged (AC-N1, AC-N2) — the assertion compares file
+            //    contents, so a write/create/rename/delete by any handler would fail here.
+            assert_eq!(
+                snapshot_no_git(ctrl.root()),
+                before,
+                "{:?} × {:?}: no file or git mutation (AC-N1/N2)",
+                modal.name(),
+                intent
+            );
+
+            // 2. The tree root is unchanged (AC-N5 — re-root only via picker→Activate).
+            assert_eq!(
+                common::canon(ctrl.root()),
+                common::canon(&root_before),
+                "{:?} × {:?}: the tree root must not change behind a modal (AC-N5)",
+                modal.name(),
+                intent
+            );
+
+            // 3. No second modal opens — modal mutual-exclusion (AC-5/AC-6). The original modal
+            //    may close (picker's own Close/Activate), but a different one must NOT open.
+            //    For finder/prompt/help, `handle()` returns noop for every intent, so the modal
+            //    stays open and nothing else opens. For the picker, only the picker's own
+            //    Nav/Expand/Collapse/Activate/Close route; everything else is noop.
+            let picker_own =
+                matches!(modal, ModalKind::Picker) && ModalKind::Picker.is_picker_own(intent);
+            if !picker_own {
+                // Inert for this modal: the modal stays open, no second modal opens.
+                assert!(
+                    modal_open(&modal, &ctrl),
+                    "{:?} × {:?}: an inert intent must not close {:?}",
+                    modal.name(),
+                    intent,
+                    modal.name()
+                );
+                assert!(
+                    !fx.quit,
+                    "{:?} × {:?}: an inert intent behind a modal must not quit the session",
+                    modal.name(),
+                    intent
+                );
+            }
+            // For every pair (including the picker's own intents): at most the original modal
+            // is open afterwards — never a second, different modal.
+            // If the original modal is now closed (picker Close/Activate), no other modal may
+            // have opened in its place.
+            if !modal_open(&modal, &ctrl) {
+                // The only legal close is the picker's own Close or Activate.
+                assert!(
+                    picker_own,
+                    "{:?} × {:?}: only the picker's own Close/Activate may close the picker",
+                    modal.name(),
+                    intent
+                );
+            }
+            // No second modal: the set of open modals is a subset of {the original modal}.
+            // I.e. if a different modal is open, that's a failure.
+            let picker_still = ctrl.picker().is_some();
+            let finder_still = ctrl.finder_open();
+            let prompt_still = ctrl.prompt_open();
+            let help_still = ctrl.help_open();
+            let any_other = match &modal {
+                ModalKind::Picker => finder_still || prompt_still || help_still,
+                ModalKind::Finder => picker_still || prompt_still || help_still,
+                ModalKind::PromptGoToLine | ModalKind::PromptSearch => {
+                    picker_still || finder_still || help_still
+                }
+                ModalKind::Help => picker_still || finder_still || prompt_still,
+            };
+            assert!(
+                !any_other,
+                "{:?} × {:?}: no second modal may open behind {:?} (AC-5/AC-6 mutual-exclusion)",
+                modal.name(),
+                intent,
+                modal.name()
+            );
+
+            // 4. The tree cursor is unchanged — no intent leaks past the modal guard to drive
+            //    the tree. (The picker's own Nav intents move the picker cursor, not the tree
+            //    cursor; the tree cursor behind the overlay must stay put.)
+            assert_eq!(
+                ctrl.tree().cursor(),
+                tree_cursor_before,
+                "{:?} × {:?}: the tree cursor must not move behind a modal",
+                modal.name(),
+                intent
+            );
+
+            // 5. For finder/prompt/help, Close does NOT quit the session (the guard short-circuits
+            //    it before close_or_unzoom) — assert the documented behavior explicitly so a
+            //    future refactor that lets Close reach close_or_unzoom behind a modal fails here.
+            if intent == Intent::Close && modal.open_after_close() {
+                assert!(
+                    modal_open(&modal, &ctrl),
+                    "{:?} × Close: the {:?} stays open (handle() guard short-circuits Close)",
+                    modal.name(),
+                    modal.name()
+                );
+                assert!(
+                    !fx.quit,
+                    "{:?} × Close: the session must not quit while {:?} is open",
+                    modal.name(),
+                    modal.name()
+                );
+            }
+        }
+    }
+
+    // Sanity: at least one modal × one intent pair was exercised (guards against the loop body
+    // being silently skipped — e.g. if Intent::ALL were ever empty).
+    assert!(
+        any_modal_open(&controller_with_modal_open(&ModalKind::Picker)),
+        "sanity: the matrix exercised at least the picker setup"
     );
 }
 
