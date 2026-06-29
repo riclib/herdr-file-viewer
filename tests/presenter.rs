@@ -82,6 +82,8 @@ fn sample_state() -> ViewState {
         root_name: "r".to_string(), // the fixture tree is rooted at /r
         branch: None,
         prompt: None,
+        content_title: Some("main.rs".to_string()),
+        content_rendering: false,
         search: None,
         help: None,
     }
@@ -2864,4 +2866,117 @@ fn help_tab_rects_agree_with_drawn_tab_positions() {
             .contains(Modifier::REVERSED),
         "the active tab's first cell (at its rect origin) is REVERSED — the rect tracks the drawn tab"
     );
+}
+
+// ── SMA-345: discoverability — help hint + empty-state guidance ──────────────
+
+#[test]
+fn content_pane_shows_a_help_hint_on_its_bottom_border() {
+    // The `? help` affordance rides the content block's bottom border so a new user discovers
+    // the help overlay without opening it first. Visible on the default (file-selected) screen.
+    let out = render(&sample_state(), 100, 24);
+    assert!(
+        out.contains("? help"),
+        "the '? help' hint must be visible on the content pane's bottom border\n{out}"
+    );
+    // It sits on the LAST line (the content block's bottom border), not in the tree column.
+    let last = out.lines().last().unwrap();
+    assert!(
+        last.contains("? help"),
+        "the hint is on the bottom border row\n{last}"
+    );
+}
+
+#[test]
+fn content_pane_shows_help_hint_even_when_a_file_is_loaded() {
+    // Sanity: the hint is persistent, not only on an empty pane.
+    let out = render(&sample_state(), 100, 24);
+    assert!(out.contains("fn main()"), "a file is loaded\n{out}");
+    assert!(out.contains("? help"), "the hint is still shown\n{out}");
+}
+
+#[test]
+fn selecting_a_directory_shows_empty_state_guidance_not_a_blank_pane() {
+    // SMA-345: a directory selection shows "Directory — select a file to view" in the content
+    // pane, instead of a blank void. Built directly in the Presenter (the controller's
+    // clear_content sets this copy).
+    let mut state = sample_state();
+    // Select the directory row (index 0 = /r/src).
+    state.selected = 0;
+    state.content = to_text("Directory — select a file to view");
+    state.notices.clear();
+    // SMA-342: a directory selection has no displayed file content, so the title falls back to
+    // the selected node's name (the directory). Mirrors the controller's `clear_content`.
+    state.content_title = None;
+    state.content_rendering = false;
+    let out = render(&state, 100, 24);
+    assert!(
+        out.contains("Directory — select a file to view"),
+        "a directory selection shows guidance, not a blank pane\n{out}"
+    );
+}
+
+#[test]
+fn an_empty_tree_shows_empty_state_guidance_not_a_blank_pane() {
+    // SMA-345: an empty / zero-match tree (no files, or a filter matched nothing) shows "No
+    // files" in the content pane instead of leaving it blank.
+    let mut state = sample_state();
+    state.nodes = vec![]; // empty tree
+    state.selected = 0;
+    state.content = to_text("No files");
+    state.notices.clear();
+    // SMA-342: no file content displayed → title falls back to "Content" (no selected node).
+    state.content_title = None;
+    state.content_rendering = false;
+    let out = render(&state, 100, 24);
+    assert!(
+        out.contains("No files"),
+        "an empty tree shows guidance, not a blank pane\n{out}"
+    );
+}
+
+#[test]
+fn empty_state_directory_snapshot() {
+    // Snapshot the directory-selected empty state so the layout + the guidance are locked.
+    let mut state = sample_state();
+    state.selected = 0; // the /r/src directory
+    state.content = to_text("Directory — select a file to view");
+    state.notices.clear();
+    // SMA-342: directory selected → no file content → title falls back to the directory's name.
+    state.content_title = None;
+    state.content_rendering = false;
+    insta::assert_snapshot!("presenter_empty_directory", render(&state, 100, 24));
+}
+
+#[test]
+fn empty_state_no_files_snapshot() {
+    // Snapshot the empty-tree empty state.
+    let mut state = sample_state();
+    state.nodes = vec![];
+    state.selected = 0;
+    state.content = to_text("No files");
+    state.notices.clear();
+    // SMA-342: no file content displayed → title falls back to "Content" (no selected node).
+    state.content_title = None;
+    state.content_rendering = false;
+    insta::assert_snapshot!("presenter_empty_no_files", render(&state, 100, 24));
+}
+
+#[test]
+fn loading_state_snapshot_while_a_render_is_in_flight() {
+    // SMA-342: while an off-thread render for a newly-selected file is in flight, the content
+    // pane shows a loading placeholder body and a neutral "Content" title (NOT the still-loading
+    // selection's name). The controller's `dispatch_render` sets `content_rendering = true` and
+    // `content_title = None` (no content has landed yet — launch / re-root), so the Presenter
+    // falls back to "Content" instead of picking up the new selection's name. This snapshot locks
+    // that visual: the body is the placeholder and the border title is "Content".
+    let mut state = sample_state();
+    // The cursor has moved to README.md (index 4) but its render hasn't landed — the body is the
+    // placeholder and `content_title` is `None` (no content has landed at all yet, e.g. launch).
+    state.selected = 4; // README.md
+    state.content = to_text("Rendering\u{2026}");
+    state.notices.clear();
+    state.content_title = None;
+    state.content_rendering = true;
+    insta::assert_snapshot!("presenter_loading", render(&state, 100, 24));
 }

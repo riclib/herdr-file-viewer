@@ -9,8 +9,8 @@ mod common;
 
 use common::TempDir;
 use herdr_file_viewer::controller::{
-    Clipboard, Components, ContentProvider, Controller, EditorHandoff, GitService, RenderResult,
-    RootProviders,
+    Clipboard, Components, ContentProvider, Controller, EditorHandoff, EditorOutcome, GitService,
+    RenderResult, RootProviders,
 };
 use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::intent::Intent;
@@ -74,8 +74,8 @@ impl ContentProvider for FakeContent {
 
 struct FakeEditor;
 impl EditorHandoff for FakeEditor {
-    fn open(&mut self, _file: &Path) -> io::Result<bool> {
-        Ok(false)
+    fn open(&mut self, _file: &Path) -> EditorOutcome {
+        EditorOutcome::NoTakeover
     }
 }
 

@@ -94,6 +94,17 @@ pub struct ViewState {
     /// border. `None` outside a git repo or on a detached HEAD — in which case the bottom title is
     /// omitted entirely rather than showing a blank/placeholder branch (degrade gracefully).
     pub branch: Option<String>,
+    /// The content pane's border title, derived from the displayed content's file path (not the
+    /// live tree cursor), so the title switches in lockstep with the body — it never shows a
+    /// freshly-selected file's name before that file's content arrives (SMA-342). `None` while no
+    /// file's content has landed yet (launch, a re-root, or a directory/empty selection); the
+    /// Presenter then falls back to the selected node's name (a directory) or "Content" — unless
+    /// [`content_rendering`](Self::content_rendering) is set, in which case it uses a neutral
+    /// "Content" label so the title doesn't jump to the still-loading selection.
+    pub content_title: Option<String>,
+    /// True while an off-thread render for a file is in flight. The Presenter uses this to pick a
+    /// neutral title while the body shows the loading placeholder (SMA-342).
+    pub content_rendering: bool,
     /// When `Some`, the content pane is drawn through [`crate::highlight::apply`] to overlay
     /// match highlights on top of the rendered text (AC-9, AC-11). `None` ⇒ draw the content
     /// as-is (byte-identical to today — the `None` arm is just `state.content.clone()`).
@@ -534,13 +545,33 @@ fn draw_tree(frame: &mut Frame, area: Rect, state: &ViewState) {
 /// Draw the right column: a notices strip (if any) above the content pane. Returns the
 /// content viewport `(width, height)` so the controller can clamp scrolling to it.
 fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) {
-    let title = state
-        .nodes
-        .get(state.selected)
-        .map(|n| sanitize_label(&node_name(n)))
-        .unwrap_or_else(|| "Content".to_string());
+    // SMA-342: the title is derived from the DISPLAYED content's file (`content_title`), not the
+    // live tree cursor, so it switches in lockstep with the body — the pane never shows a newly-
+    // selected file's name over the previous file's body while the new render is in flight.
+    // `content_title` is `None` before any file's content has landed (launch, re-root, or a
+    // directory/empty selection); in that case fall back to the selected node's name (a directory)
+    // or "Content" — but only when NO render is in flight, otherwise the fallback would pick up
+    // the still-loading selection's name and re-introduce the title-ahead-of-body bug.
+    let title = if let Some(name) = &state.content_title {
+        sanitize_label(name)
+    } else if !state.content_rendering {
+        state
+            .nodes
+            .get(state.selected)
+            .map(|n| sanitize_label(&node_name(n)))
+            .unwrap_or_else(|| "Content".to_string())
+    } else {
+        "Content".to_string()
+    };
+    // A persistent `? help` hint rides the content block's bottom border, right-aligned —
+    // one short segment, sanitized (AC-27) like the other border titles, so a new user
+    // discovers the help overlay without opening it first (SMA-345). It shares the border
+    // row (not the layout), so it never crowds the content or steals a row.
+    let hint =
+        Line::styled(sanitize_label(HELP_HINT), Style::new().fg(Color::Reset)).right_aligned();
     let block = Block::bordered()
         .title(title)
+        .title_bottom(hint)
         .border_style(border_style(state.focus == Focus::Content));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1206,6 +1237,11 @@ const FINDER_PLACEHOLDER: &str = "> type to find a file…";
 
 /// The help overlay's top-left title (the box label).
 const HELP_TITLE: &str = "Help";
+/// The persistent discoverability hint shown on the content pane's bottom border — a
+/// right-aligned one-segment affordance that `?` opens help, visible on the default screen
+/// without opening any modal (SMA-345). Static (first-party), so no sanitization is needed
+/// beyond the defense-in-depth `sanitize_label` applied at the call site (AC-27).
+const HELP_HINT: &str = "? help";
 /// The help overlay's desired interior WIDTH (columns) before clamping to the frame. A generous
 /// fixed size (the changelog/about bodies are unbounded — the box does NOT size to content like the
 /// finder; it clamps to the frame and the body scrolls).

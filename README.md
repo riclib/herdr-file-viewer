@@ -62,7 +62,8 @@ right into the tree. It opens beside whatever you're doing and never touches you
   or any files.
 - **In-app help** — press `?` to open a view-only help overlay showing What's New (the latest
   changelog entries, rendered as markdown) and About (version, repo, license, and update status).
-  Keyboard and mouse; `Esc` or `q` closes it.
+  Keyboard and mouse; `Esc` or `q` closes it. A `? help` hint rides the content pane's bottom
+  border so the overlay is discoverable without already knowing the key.
 - **Git woven in** — per-file status markers (`M`/`A`/`D`/`?`), **colored** so changes read at
   a glance (changed files and folders containing changes are red, new files green); a
   changed-files-only filter; and a baseline you can switch between the merge-base of your

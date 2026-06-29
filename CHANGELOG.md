@@ -6,7 +6,35 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **Discoverability: a `? help` hint on the content pane's bottom border.** A new user no
+  longer has to guess that `?` opens the help overlay — a right-aligned `? help` segment now
+  rides the content block's bottom border, visible on the default screen without opening any
+  modal. One short segment; it shares the border row (not the layout), so it never crowds the
+  content or steals a row. Sanitized + clipped like the other border titles (AC-27). (SMA-345)
+- **Empty-state guidance for blank panes.** Selecting a directory now shows
+  `Directory — select a file to view` in the content pane (instead of a blank void), and an
+  empty / zero-match tree (no files, or a filter — changed-only / gitignore / hidden — that
+  matched nothing) shows `No files`. The copy flows through the normal content path. (SMA-345)
+
 ### Changed
+- **Renderer fallback notices no longer leak raw OS errors.** When an external renderer
+  (glow/delta/bat) is missing, times out, or otherwise fails, the viewer's fallback notice now
+  reports a short, actionable message — naming the missing binary and pointing to
+  `docs/renderers.md` for the not-found case — instead of the raw OS error string (e.g.
+  `No such file or directory (os error 2)`, which told you nothing you could act on). AC-24/AC-25
+  plain-text-plus-notice fallback is unchanged; the raw detail is retained behind a future
+  debug/verbose path, not the default notice. (SMA-343)
+- **Editor hand-off now distinguishes a launch failure from a non-zero editor exit.** Previously
+  any error from `open_in_editor` surfaced as `"Could not open editor: …"`, so a successful
+  launch that exited non-zero (e.g. a vim exit code) was misleadingly reported as a launch
+  failure. The `EditorHandoff` return is now an `EditorOutcome` enum — `NotLaunched(reason)` for
+  a process that never started (e.g. missing binary, no `$EDITOR`) vs `NonZeroExit(detail)` for a
+  process that ran and returned a failing status — and the controller words each case correctly:
+  a launch failure still says `"Could not open editor: {reason}"`, while a non-zero exit says
+  `"Editor exited with {detail}"` and still refreshes git state and forces a full repaint (the
+  editor did take the terminal). A new `SpawnError` enum at the `Spawner` boundary keeps
+  `LiveEditor`/`ProcessSpawner` the only place that knows about `std::process`. (SMA-344)
 - Extracted the duplicated `wait_bounded` subprocess reaper (child wait + poll + timeout-kill)
   from `render.rs` and `update/mod.rs` into one shared `src/proc.rs` helper. Pure dedup — no
   behavior change; the total wall-clock timeout bound is unchanged (the 4/4-model audit
@@ -60,6 +88,18 @@ All notable changes to this project are documented here. The format is based on
   previously unreachable are now exercised. Added an OSC-52 clipboard-exfiltration ingestion test
   (AC-27 named vector) on the content-renderer path, and gated the CLI smoke test's network path
   by setting `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` so it performs no network I/O (hermetic).
+
+### Fixed
+- **Content pane no longer shows a stale file under a new title while a render is in flight.**
+  On a slow off-thread render, the content pane used to keep displaying the PREVIOUS file's body
+  while the content title (derived from the live tree cursor) already named the NEW selection —
+  the pane briefly misrepresented what was selected. The content title is now derived from the
+  displayed content's file (`content_path`, updated only when the render result lands in `poll`),
+  so the title and body switch to the new file together; while a render is in flight the body
+  shows a `Rendering…` loading placeholder (and the title stays on the previously-displayed file,
+  or a neutral `Content` label at launch / after a re-root when no content has landed yet). The
+  existing `latest_seq`/`applied_seq` supersession already keyed stale-result dropping, so a
+  superseded render result (the user moved on) still does not overwrite the pane. (SMA-342)
 
 ## [1.6.0] - 2026-06-28
 

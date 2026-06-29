@@ -9,7 +9,8 @@ mod common;
 use common::{TempDir, git, init_repo_with_commit};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use herdr_file_viewer::controller::{
-    Components, ContentProvider, Controller, EditorHandoff, GitService, RenderResult, RootProviders,
+    Components, ContentProvider, Controller, EditorHandoff, EditorOutcome, GitService,
+    RenderResult, RootProviders,
 };
 use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::herdr::HerdrCli;
@@ -67,19 +68,27 @@ impl ContentProvider for StubContent {
     }
 }
 
-/// An Editor Launcher stub that either succeeds or fails on demand, and records the file it
-/// was asked to open.
+/// An Editor Launcher stub that returns a configurable [`EditorOutcome`] on demand, and
+/// records the file it was asked to open. `fail` keeps the historical "launch failure"
+/// shortcut; richer cases use `outcome` directly.
+#[derive(Default)]
 struct StubEditor {
     fail: bool,
     opened: Recorder<PathBuf>,
+    /// The exact outcome to return. `None` ⇒ `TookOver` when not failing (historical
+    /// default), or `NotLaunched` when `fail` is set.
+    outcome: Option<EditorOutcome>,
 }
 impl EditorHandoff for StubEditor {
-    fn open(&mut self, file: &Path) -> io::Result<bool> {
+    fn open(&mut self, file: &Path) -> EditorOutcome {
         self.opened.lock().unwrap().push(file.to_path_buf());
+        if let Some(o) = self.outcome.take() {
+            return o;
+        }
         if self.fail {
-            Err(io::Error::other("no editor configured"))
+            EditorOutcome::NotLaunched("no editor configured".into())
         } else {
-            Ok(true)
+            EditorOutcome::TookOver
         }
     }
 }
@@ -103,6 +112,7 @@ fn controller(
         editor: Box::new(StubEditor {
             fail: editor_fails,
             opened: opened.clone(),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -333,6 +343,173 @@ fn an_editor_handoff_error_becomes_a_nonfatal_notice() {
         "the failure is surfaced as a notice"
     );
     assert!(!fx.quit, "a component error does not end the session");
+}
+
+// ---- SMA-344: distinguish "couldn't launch editor" from a non-zero editor exit ----------
+
+/// Build a controller whose editor stub returns a specific [`EditorOutcome`] on the first
+/// `open`, recording the file it was asked to open. Hermetic — no editor is launched.
+fn controller_with_editor_outcome(
+    root: &Path,
+    is_git_repo: bool,
+    outcome: EditorOutcome,
+) -> (Controller, Recorder<PathBuf>) {
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let git: Arc<dyn GitService> = Arc::new(StubGit::default());
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::clone(&git),
+            content: Box::new(StubContent),
+        }),
+        editor: Box::new(StubEditor {
+            outcome: Some(outcome),
+            opened: opened.clone(),
+            ..Default::default()
+        }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let ctrl = Controller::new(
+        common::resolved(root.to_path_buf(), is_git_repo),
+        Baseline::Head,
+        components,
+    );
+    (ctrl, opened)
+}
+
+#[test]
+fn a_launch_failure_reports_could_not_open_editor() {
+    // SMA-344: when the editor process could not be started (e.g. missing binary), the
+    // notice must say "could not open editor" — the editor never ran.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    let (mut ctrl, opened) = controller_with_editor_outcome(
+        dir.path(),
+        false,
+        EditorOutcome::NotLaunched("editor not on PATH".into()),
+    );
+
+    let fx = ctrl.handle(Intent::OpenInEditor);
+    assert_eq!(
+        opened.lock().unwrap().len(),
+        1,
+        "the hand-off was attempted"
+    );
+    let notice = ctrl
+        .action_notice()
+        .expect("a launch failure sets a notice");
+    assert!(
+        notice.starts_with("Could not open editor:"),
+        "launch failure wording (got {notice:?})"
+    );
+    assert!(
+        notice.contains("editor not on PATH"),
+        "the launch reason is included (got {notice:?})"
+    );
+    assert!(!fx.quit, "a launch failure does not end the session");
+}
+
+#[test]
+fn a_non_zero_editor_exit_does_not_claim_the_editor_could_not_be_opened() {
+    // SMA-344: a successful launch that exits non-zero must NOT be reported as "could not
+    // open editor" — the editor DID run. The notice says "editor exited with …" instead.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    let (mut ctrl, opened) = controller_with_editor_outcome(
+        dir.path(),
+        false,
+        EditorOutcome::NonZeroExit("exit status: 1".into()),
+    );
+
+    let fx = ctrl.handle(Intent::OpenInEditor);
+    assert_eq!(opened.lock().unwrap().len(), 1, "the editor was launched");
+    let notice = ctrl.action_notice().expect("a non-zero exit sets a notice");
+    assert!(
+        !notice.starts_with("Could not open editor:"),
+        "a non-zero exit is NOT a launch failure (got {notice:?})"
+    );
+    assert!(
+        notice.contains("Editor exited with"),
+        "the non-zero-exit wording is used (got {notice:?})"
+    );
+    assert!(
+        notice.contains("exit status: 1"),
+        "the exit detail is included (got {notice:?})"
+    );
+    assert!(!fx.quit, "a non-zero exit does not end the session");
+}
+
+#[test]
+fn a_non_zero_editor_exit_still_refreshes_git_state_and_clears_the_screen() {
+    // SMA-344: even though a non-zero exit is not a launch failure, the editor DID take the
+    // terminal — so the controller must still re-query git (the file may have changed) and
+    // force a full repaint (the editor drew over the screen), exactly like a TookOver.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    // Use the shared `controller()` helper so we can inspect `changed_calls`; inject the
+    // NonZeroExit outcome by reconstructing the controller with the outcome-aware builder is
+    // not possible here, so drive it through a standalone controller built below.
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let git = StubGit::default();
+    let changed_calls = git.changed_calls.clone();
+    let git: Arc<dyn GitService> = Arc::new(git);
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::clone(&git),
+            content: Box::new(StubContent),
+        }),
+        editor: Box::new(StubEditor {
+            outcome: Some(EditorOutcome::NonZeroExit("exit status: 1".into())),
+            opened: opened.clone(),
+            ..Default::default()
+        }),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+    changed_calls.lock().unwrap().clear(); // ignore the initial load in new()
+
+    let fx = ctrl.handle(Intent::OpenInEditor);
+    assert_eq!(opened.lock().unwrap().len(), 1, "the editor was launched");
+    assert!(
+        !changed_calls.lock().unwrap().is_empty(),
+        "git state is re-queried after a non-zero editor exit (the editor may have edited)"
+    );
+    assert!(
+        fx.redraw && fx.clear,
+        "a non-zero exit still forces a full repaint (the editor drew over the screen)"
+    );
+    assert!(!fx.quit);
+}
+
+#[test]
+fn a_successful_takeover_refreshes_git_state_and_clears_the_screen() {
+    // SMA-344: the TookOver path (editor ran and exited 0) is unchanged — git is re-queried
+    // and a full repaint is forced. This is the baseline the NonZeroExit test above mirrors.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+    let (mut ctrl, changed_calls, opened) = controller(dir.path(), true, StubGit::default(), false);
+    changed_calls.lock().unwrap().clear(); // ignore the initial load in new()
+
+    let fx = ctrl.handle(Intent::OpenInEditor);
+    assert_eq!(opened.lock().unwrap().len(), 1, "the editor was invoked");
+    assert!(
+        !changed_calls.lock().unwrap().is_empty(),
+        "git state is re-queried after a successful editor return"
+    );
+    assert!(
+        fx.redraw && fx.clear,
+        "a successful takeover forces a full repaint"
+    );
+    assert!(
+        ctrl.action_notice().is_none(),
+        "a successful editor takeover sets no notice"
+    );
+    assert!(!fx.quit);
 }
 
 #[test]
@@ -626,6 +803,7 @@ fn controller_with_lines(root: &Path, n: usize) -> Controller {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -814,6 +992,7 @@ fn left_right_scroll_the_content_horizontally_when_focused_and_unwrapped() {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -886,6 +1065,7 @@ fn wrapped_content_scrolls_vertically_to_the_bottom_and_not_horizontally() {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -1521,6 +1701,7 @@ fn horizontal_wheel_scrolls_the_content_sideways() {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -1600,6 +1781,7 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -1708,6 +1890,7 @@ fn focus_gained_keeps_tree_and_content_in_sync_after_a_changed_only_refilter() {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -1752,6 +1935,7 @@ fn controller_with_clipboard(root: &Path, is_git_repo: bool) -> (Controller, Rec
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(clipboard),
         renderers: None,
@@ -5310,6 +5494,7 @@ fn changed_controller_with_lines(root: &Path, file: &str, n: usize) -> Controlle
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -5446,6 +5631,7 @@ fn controller_with_wrap_lines(root: &Path) -> Controller {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -5754,6 +5940,7 @@ fn controller_with_search_content(root: &Path) -> Controller {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -6478,6 +6665,7 @@ fn poll_clears_stale_committed_search_after_content_swap() {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -6496,7 +6684,8 @@ fn poll_clears_stale_committed_search_after_content_swap() {
     //   - latest_seq is bumped; the b.txt render job is in flight
     //   - We do NOT poll here — b.txt content has NOT arrived yet.
     ctrl.handle(Intent::NavDown);
-    // dispatch_render already cleared search; a.txt content is still displayed.
+    // dispatch_render already cleared search and swapped the body to the loading placeholder
+    // (SMA-342); the new file's content has not arrived yet.
 
     // Step 3: Open search and commit a search against the currently-displayed (stale) content.
     //   This is the race window: user opens `/` and hits Enter before poll() fires.
@@ -6719,6 +6908,7 @@ fn controller_with_sentinel_excluded_content(root: &Path) -> Controller {
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
@@ -7323,6 +7513,7 @@ fn controller_with_renderers(root: &std::path::Path, renderers: Renderers) -> Co
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: Some(renderers),
@@ -7665,8 +7856,10 @@ fn help_scroll_down_clamps_eagerly_in_handler() {
     ctrl.set_pane_geometry(geom);
 
     let max = wrapped_rows - height;
-    // Over-scroll far past the bottom with j.
-    for _ in 0..300 {
+    // Over-scroll far past the bottom with j. Pump well past any plausible max (raw_lines + 44
+    // here) so the clamp, not the pump count, is the limiting factor — robust against changelog
+    // growth (the help body renders the CHANGELOG).
+    for _ in 0..1000 {
         ctrl.handle_help_key(key(KeyCode::Char('j')));
     }
     let scroll = ctrl.help_state().unwrap().sections[0].scroll;
@@ -8209,6 +8402,7 @@ fn controller_counting_git(root: &Path, is_git_repo: bool) -> (Controller, Recor
         editor: Box::new(StubEditor {
             fail: false,
             opened: Arc::new(Mutex::new(Vec::new())),
+            ..Default::default()
         }),
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,

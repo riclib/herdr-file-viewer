@@ -7,10 +7,10 @@
 //! via the hook `ratatui::try_init` installs.
 
 use crate::controller::{
-    Clipboard, Components, ContentProvider, Controller, EditorHandoff, GitService, RenderResult,
-    RootProviders,
+    Clipboard, Components, ContentProvider, Controller, EditorHandoff, EditorOutcome, GitService,
+    RenderResult, RootProviders,
 };
-use crate::editor::{EditorLauncher, Spawner};
+use crate::editor::{EditorLauncher, SpawnError, Spawner};
 use crate::git::{self, Baseline, Status};
 use crate::presenter::{self, ViewState};
 use crate::render::{self, Prepared, Renderers};
@@ -299,10 +299,10 @@ struct LiveEditor {
 }
 
 impl EditorHandoff for LiveEditor {
-    fn open(&mut self, file: &Path) -> io::Result<bool> {
+    fn open(&mut self, file: &Path) -> EditorOutcome {
         let Some(editor) = self.editor.clone() else {
             // No terminal change yet, so nothing to restore.
-            return Err(io::Error::other("no editor configured (set $EDITOR)"));
+            return EditorOutcome::NotLaunched("no editor configured (set $EDITOR)".into());
         };
         // Once we touch the terminal we must always try to restore it, even if suspending or
         // the editor itself fails — otherwise the viewer would keep running with raw mode off
@@ -316,10 +316,28 @@ impl EditorHandoff for LiveEditor {
         };
         let resumed = resume_tui();
         // Report the first failure in order: suspend, then the editor, then restore.
-        suspended?;
-        launched?;
-        resumed?;
-        Ok(true) // the editor drew over the screen → the run loop forces a full repaint
+        let suspend_err = suspended.err();
+        let launched_err = launched.err();
+        let resume_err = resumed.err();
+        if let Some(e) = suspend_err {
+            return EditorOutcome::NotLaunched(e.to_string());
+        }
+        if let Some(e) = launched_err {
+            // Distinguish a launch failure from a successful launch that exited non-zero
+            // (SMA-344): only NotLaunched is reported as "could not open editor".
+            return match e {
+                SpawnError::NotLaunched(e) => EditorOutcome::NotLaunched(e.to_string()),
+                SpawnError::NonZeroExit(detail) => EditorOutcome::NonZeroExit(detail),
+            };
+        }
+        if let Some(e) = resume_err {
+            // The editor ran (or the no-op path took over nothing); the terminal restore
+            // failed, which is a launch-side problem rather than an editor exit — surface it
+            // as NotLaunched so the wording stays accurate.
+            return EditorOutcome::NotLaunched(e.to_string());
+        }
+        // The editor drew over the screen → the run loop forces a full repaint.
+        EditorOutcome::TookOver
     }
 }
 
@@ -376,15 +394,23 @@ fn base64_encode(input: &[u8]) -> String {
 struct ProcessSpawner;
 
 impl Spawner for ProcessSpawner {
-    fn spawn(&mut self, argv: &[OsString]) -> io::Result<()> {
+    fn spawn(&mut self, argv: &[OsString]) -> Result<(), SpawnError> {
         let (prog, args) = argv
             .split_first()
-            .ok_or_else(|| io::Error::other("empty editor command"))?;
-        let status = Command::new(prog).args(args).status()?;
+            .ok_or_else(|| SpawnError::NotLaunched(io::Error::other("empty editor command")))?;
+        // A failed `Command::status` (e.g. the binary is not on PATH) is a launch failure —
+        // the editor never ran. Map it through `NotLaunched` so the controller words the
+        // notice as "could not open editor" rather than as an editor exit (SMA-344).
+        let status = Command::new(prog)
+            .args(args)
+            .status()
+            .map_err(SpawnError::NotLaunched)?;
         if status.success() {
             Ok(())
         } else {
-            Err(io::Error::other(format!("editor exited with {status}")))
+            // The editor launched and ran; only its exit code is non-zero. Reported separately
+            // so the controller says "editor exited with …", not "could not open editor".
+            Err(SpawnError::NonZeroExit(format!("{status}")))
         }
     }
 }
