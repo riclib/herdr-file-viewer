@@ -8,6 +8,21 @@
 use ignore::WalkBuilder;
 use std::path::Path;
 
+/// The shared base for the crate's two gitignore-aware walks — this File Index and the Tree
+/// Model (`tree.rs`). Sets the hermetic policy both share so it lives in one place: honor an
+/// ancestor `.gitignore`, ignore the user's global gitignore and generic `.ignore` files, and
+/// apply `.gitignore` even outside a git repo. The caller sets what differs between the two
+/// walks — depth, dotfile hiding, and whether `.gitignore`/`.git/info/exclude` are honored.
+pub(crate) fn walk_builder(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .parents(true) // honor ancestor .gitignore for correct nested semantics
+        .git_global(false) // hermetic: ignore the user's global gitignore
+        .ignore(false) // only git ignore sources, not generic .ignore files
+        .require_git(false); // honor .gitignore even outside a git repo (AC-13, AC-19, AC-4, AC-26)
+    builder
+}
+
 /// Return every file under `root` as a root-relative `String`, respecting `.gitignore`.
 ///
 /// - Recursive (no depth limit) — AC-12.
@@ -19,13 +34,9 @@ use std::path::Path;
 /// - Works in non-git directories without error (`require_git(false)`) — AC-19.
 /// - Read-only: no filesystem or git mutations — AC-N1, AC-N2.
 pub fn build(root: &Path) -> Vec<String> {
-    let mut builder = WalkBuilder::new(root);
+    let mut builder = walk_builder(root);
     builder
         .hidden(false) // include dotfiles (AC-17 depends on the index NOT hiding dotfiles)
-        .parents(true) // honor ancestor .gitignore for correct nested semantics
-        .git_global(false) // hermetic: ignore the user's global gitignore
-        .ignore(false) // only git ignore sources, not generic .ignore files
-        .require_git(false) // honor .gitignore even outside a git repo (AC-13, AC-19)
         .git_ignore(true)
         .git_exclude(true)
         .filter_entry(|e| e.file_name() != ".git"); // prune entire .git subtree — AC-14

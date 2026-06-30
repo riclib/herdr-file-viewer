@@ -227,6 +227,79 @@ struct RenderJob {
 /// the `poll` that applies them.
 type StatusResult = (BTreeMap<PathBuf, Status>, BTreeMap<PathBuf, Status>);
 
+/// The single open modal overlay, or [`Modal::None`] when the columns have focus. Collapses what
+/// were four parallel `Option<…State>` fields (picker / finder / prompt / help) into one value, so
+/// "at most one modal is open at a time" is enforced by the type rather than by hand: opening any
+/// modal (`self.modal = Modal::Picker(…)`) implicitly closes whatever else was open, and a single
+/// `Modal::None` closes the lot (the old per-field teardown in [`re_root`](Controller::re_root)).
+/// The variants:
+/// - `Picker` — the worktree picker (AC-1); a re-root closes it (its candidate list is old-root).
+/// - `Finder` — the go-to-file finder (AC-1), opened by `f`; closed by confirm/cancel/re-root.
+/// - `Prompt` — the in-file-nav bottom prompt (go-to-line / search). While open the run loop routes
+///   raw keys to `handle_prompt_key` and the mouse is inert, so the selection can't change beneath it.
+/// - `Help` — the help overlay (AC-1, AC-6), opened by `?`; dismissed by Esc/`q`. While open,
+///   `handle()`/`handle_mouse()` return early (AC-N4).
+enum Modal {
+    None,
+    Picker(PickerState),
+    Finder(FinderState),
+    Prompt(PromptState),
+    Help(HelpState),
+}
+
+impl Modal {
+    /// The picker state when the picker is the open modal, else `None` — the enum's `Option<&_>`
+    /// view, so call sites read like the old `self.modal.picker()`.
+    fn picker(&self) -> Option<&PickerState> {
+        match self {
+            Modal::Picker(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn picker_mut(&mut self) -> Option<&mut PickerState> {
+        match self {
+            Modal::Picker(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn finder(&self) -> Option<&FinderState> {
+        match self {
+            Modal::Finder(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn finder_mut(&mut self) -> Option<&mut FinderState> {
+        match self {
+            Modal::Finder(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn prompt(&self) -> Option<&PromptState> {
+        match self {
+            Modal::Prompt(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn prompt_mut(&mut self) -> Option<&mut PromptState> {
+        match self {
+            Modal::Prompt(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn help(&self) -> Option<&HelpState> {
+        match self {
+            Modal::Help(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn help_mut(&mut self) -> Option<&mut HelpState> {
+        match self {
+            Modal::Help(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 /// The interaction orchestrator and the ephemeral session state.
 pub struct Controller {
     root: PathBuf,
@@ -319,19 +392,12 @@ pub struct Controller {
     /// One-shot receiver for a re-root's off-thread status/changed-set computation (AC-17).
     /// `Some` between a re-root and the tick that applies the result; `None` otherwise.
     status_rx: Option<mpsc::Receiver<StatusResult>>,
-    /// The open worktree picker's state, or `None` when closed (AC-1). A re-root closes it
-    /// (AC-13); the switch itself is wired in later tasks.
-    picker: Option<PickerState>,
-    /// The open go-to-file finder's state, or `None` when closed (AC-1). Opened by the `f` key
-    /// (OpenFinder intent); closed by confirm/cancel and by [`re_root`](Self::re_root) (a
-    /// re-root invalidates the old-root candidate list).
-    finder: Option<FinderState>,
-    /// The open in-file-nav bottom prompt (go-to-line), or `None` when closed. While `Some`, the run
-    /// loop routes raw keys to `handle_prompt_key` and the mouse is inert ([`handle_mouse`]
-    /// returns early), so the selection can't change under an open prompt. Closed by confirm/cancel
-    /// and by [`re_root`](Self::re_root) (symmetric with the picker/finder teardown).
-    /// Mutually exclusive with the picker/finder modals.
-    prompt: Option<PromptState>,
+    /// The single open modal overlay (picker / finder / prompt / help), or [`Modal::None`] when the
+    /// columns have focus. One field instead of four parallel `Option`s, so mutual exclusion is
+    /// type-enforced — see [`Modal`]. A re-root resets it to `Modal::None` (the old symmetric
+    /// per-modal teardown), since a re-root invalidates the picker/finder old-root candidate lists
+    /// and must not strand a prompt/help over the freshly re-rooted tree.
+    modal: Modal,
     /// The herdr query channel for the agent-active overlay (AC-3), injected post-construction
     /// via [`set_host`](Self::set_host). `None` until then ⇒ a git-only picker (AC-15).
     /// Session-level — survives a re-root unchanged.
@@ -370,10 +436,6 @@ pub struct Controller {
     /// search + its highlighting (AC-20). The incremental-typing path (`refresh_search`) does NOT
     /// call `dispatch_render`, so live typing is never wiped by that clear.
     search: Option<SearchState>,
-    /// The open help overlay's state, or `None` when closed (AC-1, AC-6). Opened by the `?`
-    /// key (ShowHelp intent); dismissed by Esc/`q`. Modal — while `Some`, handle() and
-    /// handle_mouse() return early (AC-N4).
-    help: Option<HelpState>,
 }
 
 impl Controller {
@@ -457,13 +519,10 @@ impl Controller {
             update_dismissed: false,
             update_rx: None,
             status_rx: None,
-            picker: None,
-            finder: None,
-            prompt: None,
+            modal: Modal::None,
             pending_goto: None,
             applied_seq: 0,
             search: None,
-            help: None,
             herdr: None,
             our_workspace_id: None,
             base_branch,
@@ -605,21 +664,12 @@ impl Controller {
         self.content_path = None;
         self.action_notice = None;
         self.changed = BTreeMap::new();
-        self.picker = None;
-        // Close the finder too (symmetric teardown). A re-root invalidates its candidate list,
-        // which is rooted at the OLD root — a stale `confirm_finder` would then `root.join(old_rel)`
-        // against the NEW root and reveal nothing. Unreachable today (finder/picker are mutually
-        // exclusive and re_root only fires via picker-confirm), but kept structural so a future
-        // re-root trigger can't strand a finder.
-        self.finder = None;
-        // Close the go-to-line prompt too (symmetric teardown). Unreachable today — the prompt is
-        // modal and re_root only fires via picker-confirm — but kept structural so a future re-root
-        // trigger can't strand an open prompt over a freshly re-rooted tree.
-        self.prompt = None;
-        // Close the help overlay too (symmetric teardown). Inert today — help is modal and can't be
-        // open during a re-root — but matches the other modal teardowns so a future re-root trigger
-        // can't strand an open overlay over a freshly re-rooted tree.
-        self.help = None;
+        // Close whatever modal is open (one assignment, since `modal` is now a single value). A
+        // re-root only fires via picker-confirm, so in practice it's the picker being torn down —
+        // but a re-root also invalidates the finder's old-root candidate list and must not strand a
+        // prompt/help over the freshly re-rooted tree, so closing the lot here stays correct for any
+        // future re-root trigger.
+        self.modal = Modal::None;
         self.last_click = None;
 
         // PREFERENCES ARE CARRIED (AC-12) — deliberately NOT reset: show_ignored, hide_hidden,
@@ -719,7 +769,7 @@ impl Controller {
     /// The open worktree picker's state, or `None` when it is closed. Exposed so the Presenter
     /// can draw it and tests can assert the rows / pre-selected cursor.
     pub fn picker(&self) -> Option<&PickerState> {
-        self.picker.as_ref()
+        self.modal.picker()
     }
 
     /// Whether a re-root's off-thread status/changed-set fetch is still pending (not yet applied
@@ -817,13 +867,13 @@ impl Controller {
         let help_body_height = geom.help_body_height;
         let help_body_rows = geom.help_body_rows;
         self.geom = geom;
-        if let Some(finder) = self.finder.as_mut() {
+        if let Some(finder) = self.modal.finder_mut() {
             finder.clamp_hscroll(finder_max_hscroll);
         }
-        if let Some(picker) = self.picker.as_mut() {
+        if let Some(picker) = self.modal.picker_mut() {
             picker.clamp_hscroll(picker_max_hscroll);
         }
-        if let Some(help) = self.help.as_mut() {
+        if let Some(help) = self.modal.help_mut() {
             help.clamp_scroll(help_body_rows, help_body_height);
         }
     }
@@ -912,7 +962,7 @@ impl Controller {
     ///   2. Committed search (no open prompt) → query + count + n/N/Esc hint.
     ///   3. Neither → `None` (Presenter draws nothing on the bottom row).
     fn bottom_line(&self) -> Option<String> {
-        if let Some(p) = &self.prompt {
+        if let Some(p) = self.modal.prompt() {
             match p.mode {
                 crate::infile::PromptMode::GoToLine => {
                     Some(format!("Go to line: {}", p.input.query()))
@@ -971,7 +1021,7 @@ impl Controller {
     /// display string is the worktree's full path — informative for choosing among worktrees. The
     /// Presenter sanitizes the strings (AC-27) and renders the detached/current/agent markers.
     fn picker_view(&self) -> Option<PickerView> {
-        let picker = self.picker.as_ref()?;
+        let picker = self.modal.picker()?;
         Some(PickerView {
             rows: picker
                 .rows
@@ -996,7 +1046,7 @@ impl Controller {
     /// Presenter is borrow-free; carries the current query and cursor. The Presenter sanitizes the
     /// path strings (AC-27) and renders the query-input line + placeholder + match rows.
     fn finder_view(&self) -> Option<FinderView> {
-        let f = self.finder.as_ref()?;
+        let f = self.modal.finder()?;
         Some(FinderView {
             query: f.query().to_string(),
             matches: f
@@ -1015,7 +1065,7 @@ impl Controller {
     /// self-operating key-hints footer string (AC-11). The footer is built here so the Presenter
     /// stays mode-agnostic — it shows, at minimum, how to switch sections and how to close.
     fn help_view(&self) -> Option<HelpView> {
-        let help = self.help.as_ref()?;
+        let help = self.modal.help()?;
         let active = help.active_index();
         let labels: Vec<String> = help
             .section_labels()
@@ -1062,24 +1112,24 @@ impl Controller {
         self.action_notice = None;
         // Modal: while the picker is open, Nav/Activate/Close drive the picker, not the tree;
         // every other intent is inert (a modal selection). (AC-5)
-        if self.picker.is_some() {
+        if self.modal.picker().is_some() {
             return self.handle_picker_intent(intent);
         }
         // The finder is modal too: while it is open the run loop (app.rs) routes raw keys to
         // `handle_finder_key`, so `handle` should not be reached. Guard structurally anyway —
         // symmetric with the picker guard above — so a future or test caller can't leak an intent
         // to the tree or open a second modal beneath the finder overlay.
-        if self.finder.is_some() {
+        if self.modal.finder().is_some() {
             return Effects::noop();
         }
         // A prompt is modal too: the run loop routes raw keys to handle_prompt_key while it is open, so
         // handle() should not be reached. Guard structurally — symmetric with the finder guard.
-        if self.prompt.is_some() {
+        if self.modal.prompt().is_some() {
             return Effects::noop();
         }
         // The help overlay is modal: while it is open, all other intents are inert. The run loop
         // routes keys to handle_help_key instead; this guard mirrors finder/prompt.
-        if self.help.is_some() {
+        if self.modal.help().is_some() {
             return Effects::noop();
         }
         match intent {
@@ -1124,7 +1174,7 @@ impl Controller {
     fn handle_picker_intent(&mut self, intent: Intent) -> Effects {
         match intent {
             Intent::NavUp => {
-                if let Some(p) = self.picker.as_mut()
+                if let Some(p) = self.modal.picker_mut()
                     && p.cursor > 0
                 {
                     p.cursor -= 1;
@@ -1133,7 +1183,7 @@ impl Controller {
                 Effects::noop()
             }
             Intent::NavDown => {
-                if let Some(p) = self.picker.as_mut()
+                if let Some(p) = self.modal.picker_mut()
                     && p.cursor + 1 < p.rows.len()
                 {
                     p.cursor += 1;
@@ -1145,7 +1195,7 @@ impl Controller {
                 // Right (→/l): scroll the overlay rows right so a long path can be read sideways.
                 // Monotonic here — the Presenter clamps to the live inner width at draw, so an
                 // over-scroll past the widest row is harmless and not surfaced to the controller.
-                if let Some(p) = self.picker.as_mut() {
+                if let Some(p) = self.modal.picker_mut() {
                     let next = p.hscroll.saturating_add(HSCROLL_STEP);
                     if next != p.hscroll {
                         p.hscroll = next;
@@ -1156,7 +1206,7 @@ impl Controller {
             }
             Intent::Collapse => {
                 // Left (←/h): scroll the overlay rows left, clamped at the left edge (0).
-                if let Some(p) = self.picker.as_mut()
+                if let Some(p) = self.modal.picker_mut()
                     && p.hscroll > 0
                 {
                     p.hscroll = p.hscroll.saturating_sub(HSCROLL_STEP);
@@ -1172,11 +1222,11 @@ impl Controller {
                 // empty rows and the cursor is bounds-clamped, but the invariant is distant —
                 // use a local guard so a future change cannot introduce a panic.
                 let target = self
-                    .picker
-                    .as_ref()
+                    .modal
+                    .picker()
                     .and_then(|p| p.rows.get(p.cursor))
                     .map(|w| w.path.clone());
-                self.picker = None;
+                self.modal = Modal::None;
                 if let Some(target) = target {
                     self.re_root(&target);
                 }
@@ -1184,7 +1234,7 @@ impl Controller {
             }
             Intent::Close => {
                 // Cancel: close the picker; nothing else changes (AC-6).
-                self.picker = None;
+                self.modal = Modal::None;
                 Effects::redraw()
             }
             // Modal: any other intent is inert while picking.
@@ -1197,30 +1247,28 @@ impl Controller {
     /// still works (herdr reserves Shift+mouse for exactly that). Selection/activation happen
     /// on button *release*, so a divider drag is never mistaken for a click.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> Effects {
-        // Modal: while the picker is open the mouse is fully inert — the picker is
-        // keyboard-only. This mirrors the keyboard modal gate in `handle`.
-        if self.picker.is_some() {
-            return Effects::noop();
+        // Modal gate, exhaustive over `Modal` (so a new overlay variant forces a mouse-routing
+        // decision here, mirroring the keyboard gate in `handle`):
+        // - Picker / Prompt are keyboard-only — swallow the mouse entirely. Without this a
+        //   click/wheel would reach the tree/content beneath and change the selection under the
+        //   modal, so a later confirm would act on the WRONG file (or strand an override on a dir).
+        // - Help / Finder ARE mouse-interactive (wheel scrolls, click selects/switches): route to
+        //   their own handler, which consumes every event and never leaks to the columns (AC-21).
+        // - None: no modal → the two-column mouse handler below.
+        match self.modal {
+            Modal::Picker(_) | Modal::Prompt(_) => Effects::noop(),
+            Modal::Help(_) => self.handle_help_mouse(ev),
+            Modal::Finder(_) => self.handle_finder_mouse(ev),
+            Modal::None => self.handle_column_mouse(ev),
         }
-        // The go-to-line prompt is keyboard-only too: the run loop routes only KEY events to
-        // `handle_prompt_key`, so without this guard a click/wheel would still reach the tree/content
-        // beneath and change the selection mid-prompt — then a confirm would jump (or auto-switch) the
-        // WRONG file, or strand a bogus override on a directory. Make the mouse inert, like the picker.
-        if self.prompt.is_some() {
-            return Effects::noop();
-        }
-        // The help overlay is modal but IS mouse-interactive (like the finder): the wheel scrolls
-        // the active section's body and a click on a section tab switches sections. Route to its own
-        // handler, which consumes every event and never leaks to the tree/content beneath (AC-21).
-        if self.help.is_some() {
-            return self.handle_help_mouse(ev);
-        }
-        // The finder is also a modal overlay, but it IS mouse-interactive: wheel scrolls the
-        // selection, click selects a result row, double-click confirms. Route to the finder's
-        // own handler; it never leaks to the tree/content beneath.
-        if self.finder.is_some() {
-            return self.handle_finder_mouse(ev);
-        }
+    }
+
+    /// Handle a mouse event over the two columns, with no modal open (the [`handle_mouse`] gate
+    /// routes here only for [`Modal::None`]). Shift+mouse is inert so the terminal can do its own
+    /// text selection; otherwise the wheel scrolls the column under the pointer, a left press
+    /// starts a divider or scrollbar drag (scrollbars also jump to the pressed position), and a
+    /// left release is a click — unless it ended a drag, in which case it's consumed.
+    fn handle_column_mouse(&mut self, ev: MouseEvent) -> Effects {
         if ev.modifiers.contains(KeyModifiers::SHIFT) {
             return Effects::noop();
         }
@@ -1297,7 +1345,7 @@ impl Controller {
             // Horizontal wheel: scroll the result rows sideways, mirroring the vertical-wheel
             // handling above. Additive to the keyboard ←/→ scroll (AC-18 keyboard-first).
             MouseEventKind::ScrollRight => {
-                if let Some(f) = self.finder.as_mut() {
+                if let Some(f) = self.modal.finder_mut() {
                     f.scroll_right();
                     Effects::redraw()
                 } else {
@@ -1305,7 +1353,7 @@ impl Controller {
                 }
             }
             MouseEventKind::ScrollLeft => {
-                if let Some(f) = self.finder.as_mut() {
+                if let Some(f) = self.modal.finder_mut() {
                     f.scroll_left();
                     Effects::redraw()
                 } else {
@@ -1360,13 +1408,16 @@ impl Controller {
             return Effects::noop();
         };
         let (rel, span) = Self::track_fraction(row, track.y, track.height);
-        let Some(finder) = self.finder.as_mut() else {
+        let Some(finder) = self.modal.finder_mut() else {
             return Effects::noop();
         };
         let total = finder.matches().len();
         if span == 0 || total == 0 {
             return Effects::noop();
         }
+        // Its own mapping, not the shared `track_to_offset`: with a single match the finder maps a
+        // drag to index 0 and selects it, whereas `track_to_offset` no-ops at a zero range — a
+        // deliberate difference for the modal list, so the rounding stays inline here.
         let max = (total - 1) as u32;
         let idx = ((rel * max + span / 2) / span) as usize;
         finder.set_cursor(idx);
@@ -1376,7 +1427,7 @@ impl Controller {
     /// Move the finder selection by `delta` rows (positive = down, negative = up), clamped. A
     /// no-op when the finder is closed or the match list is empty.
     fn finder_move_selection(&mut self, delta: isize) -> Effects {
-        if let Some(f) = self.finder.as_mut() {
+        if let Some(f) = self.modal.finder_mut() {
             f.move_selection(delta);
             Effects::redraw()
         } else {
@@ -1402,7 +1453,7 @@ impl Controller {
         }
         // Map screen row → absolute match-list index.
         let idx = self.geom.finder_scroll as usize + (row - rows_rect.y) as usize;
-        let Some(finder) = self.finder.as_ref() else {
+        let Some(finder) = self.modal.finder() else {
             return Effects::noop();
         };
         if idx >= finder.matches().len() {
@@ -1414,7 +1465,7 @@ impl Controller {
         let double = is_double_click(self.last_click, (col, row), now);
         self.last_click = Some((col, row, now));
         // Set the finder cursor to the clicked row.
-        if let Some(f) = self.finder.as_mut() {
+        if let Some(f) = self.modal.finder_mut() {
             f.set_cursor(idx);
         }
         if double {
@@ -1457,7 +1508,7 @@ impl Controller {
                     .find(|(_, r)| r.contains(pos))
                     .map(|(idx, _)| *idx);
                 if let Some(idx) = hit
-                    && let Some(help) = self.help.as_mut()
+                    && let Some(help) = self.modal.help_mut()
                 {
                     help.select(idx);
                     return Effects::redraw();
@@ -1476,7 +1527,7 @@ impl Controller {
     /// post-draw clamp in [`set_pane_geometry`](Self::set_pane_geometry) stays the resize backstop.
     fn help_scroll(&mut self, delta: isize) -> Effects {
         let (rows, height) = (self.geom.help_body_rows, self.geom.help_body_height);
-        if let Some(help) = self.help.as_mut() {
+        if let Some(help) = self.modal.help_mut() {
             help.scroll_by(delta as i32);
             // Eager clamp only once a frame has measured the body (rows > 0) — see handle_help_key.
             if rows > 0 {
@@ -1595,6 +1646,21 @@ impl Controller {
         (rel, len.saturating_sub(1) as u32)
     }
 
+    /// Map a press/drag at `pos` on a scrollbar track `[start, start + len)` onto an offset in
+    /// `[0, max]`, rounded to the nearest integer. `None` (the caller no-ops) when the mapping is
+    /// degenerate — a 1-cell track (`span == 0`) or a zero range (`max == 0`). The single
+    /// track→offset rounding rule every linear scrollbar drag shares: a vertical bar passes the
+    /// row + track `y`/`height`, a horizontal bar the col + track `x`/`width`. (The finder maps a
+    /// drag to a *match index* and intentionally differs at the degenerate boundary, so it keeps
+    /// its own mapping — see `finder_scroll_to_row`.)
+    fn track_to_offset(pos: u16, start: u16, len: u16, max: u32) -> Option<u32> {
+        let (rel, span) = Self::track_fraction(pos, start, len);
+        if span == 0 || max == 0 {
+            return None;
+        }
+        Some((rel * max + span / 2) / span)
+    }
+
     /// Map a vertical press/drag on the content scrollbar track to a content scroll offset. The
     /// track is the fed-back `content_vbar` rect; the fraction maps linearly onto
     /// `[0, max_content_scroll]`, rounded to the nearest line. No-op without overflow.
@@ -1602,12 +1668,12 @@ impl Controller {
         let Some(track) = self.geom.content_vbar else {
             return Effects::noop();
         };
-        let max = self.max_content_scroll();
-        let (rel, span) = Self::track_fraction(row, track.y, track.height);
-        if span == 0 || max == 0 {
+        let Some(off) =
+            Self::track_to_offset(row, track.y, track.height, self.max_content_scroll() as u32)
+        else {
             return Effects::noop();
-        }
-        self.content_scroll = ((rel * max as u32 + span / 2) / span) as u16;
+        };
+        self.content_scroll = off as u16;
         Effects::redraw()
     }
 
@@ -1616,12 +1682,12 @@ impl Controller {
         let Some(track) = self.geom.content_hbar else {
             return Effects::noop();
         };
-        let max = self.max_content_hscroll();
-        let (rel, span) = Self::track_fraction(col, track.x, track.width);
-        if span == 0 || max == 0 {
+        let Some(off) =
+            Self::track_to_offset(col, track.x, track.width, self.max_content_hscroll() as u32)
+        else {
             return Effects::noop();
-        }
-        self.content_hscroll = ((rel * max as u32 + span / 2) / span) as u16;
+        };
+        self.content_hscroll = off as u16;
         Effects::redraw()
     }
 
@@ -1631,11 +1697,10 @@ impl Controller {
             return Effects::noop();
         };
         let max = self.geom.tree_content_width.saturating_sub(track.width);
-        let (rel, span) = Self::track_fraction(col, track.x, track.width);
-        if span == 0 || max == 0 {
+        let Some(off) = Self::track_to_offset(col, track.x, track.width, max as u32) else {
             return Effects::noop();
-        }
-        self.tree_hscroll = ((rel * max as u32 + span / 2) / span) as u16;
+        };
+        self.tree_hscroll = off as u16;
         Effects::redraw()
     }
 
@@ -1647,11 +1712,14 @@ impl Controller {
             return Effects::noop();
         };
         let len = self.tree.visible_nodes().len();
-        let (rel, span) = Self::track_fraction(row, track.y, track.height);
-        if span == 0 || len <= 1 {
+        // `max = len - 1` (the last index): a 1-cell track or a list of ≤ 1 node yields `None` here,
+        // exactly the old `span == 0 || len <= 1` no-op.
+        let Some(idx) =
+            Self::track_to_offset(row, track.y, track.height, len.saturating_sub(1) as u32)
+        else {
             return Effects::noop();
-        }
-        let idx = ((rel * (len as u32 - 1) + span / 2) / span) as usize;
+        };
+        let idx = idx as usize;
         self.focus = Focus::Tree;
         // A drag fires many events on the same row; only re-select (and re-render the content, an
         // expensive job) when the target actually changes, so a held scrub doesn't re-render the
@@ -1801,15 +1869,12 @@ impl Controller {
     /// the display-row offset of a source line), so the scroll clamp and the go-to-line target are
     /// computed by the SAME wrapping logic and therefore always agree (AC-3/AC-4).
     fn wrapped_rows_before(&self, n: usize) -> usize {
-        let w = self.content_width.max(1) as usize;
+        let w = self.content_width as usize;
         self.content
             .lines
             .iter()
             .take(n)
-            .map(|l| {
-                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-                crate::text_layout::wrapped_rows(&text, w).max(l.width().max(1).div_ceil(w))
-            })
+            .map(|l| crate::text_layout::line_wrapped_rows(l, w))
             .sum::<usize>()
     }
 
@@ -1944,8 +2009,7 @@ impl Controller {
         };
         // Recompute the changed-set against the new baseline (AC-16) and keep the changed-only
         // filter consistent with it.
-        self.changed = self.git.changed_set(self.baseline);
-        self.tree.set_changed_only(self.changed_only, &self.changed);
+        self.set_changed(self.git.changed_set(self.baseline));
         // Drop any pending re-root async status fetch: this synchronous
         // recompute is now authoritative, so a stale in-flight async result must not clobber
         // it in `poll`. Invariant: every synchronous git-state recompute invalidates a pending
@@ -2041,11 +2105,11 @@ impl Controller {
         // A filename is untrusted — an attacker can craft one in a browsed repo, and a path may
         // legally contain control bytes: ESC/BEL (a terminal escape, e.g. a forged OSC 52) or a
         // newline that would paste-inject into a shell. Strip them before the path reaches the
-        // clipboard *or* the notice — the same defense `sanitize_label` applies to every other
-        // filesystem-derived string we display. (The OSC 52 payload is base64-encoded only for
+        // clipboard *or* the notice — the same AC-27 neutralizer the Presenter applies to every
+        // filesystem-derived string it displays. (The OSC 52 payload is base64-encoded only for
         // transport; the terminal decodes it back to this exact string onto the clipboard, so the
         // encoding alone does not make a control-bearing path safe to paste.)
-        let text: String = raw.chars().filter(|c| !c.is_control()).collect();
+        let text = crate::text_layout::sanitize_control(&raw);
         self.action_notice = Some(match self.clipboard.copy(&text) {
             Ok(()) => format!("Copied {text}"),
             Err(e) => format!("Could not copy path: {e}"),
@@ -2189,7 +2253,7 @@ impl Controller {
             })
             .and_then(|active| rows.iter().position(|w| w.path == active))
             .unwrap_or(current_idx);
-        self.picker = Some(PickerState {
+        self.modal = Modal::Picker(PickerState {
             rows,
             agent_statuses,
             cursor,
@@ -2203,11 +2267,11 @@ impl Controller {
     /// Returns [`Effects::redraw`] so the run loop paints the overlay on the next tick.
     ///
     /// Modal mutual-exclusion (finder inert while the picker is open) holds BY CONSTRUCTION:
-    /// `handle()` routes to `handle_picker_intent()` while `self.picker.is_some()`, and its
+    /// `handle()` routes to `handle_picker_intent()` while `self.modal.picker().is_some()`, and its
     /// catch-all `_ => Effects::noop()` swallows `OpenFinder`. No extra guard is needed here.
     fn open_finder(&mut self) -> Effects {
         let candidates = crate::index::build(&self.root);
-        self.finder = Some(FinderState::new(candidates));
+        self.modal = Modal::Finder(FinderState::new(candidates));
         self.last_click = None; // opening the finder resets double-click state so a prior tree
         // click cannot pair with the first finder click as a double-click
         Effects::redraw()
@@ -2215,7 +2279,7 @@ impl Controller {
 
     /// Whether the go-to-file finder overlay is currently open.
     pub fn finder_open(&self) -> bool {
-        self.finder.is_some()
+        self.modal.finder().is_some()
     }
 
     /// Open the in-app help overlay (AC-1, AC-6, AC-19). Builds two sections:
@@ -2265,7 +2329,7 @@ impl Controller {
             body: crate::render::to_text(&about_body),
             scroll: 0,
         };
-        self.help = Some(HelpState::new(vec![whats_new, about]));
+        self.modal = Modal::Help(HelpState::new(vec![whats_new, about]));
         // Reset double-click state (mirrors open_finder): a tree click made just before the overlay
         // opened must not pair with a same-row click made just after it closes as a double-click.
         self.last_click = None;
@@ -2274,19 +2338,23 @@ impl Controller {
 
     /// Whether the help overlay is currently open.
     pub fn help_open(&self) -> bool {
-        self.help.is_some()
+        self.modal.help().is_some()
     }
 
     /// The current help overlay state, or `None` when closed.
     /// Exposed for tests and the `ViewState` projection.
     pub fn help_state(&self) -> Option<&HelpState> {
-        self.help.as_ref()
+        self.modal.help()
     }
 
-    /// Dismiss the help overlay. Called by handle_help_key on Esc/`q`.
-    /// A no-op when the overlay is already closed.
+    /// Dismiss the help overlay. A no-op when help is not the open modal — so this clears ONLY the
+    /// help overlay, never some other modal that happens to be open (matching the old per-field
+    /// `self.help = None`, which was inert unless help was actually open). The match guard keeps
+    /// that contract now that the four modal slots share one `modal` field.
     pub fn close_help(&mut self) {
-        self.help = None;
+        if matches!(self.modal, Modal::Help(_)) {
+            self.modal = Modal::None;
+        }
     }
 
     /// Route a key event while the help overlay is open (AC-2, AC-3, AC-7, AC-8, AC-9, AC-20).
@@ -2308,17 +2376,17 @@ impl Controller {
         if key.modifiers.difference(KeyModifiers::SHIFT) != KeyModifiers::NONE {
             return Effects::noop();
         }
-        // Read the last-known help-body geometry up front (the borrow of `self.help` below is
-        // exclusive), so the scroll-down arm can clamp eagerly against it.
+        // Read the last-known help-body geometry up front (the `self.modal.help_mut()` borrow below
+        // is exclusive), so the scroll-down arm can clamp eagerly against it.
         let (help_body_rows, help_body_height) =
             (self.geom.help_body_rows, self.geom.help_body_height);
-        let Some(help) = self.help.as_mut() else {
+        let Some(help) = self.modal.help_mut() else {
             return Effects::noop();
         };
         match key.code {
             // Close keys: '?' / Esc / 'q' dismiss the overlay (AC-2, AC-3).
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
-                self.help = None;
+                self.modal = Modal::None;
                 Effects::redraw()
             }
             // Section navigation: Tab / Right → next (AC-7).
@@ -2370,7 +2438,7 @@ impl Controller {
     /// nothing. Snapshots the current content scroll into the prompt state.
     fn open_go_to_line(&mut self) -> Effects {
         if self.selected_view_mode().is_some() {
-            self.prompt = Some(PromptState {
+            self.modal = Modal::Prompt(PromptState {
                 mode: PromptMode::GoToLine,
                 input: crate::prompt::PromptInput::new(),
                 saved_scroll: self.content_scroll,
@@ -2390,7 +2458,7 @@ impl Controller {
         // Modal mutual-exclusion: the picker and finder guards in handle() already prevent this
         // from being reached while those modals are open, but be explicit for clarity and for
         // future direct callers.
-        if self.picker.is_some() || self.finder.is_some() {
+        if self.modal.picker().is_some() || self.modal.finder().is_some() {
             return Effects::noop();
         }
         // File-gate: search requires a file to be selected (not a directory / nothing).
@@ -2408,7 +2476,7 @@ impl Controller {
         // AC-20: opening a new search clears any prior committed SearchState so highlights from
         // the old query are gone before the new prompt opens. Clear first, then snapshot scroll.
         self.search = None;
-        self.prompt = Some(PromptState {
+        self.modal = Modal::Prompt(PromptState {
             mode: PromptMode::Search,
             input: crate::prompt::PromptInput::new(),
             saved_scroll: self.content_scroll,
@@ -2418,13 +2486,13 @@ impl Controller {
 
     /// Whether an in-file-nav bottom prompt is currently open.
     pub fn prompt_open(&self) -> bool {
-        self.prompt.is_some()
+        self.modal.prompt().is_some()
     }
 
     /// The mode of the currently-open bottom-prompt, or `None` when no prompt is open.
     /// Exposed for tests that need to assert which prompt variant was opened.
     pub fn prompt_mode(&self) -> Option<PromptMode> {
-        self.prompt.as_ref().map(|p| p.mode)
+        self.modal.prompt().map(|p| p.mode)
     }
 
     /// The pending auto-switch go-to-line target (1-based source line), or `None`. Set when `:`
@@ -2437,7 +2505,7 @@ impl Controller {
     /// The current go-to-line prompt buffer, or `""` when no prompt is open. Exposed for tests
     /// (AC-2) and the Presenter's bottom prompt line. Mirrors `finder_query()`.
     pub fn prompt_query(&self) -> &str {
-        self.prompt.as_ref().map(|p| p.input.query()).unwrap_or("")
+        self.modal.prompt().map(|p| p.input.query()).unwrap_or("")
     }
 
     /// Route a key event while a bottom-prompt modal is open. The run loop calls this
@@ -2445,7 +2513,7 @@ impl Controller {
     /// mode. (AC-2…AC-6)
     pub fn handle_prompt_key(&mut self, key: KeyEvent) -> Effects {
         // `PromptMode` is `Copy`; read it and drop the borrow before the per-mode handler runs.
-        let Some(mode) = self.prompt.as_ref().map(|p| p.mode) else {
+        let Some(mode) = self.modal.prompt().map(|p| p.mode) else {
             return Effects::noop();
         };
         match mode {
@@ -2469,7 +2537,7 @@ impl Controller {
                 if c.is_ascii_digit()
                     && key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
             {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modal.prompt_mut() {
                     p.input.push(c);
                 }
                 Effects::redraw()
@@ -2477,18 +2545,18 @@ impl Controller {
             // A non-digit printable is ignored — the buffer is unchanged, no repaint. (AC-2)
             KeyCode::Char(_) => Effects::noop(),
             KeyCode::Backspace => {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modal.prompt_mut() {
                     p.input.backspace();
                 }
                 Effects::redraw()
             }
             KeyCode::Enter => {
                 let q = self
-                    .prompt
-                    .as_ref()
+                    .modal
+                    .prompt()
                     .map(|p| p.input.query().to_string())
                     .unwrap_or_default();
-                self.prompt = None; // confirm always closes (AC-5 empty also closes)
+                self.modal = Modal::None; // confirm always closes (AC-5 empty also closes)
                 // A new confirm supersedes any auto-switch jump still queued from an earlier confirm,
                 // so the older line can't overwrite this one when its render lands.
                 self.pending_goto = None;
@@ -2524,7 +2592,7 @@ impl Controller {
                 Effects::redraw()
             }
             KeyCode::Esc => {
-                self.prompt = None; // cancel: close, scroll unchanged (AC-6)
+                self.modal = Modal::None; // cancel: close, scroll unchanged (AC-6)
                 Effects::redraw()
             }
             _ => Effects::noop(),
@@ -2541,14 +2609,14 @@ impl Controller {
             // Accept any printable char (no modifier beyond SHIFT — consistent with the finder's
             // printable-char gate). Unlike go-to-line, search does NOT restrict to digits.
             KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modal.prompt_mut() {
                     p.input.push(c);
                 }
                 self.refresh_search();
                 Effects::redraw()
             }
             KeyCode::Backspace => {
-                if let Some(p) = self.prompt.as_mut() {
+                if let Some(p) = self.modal.prompt_mut() {
                     p.input.backspace();
                 }
                 self.refresh_search();
@@ -2561,23 +2629,23 @@ impl Controller {
             // "Search: (no matches)" state persists after the prompt closes.
             KeyCode::Enter => {
                 let empty = self
-                    .prompt
-                    .as_ref()
+                    .modal
+                    .prompt()
                     .map(|p| p.input.query().is_empty())
                     .unwrap_or(true);
                 if empty {
                     self.search = None;
                 }
-                self.prompt = None;
+                self.modal = Modal::None;
                 Effects::redraw()
             }
             // AC-17: Esc cancels the search — restore the pre-open scroll snapshot and clear
             // the in-progress SearchState (no highlights remain after cancel).
             KeyCode::Esc => {
-                let saved_scroll = self.prompt.as_ref().map(|p| p.saved_scroll).unwrap_or(0);
+                let saved_scroll = self.modal.prompt().map(|p| p.saved_scroll).unwrap_or(0);
                 self.content_scroll = saved_scroll;
                 self.search = None;
-                self.prompt = None;
+                self.modal = Modal::None;
                 Effects::redraw()
             }
             _ => Effects::noop(),
@@ -2638,8 +2706,8 @@ impl Controller {
     /// the first match into view (AC-9, AC-10, AC-18).
     fn refresh_search(&mut self) {
         let q = self
-            .prompt
-            .as_ref()
+            .modal
+            .prompt()
             .map(|p| p.input.query().to_string())
             .unwrap_or_default();
         let plain = self.content_plain_lines();
@@ -2673,31 +2741,31 @@ impl Controller {
     /// The full candidate list loaded when the finder was opened, or an empty slice when
     /// the finder is closed. Exposed for tests; the Presenter reads via `finder()`.
     pub fn finder_candidates(&self) -> &[String] {
-        self.finder.as_ref().map(|f| f.candidates()).unwrap_or(&[])
+        self.modal.finder().map(|f| f.candidates()).unwrap_or(&[])
     }
 
     /// The current finder query string, or `""` when the finder is closed or the query is
     /// empty. Exposed for tests; the Presenter reads via `finder()`.
     pub fn finder_query(&self) -> &str {
-        self.finder.as_ref().map(|f| f.query()).unwrap_or("")
+        self.modal.finder().map(|f| f.query()).unwrap_or("")
     }
 
     /// The current ranked match indices (into `finder_candidates()`), or `&[]` when the finder
     /// is closed or the query is empty. Exposed for tests and the Presenter.
     pub fn finder_matches(&self) -> &[usize] {
-        self.finder.as_ref().map(|f| f.matches()).unwrap_or(&[])
+        self.modal.finder().map(|f| f.matches()).unwrap_or(&[])
     }
 
     /// The cursor position within the match list, or `0` when the finder is closed or the
     /// list is empty. Exposed for tests and the confirm path.
     pub fn finder_cursor(&self) -> usize {
-        self.finder.as_ref().map(|f| f.cursor()).unwrap_or(0)
+        self.modal.finder().map(|f| f.cursor()).unwrap_or(0)
     }
 
     /// The horizontal scroll offset for the result rows, or `0` when the finder is closed.
     /// Exposed for tests that verify Left/Right keys and horizontal wheel move hscroll.
     pub fn finder_hscroll(&self) -> u16 {
-        self.finder.as_ref().map(|f| f.hscroll()).unwrap_or(0)
+        self.modal.finder().map(|f| f.hscroll()).unwrap_or(0)
     }
 
     /// Route a key event while the finder overlay is open.
@@ -2714,7 +2782,7 @@ impl Controller {
     ///
     /// When the finder is not open, all keys are a no-op (defensive guard).
     pub fn handle_finder_key(&mut self, key: KeyEvent) -> Effects {
-        let Some(finder) = self.finder.as_mut() else {
+        let Some(finder) = self.modal.finder_mut() else {
             return Effects::noop();
         };
         let effects = match key.code {
@@ -2749,7 +2817,7 @@ impl Controller {
             // the Esc arm) and return early, so they never reach the reset below.
             KeyCode::Enter => return self.confirm_finder(),
             KeyCode::Esc => {
-                self.finder = None;
+                self.modal = Modal::None;
                 self.last_click = None; // closing the finder resets double-click state so a
                 // finder click cannot pair with the next tree click
                 return Effects::redraw();
@@ -2774,7 +2842,7 @@ impl Controller {
     /// - Reveal returns `false` (target missing/removed since open) → close the finder, set a
     ///   non-fatal `action_notice`, leave the tree selection unchanged (AC-20).
     fn confirm_finder(&mut self) -> Effects {
-        let Some(finder) = self.finder.as_ref() else {
+        let Some(finder) = self.modal.finder() else {
             return Effects::noop();
         };
         let Some(cand_idx) = finder.selected_candidate_index() else {
@@ -2782,7 +2850,7 @@ impl Controller {
         };
         let rel = finder.candidates()[cand_idx].clone();
         let abs = self.root.join(&rel);
-        self.finder = None; // confirm dismisses the modal regardless of reveal outcome
+        self.modal = Modal::None; // confirm dismisses the modal regardless of reveal outcome
         self.last_click = None; // closing the finder resets double-click state
         if self.tree.reveal(&abs) {
             // reveal() may have relaxed the tree's changed_only/hide_hidden fields — re-sync
@@ -2843,6 +2911,29 @@ impl Controller {
         Effects::redraw()
     }
 
+    /// Store a new changed-set and re-apply the changed-only filter against it (AC-16). The two
+    /// move together — the filter reads `self.changed` — so the pair lives in one place and the
+    /// stored set and the displayed filter can never disagree.
+    fn set_changed(&mut self, changed: BTreeMap<PathBuf, Status>) {
+        self.changed = changed;
+        self.tree.set_changed_only(self.changed_only, &self.changed);
+    }
+
+    /// Push a freshly-queried git status + changed-set onto the tree together: per-node status
+    /// markers (AC-7) plus the changed-set behind the changed-only filter (AC-16). The single
+    /// place a status and its matching changed-set are applied in lockstep, so the markers can
+    /// never drift from the set the filter reads. `changed` is passed in because callers source
+    /// it differently — synchronously (`refresh_git_state`) or from the off-thread re-root fetch
+    /// (`poll`).
+    fn apply_git_state(
+        &mut self,
+        status: &BTreeMap<PathBuf, Status>,
+        changed: BTreeMap<PathBuf, Status>,
+    ) {
+        self.tree.set_status(status);
+        self.set_changed(changed);
+    }
+
     /// Re-query git for the working-tree status (tree markers, AC-7) and the changed-set
     /// against the active baseline (AC-16), updating the tree caches. No-op without a repo
     /// (AC-26). Runs on the calling thread, but only on deliberate, infrequent actions —
@@ -2853,9 +2944,8 @@ impl Controller {
             return;
         }
         let status = self.git.status();
-        self.tree.set_status(&status);
-        self.changed = self.git.changed_set(self.baseline);
-        self.tree.set_changed_only(self.changed_only, &self.changed);
+        let changed = self.git.changed_set(self.baseline);
+        self.apply_git_state(&status, changed);
         // Refresh the cached branch too: `refresh_git_state` runs on `r`,
         // editor-return, and focus-gain to pick up EXTERNAL git changes — so an external
         // `git checkout` must update the tree's bottom-border branch, not just status/changed-set.
@@ -2988,7 +3078,7 @@ impl Controller {
                 // swaps self.content; matches computed against the OLD content are now stale.
                 // Mirror dispatch_render's AC-20 clear: recompute an open Search prompt against
                 // the new content, else drop a committed search.
-                if self.prompt.as_ref().map(|p| p.mode) == Some(crate::infile::PromptMode::Search) {
+                if self.modal.prompt().map(|p| p.mode) == Some(crate::infile::PromptMode::Search) {
                     self.refresh_search();
                 } else {
                     self.search = None;
@@ -3003,9 +3093,7 @@ impl Controller {
         if let Some(rx) = &self.status_rx {
             match rx.try_recv() {
                 Ok((status, changed)) => {
-                    self.tree.set_status(&status);
-                    self.changed = changed;
-                    self.tree.set_changed_only(self.changed_only, &self.changed);
+                    self.apply_git_state(&status, changed);
                     self.status_rx = None;
                     // The synchronous `re_root` dispatched the first render against the *empty*
                     // changed-set, so a changed file rendered in content/markdown mode, not Diff.
