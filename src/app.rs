@@ -330,11 +330,16 @@ impl EditorHandoff for LiveEditor {
                 SpawnError::NonZeroExit(detail) => EditorOutcome::NonZeroExit(detail),
             };
         }
-        if let Some(e) = resume_err {
-            // The editor ran (or the no-op path took over nothing); the terminal restore
-            // failed, which is a launch-side problem rather than an editor exit — surface it
-            // as NotLaunched so the wording stays accurate.
-            return EditorOutcome::NotLaunched(e.to_string());
+        if let Some(_e) = resume_err {
+            // The editor launched and ran (we are past the launch-error check), then drawing
+            // it over the screen left the terminal in editor mode and the restore failed. The
+            // editor DID take over and may have changed the file, so this is a takeover, not a
+            // launch failure: returning `TookOver` makes the controller refresh git state +
+            // re-render (the file may differ) and forces the run loop's full repaint, which is
+            // also the recovery for the failed restore. Reporting it as `NotLaunched` would both
+            // skip that refresh (stale markers/content after a real edit) and show a misleading
+            // "Could not open editor" notice for an editor that did open.
+            return EditorOutcome::TookOver;
         }
         // The editor drew over the screen → the run loop forces a full repaint.
         EditorOutcome::TookOver

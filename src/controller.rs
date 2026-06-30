@@ -2918,19 +2918,27 @@ impl Controller {
         // here — it updates only when the matching result lands in `poll`, so the title and body
         // switch to the new file together. The `latest_seq`/`applied_seq` gap already keys the
         // supersession, so a stale result for a superseded selection is dropped by `poll`.
-        self.content = Text::raw("Rendering\u{2026}");
-        self.content_notices.clear();
-        self.content_rendering = true;
-        // If the worker has gone (channel closed) the send simply fails; the pane keeps its
-        // last content rather than panicking.
-        let _ = self.job_tx.send(RenderJob {
-            seq,
-            path: node.path,
-            rel,
-            mode,
-            baseline: self.baseline,
-            is_git: self.is_git_repo,
-        });
+        // Dispatch first, and only show the loading placeholder if the job was actually
+        // queued. If the worker has gone (channel closed) the send fails — keep the last
+        // rendered content instead of stranding the pane on a `Rendering…` placeholder that
+        // no result will ever arrive to clear (`poll` only clears `content_rendering` when a
+        // matching result lands). The send never panics, so the viewer stays alive either way.
+        if self
+            .job_tx
+            .send(RenderJob {
+                seq,
+                path: node.path,
+                rel,
+                mode,
+                baseline: self.baseline,
+                is_git: self.is_git_repo,
+            })
+            .is_ok()
+        {
+            self.content = Text::raw("Rendering\u{2026}");
+            self.content_notices.clear();
+            self.content_rendering = true;
+        }
     }
 
     /// Clear the content pane, showing empty-state guidance instead of a blank pane

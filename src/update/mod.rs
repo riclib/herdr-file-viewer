@@ -151,8 +151,16 @@ fn run_ls_remote_in(repo_url: &str, run_dir: &Path) -> io::Result<String> {
         }
         let _ = tx.send(buf);
     });
+    // A SINGLE combined wall-clock deadline for the whole probe (matching the renderer
+    // call-site): `recv_timeout` can consume most of `PROBE_TIMEOUT` waiting for stdout, so bound
+    // the child wait by what's LEFT — otherwise a `ls-remote` that closes stdout near the deadline
+    // then hangs before exit could spend a second full budget (~2× `PROBE_TIMEOUT` total).
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     match rx.recv_timeout(PROBE_TIMEOUT) {
-        Ok(buf) => match crate::proc::wait_bounded(&mut child, PROBE_TIMEOUT) {
+        Ok(buf) => match crate::proc::wait_bounded(
+            &mut child,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ) {
             Some(status) if status.success() => Ok(String::from_utf8_lossy(&buf).into_owned()),
             Some(status) => Err(io::Error::other(format!(
                 "git ls-remote exited with {status}"
