@@ -967,6 +967,21 @@ fn centered_rect_sized(w: u16, h: u16, area: Rect) -> Rect {
     }
 }
 
+/// The base frame every modal overlay (picker, finder, help) is drawn in: a bordered block with
+/// uniform [`PICKER_PADDING`]. The `*_overlay_layout` fns measure `inner` from it; the draw fns
+/// start from it and add the titles + [`modal_border_style`] on top. Titles render on the
+/// already-reserved border rows and the accent is style-only, so neither changes the interior
+/// geometry — the measured interior and the drawn interior therefore always agree.
+fn modal_frame() -> Block<'static> {
+    Block::bordered().padding(Padding::uniform(PICKER_PADDING))
+}
+
+/// The shared modal border accent — blue + bold — so the picker, finder, and help overlays read
+/// as the same kind of surface and the accent is defined once.
+fn modal_border_style() -> Style {
+    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+}
+
 /// Uniform inner padding (cells on every side) between the picker rows and the box border, so the
 /// content reads with a little breathing room — matching herdr's indented popup content. Applied
 /// both horizontally (a column gutter each side) and vertically (a blank row above the first row
@@ -1038,7 +1053,7 @@ fn picker_overlay_layout(area: Rect, picker: &PickerView) -> PickerLayout {
     let cap_h = area.height.saturating_sub(2);
     let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
 
-    let block = Block::bordered().padding(Padding::uniform(PICKER_PADDING));
+    let block = modal_frame();
     let inner = block.inner(popup);
 
     let visible = inner.height as usize;
@@ -1110,16 +1125,15 @@ fn draw_picker_overlay(frame: &mut Frame, area: Rect, picker: &PickerView) {
     // Clear whatever the columns drew beneath the popup so it reads as a true modal.
     frame.render_widget(Clear, layout.popup);
 
-    let block = Block::bordered()
+    // The shared modal frame already carries the 1-cell uniform gutter (so the rows aren't flush
+    // against the border or the title/footer chrome on the border rows); `inner()` subtracts it
+    // all round, so the rows, cursor highlight, current marker, agent badge, and scrollbars all
+    // flow from the padded interior below.
+    let block = modal_frame()
         .title_top(top_left)
         .title_top(top_right)
         .title_bottom(footer)
-        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
-        // A 1-cell gutter on every side so the rows aren't flush against the border (or the
-        // title/footer chrome that shares the border rows). `inner()` subtracts this all round
-        // automatically, so the rows, cursor highlight, current marker, agent badge, vertical
-        // scroll, and hscroll all flow from the padded interior below.
-        .padding(Padding::uniform(PICKER_PADDING));
+        .border_style(modal_border_style());
     frame.render_widget(block, layout.popup);
 
     let visible = layout.inner.height as usize;
@@ -1373,7 +1387,7 @@ fn finder_overlay_layout(area: Rect, finder: &FinderView) -> FinderLayout {
     let cap_h = area.height.saturating_sub(2);
     let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
 
-    let block = Block::bordered().padding(Padding::uniform(PICKER_PADDING));
+    let block = modal_frame();
     let inner = block.inner(popup);
 
     // The query line always occupies the first row of the interior (when it fits).
@@ -1488,11 +1502,10 @@ fn draw_finder_overlay(frame: &mut Frame, area: Rect, finder: &FinderView) {
     // Clear whatever the columns drew beneath the popup so it reads as a true modal.
     frame.render_widget(Clear, layout.popup);
 
-    let block = Block::bordered()
+    let block = modal_frame()
         .title_top(top_left)
         .title_bottom(footer)
-        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
-        .padding(Padding::uniform(PICKER_PADDING));
+        .border_style(modal_border_style());
     frame.render_widget(block, layout.popup);
 
     // Render the query line if the interior is tall enough.
@@ -1580,7 +1593,7 @@ fn help_overlay_layout(area: Rect, help: &HelpView) -> HelpLayout {
     let cap_h = area.height.saturating_sub(2);
     let popup = centered_rect_sized(want_w.min(cap_w), want_h.min(cap_h), area);
 
-    let block = Block::bordered().padding(Padding::uniform(PICKER_PADDING));
+    let block = modal_frame();
     let inner = block.inner(popup);
 
     // Section-tab rects in the top-border tab row, derived from the SAME span widths the draw path
@@ -1746,11 +1759,10 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, help: &HelpView) {
     // Clear whatever is beneath the popup so it reads as a true modal (on top of the picker/finder).
     frame.render_widget(Clear, layout.popup);
 
-    let block = Block::bordered()
+    let block = modal_frame()
         .title_top(tabs)
         .title_bottom(footer)
-        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
-        .padding(Padding::uniform(PICKER_PADDING));
+        .border_style(modal_border_style());
     frame.render_widget(block, layout.popup);
 
     if let Some(body_area) = layout.body {
