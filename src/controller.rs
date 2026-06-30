@@ -1247,30 +1247,28 @@ impl Controller {
     /// still works (herdr reserves Shift+mouse for exactly that). Selection/activation happen
     /// on button *release*, so a divider drag is never mistaken for a click.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> Effects {
-        // Modal: while the picker is open the mouse is fully inert — the picker is
-        // keyboard-only. This mirrors the keyboard modal gate in `handle`.
-        if self.modal.picker().is_some() {
-            return Effects::noop();
+        // Modal gate, exhaustive over `Modal` (so a new overlay variant forces a mouse-routing
+        // decision here, mirroring the keyboard gate in `handle`):
+        // - Picker / Prompt are keyboard-only — swallow the mouse entirely. Without this a
+        //   click/wheel would reach the tree/content beneath and change the selection under the
+        //   modal, so a later confirm would act on the WRONG file (or strand an override on a dir).
+        // - Help / Finder ARE mouse-interactive (wheel scrolls, click selects/switches): route to
+        //   their own handler, which consumes every event and never leaks to the columns (AC-21).
+        // - None: no modal → the two-column mouse handler below.
+        match self.modal {
+            Modal::Picker(_) | Modal::Prompt(_) => Effects::noop(),
+            Modal::Help(_) => self.handle_help_mouse(ev),
+            Modal::Finder(_) => self.handle_finder_mouse(ev),
+            Modal::None => self.handle_column_mouse(ev),
         }
-        // The go-to-line prompt is keyboard-only too: the run loop routes only KEY events to
-        // `handle_prompt_key`, so without this guard a click/wheel would still reach the tree/content
-        // beneath and change the selection mid-prompt — then a confirm would jump (or auto-switch) the
-        // WRONG file, or strand a bogus override on a directory. Make the mouse inert, like the picker.
-        if self.modal.prompt().is_some() {
-            return Effects::noop();
-        }
-        // The help overlay is modal but IS mouse-interactive (like the finder): the wheel scrolls
-        // the active section's body and a click on a section tab switches sections. Route to its own
-        // handler, which consumes every event and never leaks to the tree/content beneath (AC-21).
-        if self.modal.help().is_some() {
-            return self.handle_help_mouse(ev);
-        }
-        // The finder is also a modal overlay, but it IS mouse-interactive: wheel scrolls the
-        // selection, click selects a result row, double-click confirms. Route to the finder's
-        // own handler; it never leaks to the tree/content beneath.
-        if self.modal.finder().is_some() {
-            return self.handle_finder_mouse(ev);
-        }
+    }
+
+    /// Handle a mouse event over the two columns, with no modal open (the [`handle_mouse`] gate
+    /// routes here only for [`Modal::None`]). Shift+mouse is inert so the terminal can do its own
+    /// text selection; otherwise the wheel scrolls the column under the pointer, a left press
+    /// starts a divider or scrollbar drag (scrollbars also jump to the pressed position), and a
+    /// left release is a click — unless it ended a drag, in which case it's consumed.
+    fn handle_column_mouse(&mut self, ev: MouseEvent) -> Effects {
         if ev.modifiers.contains(KeyModifiers::SHIFT) {
             return Effects::noop();
         }
