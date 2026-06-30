@@ -5,7 +5,7 @@
 //! its root — no node ever escapes it (AC-N5) — and reads only, never writes (AC-N1).
 
 use crate::git::Status;
-use ignore::WalkBuilder;
+use crate::index::walk_builder;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -229,16 +229,12 @@ impl TreeModel {
     /// entries dropped when `hide_hidden` (#46), `.git` always hidden, directories before files,
     /// each group alphabetical. Read-only.
     fn entries(&self, dir: &Path) -> Vec<(PathBuf, NodeKind)> {
-        let mut builder = WalkBuilder::new(dir);
+        let mut builder = walk_builder(dir);
         builder
             .max_depth(Some(1))
             // Dotfiles (e.g. .gitignore, .github) show by default; the hide-hidden toggle (#46)
             // turns on `ignore`'s hidden filter to drop every `.`-prefixed entry.
             .hidden(self.hide_hidden)
-            .parents(true) // honor ancestor .gitignore for correct nested semantics
-            .git_global(false) // hermetic: ignore the user's global gitignore
-            .ignore(false) // only git ignore sources, not generic .ignore files
-            .require_git(false) // honor .gitignore even outside a git repo (AC-4, AC-26)
             .git_ignore(!self.show_ignored)
             .git_exclude(!self.show_ignored);
 
